@@ -407,12 +407,14 @@ impl ReviewState {
 impl ReviewState {
     fn ensure_visible(&mut self) {
         let h = self.size.rows.max(1);
+        let reserved = if self.find.is_some() { 1 } else { 0 };
+        let view = h.saturating_sub(reserved).max(1);
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + h {
-            self.scroll = self.cursor + 1 - h;
+        } else if self.cursor >= self.scroll + view {
+            self.scroll = self.cursor + 1 - view;
         }
-        let max_scroll = self.rows.len().saturating_sub(h);
+        let max_scroll = self.rows.len().saturating_sub(view);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
