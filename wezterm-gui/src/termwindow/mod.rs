@@ -612,33 +612,35 @@ impl TermWindow {
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let (tab_bar_height, tab_bar_width) = if show_tab_bar {
-            use config::TabBarPlacement;
-            let default = if config.tab_bar_at_bottom {
-                TabBarPlacement::Bottom
+        let (tab_bar_height, tab_bar_width) =
+            if show_tab_bar {
+                use config::TabBarPlacement;
+                let default = if config.tab_bar_at_bottom {
+                    TabBarPlacement::Bottom
+                } else {
+                    TabBarPlacement::Top
+                };
+                let placement = config.tab_bar_placement.unwrap_or(default);
+                let placement = if placement.is_vertical() && !config.use_fancy_tab_bar {
+                    default
+                } else {
+                    placement
+                };
+                if placement.is_vertical() {
+                    let width = Self::load_tab_bar_width().unwrap_or(
+                        Self::tab_bar_pixel_width_impl(&config, &fontconfig, &render_metrics)?,
+                    );
+                    (0, width as usize)
+                } else {
+                    (
+                        Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)?
+                            as usize,
+                        0,
+                    )
+                }
             } else {
-                TabBarPlacement::Top
+                (0, 0)
             };
-            let placement = config.tab_bar_placement.unwrap_or(default);
-            let placement = if placement.is_vertical() && !config.use_fancy_tab_bar {
-                default
-            } else {
-                placement
-            };
-            if placement.is_vertical() {
-                let width = Self::load_tab_bar_width().unwrap_or(
-                    Self::tab_bar_pixel_width_impl(&config, &fontconfig, &render_metrics)?,
-                );
-                (0, width as usize)
-            } else {
-                (
-                    Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize,
-                    0,
-                )
-            }
-        } else {
-            (0, 0)
-        };
 
         let terminal_size = TerminalSize {
             rows: physical_rows,
@@ -3131,6 +3133,11 @@ impl TermWindow {
                 }
             }
             ReviewMode(_) => {}
+            OpenPaseoAgentPane(args) => {
+                if let Err(err) = crate::paseo::open_paseo_agent_pane(self, args) {
+                    log::error!("failed to open paseo agent pane: {err:#}");
+                }
+            }
             RotatePanes(direction) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {

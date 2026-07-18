@@ -141,6 +141,32 @@ impl PaseoClient {
         Ok(serde_json::from_value(entries).unwrap_or_default())
     }
 
+    pub async fn fetch_agent_timeline(
+        &self,
+        agent_id: &str,
+        direction: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::protocol::TimelineItem>> {
+        let id = new_id();
+        let payload = self
+            .request(agents::fetch_agent_timeline_request(
+                &id, agent_id, direction, limit,
+            ))
+            .await?;
+        let items = payload
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("item").cloned())
+                    .filter_map(|item| serde_json::from_value(item).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(items)
+    }
+
     pub async fn set_timeline_subscription(&self, agent_ids: &[String]) -> Result<()> {
         let id = new_id();
         self.request(agents::set_timeline_subscription_request(&id, agent_ids))

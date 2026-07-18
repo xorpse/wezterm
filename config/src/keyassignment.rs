@@ -649,8 +649,22 @@ pub enum KeyAssignment {
 
     OpenReviewPane(ReviewPaneArgs),
     ReviewMode(ReviewModeAssignment),
+
+    OpenPaseoAgentPane(PaseoAgentArgs),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct PaseoAgentArgs {
+    pub domain: String,
+    #[dynamic(default)]
+    pub agent_id: Option<String>,
+    #[dynamic(default = "review_default_direction")]
+    pub direction: PaneDirection,
+    #[dynamic(default)]
+    pub size: SplitSize,
+}
+impl_lua_conversion_dynamic!(PaseoAgentArgs);
 
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum ReviewDiffMode {
@@ -662,7 +676,6 @@ pub enum ReviewDiffMode {
 
 impl Default for ReviewDiffMode {
     fn default() -> Self {
-
         Self::WorkingTree
     }
 }

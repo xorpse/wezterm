@@ -5,7 +5,6 @@ use crate::color::{
 };
 use crate::daemon::DaemonOptions;
 use crate::exec_domain::ExecDomain;
-use crate::paseo::PaseoDaemon;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
     FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
@@ -16,6 +15,7 @@ use crate::keyassignment::{
 };
 use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
+use crate::paseo::PaseoDaemon;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;

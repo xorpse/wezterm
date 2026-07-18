@@ -4,9 +4,9 @@ use crate::termwindow::box_model::*;
 use crate::termwindow::render::corners::*;
 
 use crate::termwindow::render::window_buttons::window_button_element;
+use crate::termwindow::render::LinearRgba;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
-use crate::termwindow::render::LinearRgba;
 use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
 use wezterm_font::LoadedFont;

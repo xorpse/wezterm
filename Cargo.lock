@@ -7324,6 +7324,8 @@ dependencies = [
  "nucleo-matcher",
  "ordered-float 4.6.0",
  "parking_lot",
+ "paseo-client",
+ "paseo-mux",
  "percent-encoding",
  "portable-pty",
  "promise",

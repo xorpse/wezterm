@@ -30,6 +30,8 @@ pub struct AgentSnapshot {
     #[serde(default)]
     pub attention_reason: Option<String>,
     #[serde(default)]
+    pub archived_at: Option<String>,
+    #[serde(default)]
     pub pending_permissions: Vec<PermissionRequest>,
 }
 

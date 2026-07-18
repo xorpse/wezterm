@@ -8,9 +8,6 @@ use git_review::{
     compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, DiffLimits,
     DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
-use percent_encoding::percent_decode_str;
-use std::collections::{HashMap, HashSet};
-use termwiz::lineedit::{LineEditBuffer, Movement};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -21,13 +18,16 @@ use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use percent_encoding::percent_decode_str;
 use rangeset::RangeSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use termwiz::cell::{CellAttributes, Intensity};
 use termwiz::color::AnsiColor;
+use termwiz::lineedit::{LineEditBuffer, Movement};
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
 use url::Url;
 use wezterm_term::color::ColorPalette;
@@ -240,7 +240,11 @@ struct ReviewState {
     source_pane_id: PaneId,
 }
 
-fn find_best_anchor(data: &GitDiffData, anchor: &LineAnchor, line_text: &str) -> Option<LineAnchor> {
+fn find_best_anchor(
+    data: &GitDiffData,
+    anchor: &LineAnchor,
+    line_text: &str,
+) -> Option<LineAnchor> {
     let file = data.files.iter().find(|f| f.file_path == anchor.file)?;
     let mut best: Option<usize> = None;
     for hunk in &file.hunks {
@@ -292,7 +296,10 @@ impl ReviewState {
     fn find_bar_line(&self) -> Line {
         let text = match &self.find {
             Some(find) if find.browsing => {
-                format!("/{}    n/p: next/prev · Enter/Esc: done", find.buffer.get_line())
+                format!(
+                    "/{}    n/p: next/prev · Enter/Esc: done",
+                    find.buffer.get_line()
+                )
             }
             Some(find) => format!("/{}", find.buffer.get_line()),
             None => String::new(),
@@ -375,7 +382,8 @@ impl ReviewState {
         if self.file_loads.contains_key(&candidate.0) {
             return None;
         }
-        self.file_loads.insert(candidate.0.clone(), FileLoad::Loading);
+        self.file_loads
+            .insert(candidate.0.clone(), FileLoad::Loading);
         Some(candidate)
     }
 
@@ -839,12 +847,7 @@ impl ReviewPane {
     }
 
     fn handle_find_key(&self, key: KeyCode, mods: KeyModifiers) {
-        let browsing = self
-            .state
-            .lock()
-            .find
-            .as_ref()
-            .is_some_and(|f| f.browsing);
+        let browsing = self.state.lock().find.as_ref().is_some_and(|f| f.browsing);
         if browsing {
             match key {
                 KeyCode::Char('n') => self.find_jump(true),
@@ -868,9 +871,8 @@ impl ReviewPane {
         match key {
             KeyCode::Char('\r') | KeyCode::Enter => self.find_jump(true),
             KeyCode::Char('\x1b') | KeyCode::Escape => self.cancel_find(),
-            KeyCode::Backspace => {
-                self.find_apply(|b| b.kill_text(Movement::BackwardChar(1), Movement::BackwardChar(1)))
-            }
+            KeyCode::Backspace => self
+                .find_apply(|b| b.kill_text(Movement::BackwardChar(1), Movement::BackwardChar(1))),
             KeyCode::LeftArrow => self.find_apply(|b| b.exec_movement(Movement::BackwardChar(1))),
             KeyCode::RightArrow => self.find_apply(|b| b.exec_movement(Movement::ForwardChar(1))),
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CTRL) => {
@@ -904,7 +906,10 @@ impl ReviewPane {
     fn render_find_bar(&self, state: &ReviewState) -> Line {
         let text = match &state.find {
             Some(find) if find.browsing => {
-                format!("/{}    n/p: next/prev · Enter/Esc: done", find.buffer.get_line())
+                format!(
+                    "/{}    n/p: next/prev · Enter/Esc: done",
+                    find.buffer.get_line()
+                )
             }
             Some(find) => format!("/{}", find.buffer.get_line()),
             None => String::new(),
@@ -921,7 +926,12 @@ impl ReviewPane {
             return make_line("", &CellAttributes::default(), state.seqno, cols);
         }
         let row = &state.rows[doc];
-        let attrs = attrs_for(row.kind, doc == state.cursor, state.is_selected(doc), row.commented);
+        let attrs = attrs_for(
+            row.kind,
+            doc == state.cursor,
+            state.is_selected(doc),
+            row.commented,
+        );
         make_line(&row.text, &attrs, state.seqno, cols)
     }
 
@@ -1025,9 +1035,21 @@ impl ReviewPane {
         std::thread::spawn(move || {
             let (host, repo, mode, seq) = {
                 let s = pane.state.lock();
-                (s.host.clone(), s.repo_root.clone(), s.mode.clone(), s.compute_seq)
+                (
+                    s.host.clone(),
+                    s.repo_root.clone(),
+                    s.mode.clone(),
+                    s.compute_seq,
+                )
             };
-            let result = compute_file_diff(&host, &repo, &mode, &path, &status, &DiffLimits::on_demand());
+            let result = compute_file_diff(
+                &host,
+                &repo,
+                &mode,
+                &path,
+                &status,
+                &DiffLimits::on_demand(),
+            );
 
             {
                 let mut s = pane.state.lock();
@@ -1038,22 +1060,24 @@ impl ReviewPane {
                     Ok(file) => {
                         let still_oversized = file.oversized;
                         if let Some(data) = &mut s.data {
-                            if let Some(slot) =
-                                data.files.iter_mut().find(|f| f.file_path == path)
+                            if let Some(slot) = data.files.iter_mut().find(|f| f.file_path == path)
                             {
                                 *slot = file;
                             }
                             data.recompute_totals();
                         }
                         if still_oversized {
-                            s.file_loads
-                                .insert(path.clone(), FileLoad::Failed("file too large to display".to_string()));
+                            s.file_loads.insert(
+                                path.clone(),
+                                FileLoad::Failed("file too large to display".to_string()),
+                            );
                         } else {
                             s.file_loads.remove(&path);
                         }
                     }
                     Err(err) => {
-                        s.file_loads.insert(path.clone(), FileLoad::Failed(format!("{err:#}")));
+                        s.file_loads
+                            .insert(path.clone(), FileLoad::Failed(format!("{err:#}")));
                     }
                 }
                 s.seqno += 1;
@@ -1228,17 +1252,30 @@ fn note_row(text: String, kind: RowKind, anchor: &LineAnchor) -> RenderRow {
     }
 }
 
-fn push_note_rows(rows: &mut Vec<RenderRow>, anchor: &LineAnchor, editing: Option<&EditState>, saved: Option<&Comment>) {
+fn push_note_rows(
+    rows: &mut Vec<RenderRow>,
+    anchor: &LineAnchor,
+    editing: Option<&EditState>,
+    saved: Option<&Comment>,
+) {
     match editing {
         Some(edit) if &edit.anchor == anchor => {
             for line in &edit.lines {
-                rows.push(note_row(format!("{EDIT_PREFIX}{line}"), RowKind::NoteEdit, anchor));
+                rows.push(note_row(
+                    format!("{EDIT_PREFIX}{line}"),
+                    RowKind::NoteEdit,
+                    anchor,
+                ));
             }
         }
         _ => {
             if let Some(note) = saved {
                 for line in note.body.split('\n') {
-                    rows.push(note_row(format!("{NOTE_PREFIX}{line}"), RowKind::Note, anchor));
+                    rows.push(note_row(
+                        format!("{NOTE_PREFIX}{line}"),
+                        RowKind::Note,
+                        anchor,
+                    ));
                 }
             }
         }
@@ -1319,7 +1356,10 @@ fn build_rows(
 
         let mut rendered_anchors: HashSet<LineAnchor> = HashSet::new();
         if file.is_binary {
-            rows.push(RenderRow::plain("  binary file".to_string(), RowKind::Summary));
+            rows.push(RenderRow::plain(
+                "  binary file".to_string(),
+                RowKind::Summary,
+            ));
         } else if file.oversized {
             let msg = match file_loads.get(&file.file_path) {
                 Some(FileLoad::Loading) => "  loading…".to_string(),
@@ -1394,10 +1434,7 @@ fn config_mode_to_diff(mode: &ReviewDiffMode) -> DiffMode {
     }
 }
 
-pub fn open_review_pane(
-    term_window: &mut TermWindow,
-    args: &ReviewPaneArgs,
-) -> anyhow::Result<()> {
+pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> anyhow::Result<()> {
     let mux = Mux::get();
     let tab = mux
         .get_active_tab_for_window(term_window.mux_window_id)
@@ -1628,7 +1665,8 @@ impl Pane for ReviewPane {
         impl_get_logical_lines_via_get_lines(self, lines)
     }
 
-    fn apply_hyperlinks(&self, _lines: Range<StableRowIndex>, _rules: &[termwiz::hyperlink::Rule]) {}
+    fn apply_hyperlinks(&self, _lines: Range<StableRowIndex>, _rules: &[termwiz::hyperlink::Rule]) {
+    }
 
     fn get_dimensions(&self) -> RenderableDimensions {
         let state = self.state.lock();
@@ -1733,7 +1771,9 @@ impl Pane for ReviewPane {
             KeyCode::Char('\r') | KeyCode::Enter => {
                 let on_header = {
                     let s = self.state.lock();
-                    s.rows.get(s.cursor).is_some_and(|r| r.kind == RowKind::FileHeader)
+                    s.rows
+                        .get(s.cursor)
+                        .is_some_and(|r| r.kind == RowKind::FileHeader)
                 };
                 if on_header {
                     self.toggle_fold();
@@ -1819,7 +1859,8 @@ impl Pane for ReviewPane {
             (MouseButton::Left, MouseEventKind::Move) => {
                 self.mutate(|s| {
                     if let Some(anchor) = s.drag_anchor {
-                        let doc = (s.scroll + event.y.max(0) as usize).min(s.rows.len().saturating_sub(1));
+                        let doc = (s.scroll + event.y.max(0) as usize)
+                            .min(s.rows.len().saturating_sub(1));
                         s.cursor = doc;
                         s.select_start = Some(anchor);
                         s.ensure_visible();
@@ -1875,9 +1916,9 @@ impl Pane for ReviewPane {
             if !matches!(s.status, LoadStatus::Ready) || s.editing.is_some() || s.find.is_some() {
                 return;
             }
-            let ok = s
-                .last_refresh
-                .map_or(true, |t| Instant::now().duration_since(t) > Duration::from_millis(300));
+            let ok = s.last_refresh.map_or(true, |t| {
+                Instant::now().duration_since(t) > Duration::from_millis(300)
+            });
             if ok {
                 s.last_refresh = Some(Instant::now());
             }
@@ -1935,7 +1976,13 @@ mod tests {
             total_deletions: 1,
         };
 
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(rows[0].kind, RowKind::FileHeader);
         assert!(rows[0].text.contains("src/foo.rs"));
         assert!(rows[0].text.contains("+1 -1"));
@@ -1968,12 +2015,24 @@ mod tests {
             total_additions: 0,
             total_deletions: 0,
         };
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert!(rows
             .iter()
             .any(|r| r.kind == RowKind::Summary && r.text.contains("binary")));
 
-        let empty = build_rows(&GitDiffData::default(), &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let empty = build_rows(
+            &GitDiffData::default(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].kind, RowKind::Info);
     }
@@ -1993,7 +2052,13 @@ mod tests {
             total_additions: 9000,
             total_deletions: 10,
         };
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert!(rows
             .iter()
             .any(|r| r.kind == RowKind::Summary && r.text.contains("large diff")));
@@ -2037,7 +2102,13 @@ mod tests {
         let add = rows.iter().find(|r| r.kind == RowKind::Add).unwrap();
         assert!(add.text.starts_with('●'));
 
-        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let plain = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert!(plain.iter().all(|r| r.kind != RowKind::Note));
     }
 
@@ -2107,7 +2178,13 @@ mod tests {
             total_deletions: 0,
         };
 
-        let expanded = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
+        let expanded = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
         assert!(expanded.iter().any(|r| r.kind == RowKind::Add));
         assert!(expanded
             .iter()
@@ -2189,8 +2266,17 @@ mod tests {
         edit.newline();
         edit.insert_char('x');
 
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), Some(&edit));
-        let edits: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::NoteEdit).collect();
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            Some(&edit),
+        );
+        let edits: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::NoteEdit)
+            .collect();
         assert_eq!(edits.len(), 2);
         assert!(edits[0].text.ends_with("hi"));
         assert!(edits[1].text.ends_with('x'));
@@ -2234,8 +2320,17 @@ mod tests {
         assert!(header.commented);
         assert!(header.text.contains('💬'));
 
-        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
-        let h2 = plain.iter().find(|r| r.kind == RowKind::FileHeader).unwrap();
+        let plain = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
+        let h2 = plain
+            .iter()
+            .find(|r| r.kind == RowKind::FileHeader)
+            .unwrap();
         assert!(!h2.commented);
         assert!(!h2.text.contains('💬'));
     }

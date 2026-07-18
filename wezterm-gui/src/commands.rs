@@ -1985,6 +1985,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit", "Review Mode"],
             icon: None,
         },
+        OpenPaseoAgentPane(_) => CommandDef {
+            brief: "Open Paseo agent pane".into(),
+            doc: "Split the current pane and show a Paseo agent session".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
         RotatePanes(direction) => CommandDef {
             brief: format!("Rotate panes {direction:?}").into(),
             doc: format!("Rotate panes {direction:?}").into(),
