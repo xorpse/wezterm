@@ -222,7 +222,79 @@ pub struct ClusterStyleCache<'a> {
     underline_color: LinearRgba,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TabBarInsets {
+    pub top: f32,
+    pub bottom: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
 impl crate::TermWindow {
+    pub fn resolved_tab_bar_placement(&self) -> config::TabBarPlacement {
+        use config::TabBarPlacement;
+        let default = if self.config.tab_bar_at_bottom {
+            TabBarPlacement::Bottom
+        } else {
+            TabBarPlacement::Top
+        };
+        let placement = self.config.tab_bar_placement.unwrap_or(default);
+        if placement.is_vertical() && !self.config.use_fancy_tab_bar {
+            default
+        } else {
+            placement
+        }
+    }
+
+    pub fn vertical_tab_bar_width(&self) -> f32 {
+        if self.tab_bar_collapsed {
+            0.
+        } else {
+            self.tab_bar_pixel_width().unwrap_or(0.)
+        }
+    }
+
+    pub fn tab_bar_insets(&self) -> TabBarInsets {
+        use config::TabBarPlacement;
+        if !self.show_tab_bar {
+            return TabBarInsets::default();
+        }
+        match self.resolved_tab_bar_placement() {
+            TabBarPlacement::Top => TabBarInsets {
+                top: self.tab_bar_pixel_height().unwrap_or(0.),
+                ..Default::default()
+            },
+            TabBarPlacement::Bottom => TabBarInsets {
+                bottom: self.tab_bar_pixel_height().unwrap_or(0.),
+                ..Default::default()
+            },
+            TabBarPlacement::Left => TabBarInsets {
+                left: self.vertical_tab_bar_width(),
+                ..Default::default()
+            },
+            TabBarPlacement::Right => TabBarInsets {
+                right: self.vertical_tab_bar_width(),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn save_tab_bar_width(&self) {
+        if let Some(px) = self.tab_bar_width_override {
+            let path = config::RUNTIME_DIR.join("tab_bar_width");
+            let _ = std::fs::write(path, px.to_string());
+        }
+    }
+
+    pub fn load_tab_bar_width() -> Option<f32> {
+        let path = config::RUNTIME_DIR.join("tab_bar_width");
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<f32>()
+            .ok()
+    }
+
     pub fn update_next_frame_time(&self, next_due: Option<Instant>) {
         if next_due.is_some() {
             update_next_frame_time(&mut *self.has_animation.borrow_mut(), next_due);
@@ -363,9 +435,11 @@ impl crate::TermWindow {
             .bottom
             .evaluate_as_pixels(v_context);
 
+        let insets = self.tab_bar_insets();
         let horizontal_gap = self.dimensions.pixel_width as f32
             - self.terminal_size.pixel_width as f32
             - padding_left
+            - (insets.left + insets.right)
             - if self.show_scroll_bar && padding_right.is_zero() {
                 h_context.pixel_cell
             } else {
@@ -375,11 +449,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_height as f32
             - padding_top
             - padding_bottom
-            - if self.show_tab_bar {
-                self.tab_bar_pixel_height().unwrap_or(0.)
-            } else {
-                0.
-            };
+            - (insets.top + insets.bottom);
         let left_gap = match self.config.window_content_alignment.horizontal {
             HorizontalWindowContentAlignment::Left => 0.,
             HorizontalWindowContentAlignment::Center => (horizontal_gap / 2.).round(),

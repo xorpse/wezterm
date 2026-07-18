@@ -200,6 +200,30 @@ fn spinner_phase(tab_id: usize) -> u64 {
     z ^ (z >> 31)
 }
 
+fn process_icon(title: &str) -> &'static str {
+    let t = title.to_ascii_lowercase();
+    let has = |s: &str| t.contains(s);
+    if has("nvim") || has("vim") {
+        "\u{e62b}"
+    } else if has("git") {
+        "\u{e702}"
+    } else if has("docker") {
+        "\u{f308}"
+    } else if has("python") {
+        "\u{e606}"
+    } else if has("node") {
+        "\u{e718}"
+    } else if has("cargo") || has("rust") {
+        "\u{e7a8}"
+    } else if has("ssh") {
+        "\u{f489}"
+    } else if has("bash") || has("zsh") || has("fish") {
+        "\u{f489}"
+    } else {
+        "\u{f120}"
+    }
+}
+
 fn compute_tab_title(
     tab: &TabInformation,
     tab_info: &[TabInformation],
@@ -225,6 +249,11 @@ fn compute_tab_title(
                 };
 
                 let classic_spacing = if config.use_fancy_tab_bar { "" } else { " " };
+                if config.show_tab_icons {
+                    let icon = format!(" {}  ", process_icon(&pane.title));
+                    len += unicode_column_width(&icon, None);
+                    items.push(FormatItem::Text(icon));
+                }
                 if config.show_tab_index_in_tab_bar {
                     let index = format!(
                         "{classic_spacing}{}: ",

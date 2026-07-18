@@ -2101,6 +2101,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "git-review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "git2"
 version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7048,7 +7057,9 @@ dependencies = [
  "finl_unicode",
  "frecency",
  "futures",
+ "git-review",
  "hdrhistogram",
+ "hostname",
  "http_req",
  "image",
  "k9",
@@ -7064,6 +7075,7 @@ dependencies = [
  "nucleo-matcher",
  "ordered-float 4.6.0",
  "parking_lot",
+ "percent-encoding",
  "portable-pty",
  "promise",
  "rangeset",

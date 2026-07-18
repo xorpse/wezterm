@@ -75,6 +75,13 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* [tab_bar_placement](config/lua/config/tab_bar_placement.md) adds an optional
+  **vertical tab bar** on the left or right (fancy tab bar only): stacked tabs
+  with per-tab icons ([show_tab_icons](config/lua/config/show_tab_icons.md)), a
+  drag-to-resize inner edge whose width persists across sessions
+  ([tab_bar_width](config/lua/config/tab_bar_width.md)), and an optional
+  hover-to-collapse control
+  ([tab_bar_collapsible](config/lua/config/tab_bar_collapsible.md)).
 * [OpenReviewPane](config/lua/keyassignment/OpenReviewPane.md) opens a git diff
   review pane: navigate hunks/files, annotate lines, and send selected diff
   lines to another pane.

@@ -159,6 +159,8 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    TabBarResize,
+    TabBarCollapse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,6 +395,9 @@ pub struct TermWindow {
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    tab_bar_width_override: Option<f32>,
+    tab_bar_collapsed: bool,
+    tab_bar_revealed: bool,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -607,10 +612,32 @@ impl TermWindow {
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
-            Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
+        let (tab_bar_height, tab_bar_width) = if show_tab_bar {
+            use config::TabBarPlacement;
+            let default = if config.tab_bar_at_bottom {
+                TabBarPlacement::Bottom
+            } else {
+                TabBarPlacement::Top
+            };
+            let placement = config.tab_bar_placement.unwrap_or(default);
+            let placement = if placement.is_vertical() && !config.use_fancy_tab_bar {
+                default
+            } else {
+                placement
+            };
+            if placement.is_vertical() {
+                let width = Self::load_tab_bar_width().unwrap_or(
+                    Self::tab_bar_pixel_width_impl(&config, &fontconfig, &render_metrics)?,
+                );
+                (0, width as usize)
+            } else {
+                (
+                    Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize,
+                    0,
+                )
+            }
         } else {
-            0
+            (0, 0)
         };
 
         let terminal_size = TerminalSize {
@@ -654,7 +681,8 @@ impl TermWindow {
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let mut dimensions = Dimensions {
-            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
+            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize
+                + tab_bar_width,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -715,6 +743,9 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            tab_bar_width_override: Self::load_tab_bar_width(),
+            tab_bar_collapsed: false,
+            tab_bar_revealed: false,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2113,20 +2144,17 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
+            let insets = self.tab_bar_insets();
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
                 Point::new(
                     (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
+                        .add(padding_left as isize)
+                        .add(insets.left as isize),
                     ((cursor.y + pos.top as isize - top).max(0)
                         * self.render_metrics.cell_size.height)
-                        .add(tab_bar_height as isize)
+                        .add(insets.top as isize)
                         .add(padding_top as isize),
                 ),
                 self.render_metrics.cell_size,

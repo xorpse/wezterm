@@ -482,6 +482,25 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
 
+    /// Where to place the tab bar. When unset, derives from `tab_bar_at_bottom`
+    /// (Top, or Bottom). `Left`/`Right` render a vertical sidebar and require
+    /// `use_fancy_tab_bar = true`.
+    #[dynamic(default)]
+    pub tab_bar_placement: Option<TabBarPlacement>,
+
+    /// Width (in cells) of a vertical (Left/Right) tab bar.
+    #[dynamic(default = "default_tab_bar_width")]
+    pub tab_bar_width: usize,
+
+    /// If true, a vertical tab bar can be collapsed (hidden) via a
+    /// hover-revealed button at the middle of its inner edge.
+    #[dynamic(default)]
+    pub tab_bar_collapsible: bool,
+
+    /// If true, show a per-tab icon derived from the foreground process.
+    #[dynamic(default)]
+    pub show_tab_icons: bool,
+
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
 
@@ -1879,6 +1898,24 @@ fn default_enq_answerback() -> String {
 
 fn default_tab_max_width() -> usize {
     16
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum TabBarPlacement {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl TabBarPlacement {
+    pub fn is_vertical(self) -> bool {
+        matches!(self, TabBarPlacement::Left | TabBarPlacement::Right)
+    }
+}
+
+fn default_tab_bar_width() -> usize {
+    24
 }
 
 fn default_update_interval() -> u64 {

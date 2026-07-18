@@ -6,6 +6,7 @@ use crate::termwindow::render::corners::*;
 use crate::termwindow::render::window_buttons::window_button_element;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
+use crate::termwindow::render::LinearRgba;
 use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
@@ -355,6 +356,132 @@ impl crate::TermWindow {
                 }
                 _ => left_eles.push(item_to_elem(item)),
             }
+        }
+
+        if self.resolved_tab_bar_placement().is_vertical() {
+            use config::TabBarPlacement;
+            let collapsed = self.tab_bar_collapsed;
+            let strip_width = self.vertical_tab_bar_width();
+            let border = self.get_os_border();
+
+            let mut col: Vec<Element> = vec![];
+
+            if !collapsed {
+                let window_buttons: Vec<Element> = items
+                    .iter()
+                    .filter(|item| matches!(item.item, TabBarItem::WindowButton(_)))
+                    .map(item_to_elem)
+                    .collect();
+                if !window_buttons.is_empty() {
+                    col.push(
+                        Element::new(&font, ElementContent::Children(window_buttons))
+                            .display(DisplayType::Block)
+                            .vertical_align(VerticalAlign::Top)
+                            .min_width(Some(Dimension::Pixels(strip_width)))
+                            .max_width(Some(Dimension::Pixels(strip_width)))
+                            .colors(bar_colors.clone()),
+                    );
+                }
+            }
+
+            for item in items {
+                if collapsed {
+                    break;
+                }
+                if matches!(
+                    item.item,
+                    TabBarItem::WindowButton(_) | TabBarItem::NewTabButton
+                ) {
+                    continue;
+                }
+                let row = match item.item {
+                    TabBarItem::Tab { tab_idx, active } => {
+                        let mut e = item_to_elem(item);
+                        e.content = match e.content {
+                            ElementContent::Children(mut kids) => {
+                                if self.config.show_close_tab_button_in_tabs {
+                                    kids.push(make_x_button(
+                                        &font, &metrics, &colors, tab_idx, active,
+                                    ));
+                                }
+                                ElementContent::Children(kids)
+                            }
+                            other => other,
+                        };
+                        e.vertical_align(VerticalAlign::Top)
+                    }
+                    TabBarItem::NewTabButton => {
+                        let new_tab = colors.new_tab();
+                        let new_tab_hover = colors.new_tab_hover();
+                        let inner = item_to_elem(item)
+                            .colors(ElementColors {
+                                border: BorderColor::default(),
+                                bg: LinearRgba::TRANSPARENT.into(),
+                                text: new_tab.fg_color.to_linear().into(),
+                            })
+                            .hover_colors(None);
+                        Element::new(&font, ElementContent::Children(vec![inner]))
+                            .colors(ElementColors {
+                                border: BorderColor::default(),
+                                bg: new_tab.bg_color.to_linear().into(),
+                                text: new_tab.fg_color.to_linear().into(),
+                            })
+                            .hover_colors(Some(ElementColors {
+                                border: BorderColor::default(),
+                                bg: new_tab_hover.bg_color.to_linear().into(),
+                                text: new_tab_hover.fg_color.to_linear().into(),
+                            }))
+                    }
+                    _ => Element::new(&font, ElementContent::Children(vec![item_to_elem(item)])),
+                };
+                col.push(
+                    row.display(DisplayType::Block)
+                        .float(Float::None)
+                        .item_type(UIItemType::TabBar(item.item.clone()))
+                        .min_width(Some(Dimension::Pixels(strip_width)))
+                        .max_width(Some(Dimension::Pixels(strip_width))),
+                );
+            }
+
+            let tabs = Element::new(&font, ElementContent::Children(col))
+                .display(DisplayType::Block)
+                .item_type(UIItemType::TabBar(TabBarItem::None))
+                .min_width(Some(Dimension::Pixels(strip_width)))
+                .min_height(Some(Dimension::Pixels(self.dimensions.pixel_height as f32)))
+                .colors(bar_colors);
+
+            let x0 = if self.resolved_tab_bar_placement() == TabBarPlacement::Right {
+                self.dimensions.pixel_width as f32 - strip_width - border.right.get() as f32
+            } else {
+                border.left.get() as f32
+            };
+
+            let computed = self.compute_element(
+                &LayoutContext {
+                    height: DimensionContext {
+                        dpi: self.dimensions.dpi as f32,
+                        pixel_max: self.dimensions.pixel_height as f32,
+                        pixel_cell: metrics.cell_size.height as f32,
+                    },
+                    width: DimensionContext {
+                        dpi: self.dimensions.dpi as f32,
+                        pixel_max: strip_width,
+                        pixel_cell: metrics.cell_size.width as f32,
+                    },
+                    bounds: euclid::rect(
+                        x0,
+                        border.top.get() as f32,
+                        strip_width,
+                        self.dimensions.pixel_height as f32
+                            - (border.top + border.bottom).get() as f32,
+                    ),
+                    metrics: &metrics,
+                    gl_state: self.render_state.as_ref().unwrap(),
+                    zindex: 10,
+                },
+                &tabs,
+            )?;
+            return Ok(computed);
         }
 
         let mut children = vec![];
