@@ -379,6 +379,37 @@ impl TerminalHandle {
         self.output_rx.clone()
     }
 
+    pub fn writer(&self) -> TerminalWriter {
+        TerminalWriter {
+            transport: self.transport.clone(),
+            slot: self.slot,
+        }
+    }
+
+    pub async fn send_input(&self, data: &[u8]) -> Result<()> {
+        self.writer().send_input(data).await
+    }
+
+    pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
+        self.writer().resize(rows, cols).await
+    }
+
+    pub async fn unsubscribe(self) -> Result<()> {
+        self.owner.inner.terminals.lock().remove(&self.slot);
+        let message = terminals::unsubscribe_terminal_request(&self.terminal_id);
+        self.transport
+            .send_text(session_envelope(message).to_string())
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub struct TerminalWriter {
+    transport: Arc<dyn Transport>,
+    slot: u8,
+}
+
+impl TerminalWriter {
     pub async fn send_input(&self, data: &[u8]) -> Result<()> {
         self.transport
             .send_binary(encode_input(self.slot, data))
@@ -388,14 +419,6 @@ impl TerminalHandle {
     pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
         self.transport
             .send_binary(encode_resize(self.slot, rows, cols)?)
-            .await
-    }
-
-    pub async fn unsubscribe(self) -> Result<()> {
-        self.owner.inner.terminals.lock().remove(&self.slot);
-        let message = terminals::unsubscribe_terminal_request(&self.terminal_id);
-        self.transport
-            .send_text(session_envelope(message).to_string())
             .await
     }
 }

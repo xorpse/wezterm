@@ -4270,6 +4270,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "paseo-mux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "flume",
+ "log",
+ "mux",
+ "parking_lot",
+ "paseo-client",
+ "portable-pty",
+ "promise",
+ "rangeset",
+ "termwiz",
+ "url",
+ "wezterm-term",
+]
+
+[[package]]
 name = "passfd"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
