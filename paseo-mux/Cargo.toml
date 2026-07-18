@@ -13,6 +13,7 @@ log = { workspace = true }
 url = { workspace = true }
 flume = { workspace = true }
 rangeset = { workspace = true }
+config = { workspace = true }
 mux = { workspace = true }
 wezterm-term = { workspace = true }
 termwiz = { workspace = true }

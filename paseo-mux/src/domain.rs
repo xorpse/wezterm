@@ -146,7 +146,7 @@ impl Domain for PaseoDomain {
             if !self.attached_terminals.lock().insert(info.id.clone()) {
                 continue;
             }
-            let handle = client.subscribe_terminal(&info.id, "live").await?;
+            let handle = client.subscribe_terminal(&info.id, "visible-snapshot").await?;
             let remote = handle.writer();
             let (pane, input_rx) = PaseoTerminalPane::new(
                 alloc_pane_id(),

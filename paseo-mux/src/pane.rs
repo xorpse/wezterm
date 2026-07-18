@@ -25,15 +25,6 @@ use wezterm_term::{
     TerminalSize,
 };
 
-#[derive(Debug)]
-struct PaseoTermConfig;
-
-impl TerminalConfiguration for PaseoTermConfig {
-    fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
-    }
-}
-
 struct ChannelWriter {
     tx: flume::Sender<Vec<u8>>,
 }
@@ -68,10 +59,10 @@ impl PaseoTerminalPane {
         remote: TerminalWriter,
     ) -> (Arc<PaseoTerminalPane>, flume::Receiver<Vec<u8>>) {
         let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
-        let config = Arc::new(PaseoTermConfig);
+        let term_config = Arc::new(config::TermConfig::new());
         let terminal = Terminal::new(
             size,
-            config,
+            term_config,
             "paseo",
             "1.0",
             Box::new(ChannelWriter {
