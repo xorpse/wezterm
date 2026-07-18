@@ -198,12 +198,8 @@ fn truncate_lines(text: &str, max: usize) -> String {
     }
 }
 
-fn item_key(item: &TimelineItem) -> Option<String> {
-    if item.kind == "tool_call" {
-        item.call_id.clone()
-    } else {
-        None
-    }
+fn is_message(kind: &str) -> bool {
+    matches!(kind, "assistant_message" | "reasoning" | "user_message")
 }
 
 struct AgentState {
@@ -233,21 +229,41 @@ impl AgentState {
         self.rows = rows;
     }
 
-    fn upsert(&mut self, item: TimelineItem) {
-        match item_key(&item) {
-            Some(key) => {
+    fn apply_live_item(&mut self, item: TimelineItem) {
+        if item.kind == "tool_call" {
+            if let Some(call_id) = item.call_id.clone() {
                 if let Some(existing) = self
                     .items
                     .iter_mut()
-                    .find(|it| item_key(it).as_deref() == Some(key.as_str()))
+                    .find(|it| it.call_id.as_deref() == Some(call_id.as_str()))
                 {
                     *existing = item;
-                } else {
-                    self.items.push(item);
+                    return;
                 }
             }
-            None => self.items.push(item),
+            self.items.push(item);
+            return;
         }
+
+        if is_message(&item.kind) {
+            if let Some(last) = self.items.last_mut() {
+                if last.kind == item.kind
+                    && last.message_id.is_some()
+                    && last.message_id == item.message_id
+                {
+                    let old = last.text.clone().unwrap_or_default();
+                    let new = item.text.clone().unwrap_or_default();
+                    last.text = Some(if new.starts_with(&old) {
+                        new
+                    } else {
+                        format!("{old}{new}")
+                    });
+                    return;
+                }
+            }
+        }
+
+        self.items.push(item);
     }
 
     fn row_line(&self, index: StableRowIndex) -> Line {
@@ -314,7 +330,7 @@ impl PaseoAgentPane {
         };
         self.mutate(|state| {
             state.status_message = None;
-            state.upsert(item.clone());
+            state.apply_live_item(item.clone());
             state.rebuild_rows();
         });
     }

@@ -9,6 +9,7 @@ struct Options {
     restore: String,
     create_probe: Option<String>,
     dump_timeline: Option<String>,
+    watch_stream: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -30,6 +31,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         restore: "live".to_string(),
         create_probe: None,
         dump_timeline: None,
+        watch_stream: None,
     };
 
     if first == "--local" {
@@ -51,6 +53,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--create-probe" => {
                 options.create_probe = Some(iter.next().cloned().ok_or_else(usage)?);
+            }
+            "--watch" => {
+                options.watch_stream = Some(iter.next().cloned().unwrap_or_default());
             }
             "--dump-timeline" => {
                 options.dump_timeline = Some(iter.next().cloned().unwrap_or_default());
@@ -106,7 +111,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(agent_arg) = &options.dump_timeline {
+    if let Some(agent_arg) = &options.watch_stream {
+        watch_stream(&client, agent_arg, &agents).await?;
+    } else if let Some(agent_arg) = &options.dump_timeline {
         dump_timeline(&client, agent_arg, &agents).await?;
     } else if let Some(cwd) = &options.create_probe {
         create_probe(&client, cwd).await?;
@@ -119,6 +126,61 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
     }
 
     client.close().await;
+    Ok(())
+}
+
+async fn watch_stream(
+    client: &PaseoClient,
+    agent_arg: &str,
+    agents: &[paseo_client::AgentListEntry],
+) -> anyhow::Result<()> {
+    let agent_id = if agent_arg.is_empty() {
+        agents
+            .iter()
+            .find(|e| e.agent.status == "running")
+            .or_else(|| agents.iter().find(|e| e.agent.archived_at.is_none()))
+            .map(|e| e.agent.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no agents"))?
+    } else {
+        agent_arg.to_string()
+    };
+    println!("watching stream for agent {agent_id} (~15s)");
+    let mut events = client.events();
+    let _ = client.set_timeline_subscription(&[agent_id.clone()]).await;
+
+    let collect = async {
+        while let Ok(event) = events.recv().await {
+            if let paseo_client::DaemonEvent::AgentStream {
+                agent_id: aid,
+                event,
+            } = event
+            {
+                if aid != agent_id {
+                    continue;
+                }
+                if event.kind == "timeline" {
+                    if let Some(item) = &event.item {
+                        let text = item.text.clone().unwrap_or_default();
+                        let preview: String = text.chars().take(60).collect();
+                        println!(
+                            "timeline kind={:18} msg={:10} call={:10} len={:4} | {}",
+                            item.kind,
+                            item.message_id.as_deref().unwrap_or("-"),
+                            item.call_id.as_deref().unwrap_or("-"),
+                            text.chars().count(),
+                            preview.replace('\n', "⏎")
+                        );
+                    }
+                } else {
+                    println!("event kind={}", event.kind);
+                }
+            }
+        }
+    };
+    let timer = async {
+        smol::Timer::after(Duration::from_secs(15)).await;
+    };
+    smol::future::or(collect, timer).await;
     Ok(())
 }
 
