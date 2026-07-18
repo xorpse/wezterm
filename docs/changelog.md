@@ -75,6 +75,11 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* [tab_attention](config/lua/config/tab_attention.md) makes an inactive tab
+  pulse its background color when one of its panes sets a designated
+  [user var](recipes/passing-data.md) (default `claude_status`), keyed by the
+  var's value to a configurable color. Useful for flagging a background tab that
+  is waiting for input; clears when the var is emptied or the tab is focused.
 * [tab_bar_placement](config/lua/config/tab_bar_placement.md) adds an optional
   **vertical tab bar** on the left or right (fancy tab bar only): stacked tabs
   with per-tab icons ([show_tab_icons](config/lua/config/show_tab_icons.md)), a
