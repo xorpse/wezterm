@@ -518,6 +518,7 @@ impl super::TermWindow {
     pub fn mouse_event_tab_search(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         if event.kind == WMEK::Press(MousePress::Left) {
             self.tab_search_active = true;
+            self.clear_tab_search_cache();
             self.invalidate_fancy_tab_bar();
             context.invalidate();
         }

@@ -225,6 +225,21 @@ impl crate::TermWindow {
     }
 
     pub fn tab_search_content(&self, tab_idx: usize) -> Option<String> {
+        if let Some(cached) = self.tab_search_cache.borrow().get(&tab_idx) {
+            return cached.clone();
+        }
+        let computed = self.compute_tab_search_content(tab_idx);
+        self.tab_search_cache
+            .borrow_mut()
+            .insert(tab_idx, computed.clone());
+        computed
+    }
+
+    pub fn clear_tab_search_cache(&self) {
+        self.tab_search_cache.borrow_mut().clear();
+    }
+
+    fn compute_tab_search_content(&self, tab_idx: usize) -> Option<String> {
         let mux = mux::Mux::get();
         let tab = mux
             .get_window(self.mux_window_id)

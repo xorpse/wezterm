@@ -761,6 +761,7 @@ impl super::TermWindow {
             (KC::Escape, _) => {
                 self.tab_search_query.clear();
                 self.tab_search_active = false;
+                self.clear_tab_search_cache();
             }
             (KC::Char('u'), m) if m.contains(Modifiers::CTRL) => {
                 self.tab_search_query.clear();
