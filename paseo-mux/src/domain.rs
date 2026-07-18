@@ -8,6 +8,7 @@ use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::PaseoClient;
 use portable_pty::CommandBuilder;
+use std::collections::HashSet;
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
 
@@ -29,6 +30,7 @@ pub struct PaseoDomain {
     target: ConnectTarget,
     client: Mutex<Option<PaseoClient>>,
     state: Mutex<DomainState>,
+    attached_terminals: Mutex<HashSet<String>>,
 }
 
 impl PaseoDomain {
@@ -39,6 +41,7 @@ impl PaseoDomain {
             target,
             client: Mutex::new(None),
             state: Mutex::new(DomainState::Detached),
+            attached_terminals: Mutex::new(HashSet::new()),
         })
     }
 
@@ -140,6 +143,9 @@ impl Domain for PaseoDomain {
             terminals.len()
         );
         for info in terminals {
+            if !self.attached_terminals.lock().insert(info.id.clone()) {
+                continue;
+            }
             let handle = client.subscribe_terminal(&info.id, "live").await?;
             let remote = handle.writer();
             let (pane, input_rx) = PaseoTerminalPane::new(
@@ -167,6 +173,7 @@ impl Domain for PaseoDomain {
 
     fn detach(&self) -> anyhow::Result<()> {
         *self.client.lock() = None;
+        self.attached_terminals.lock().clear();
         *self.state.lock() = DomainState::Detached;
         Ok(())
     }

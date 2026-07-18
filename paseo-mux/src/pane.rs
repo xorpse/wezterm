@@ -239,6 +239,18 @@ impl Pane for PaseoTerminalPane {
         self.terminal.lock().palette()
     }
 
+    fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
+        self.terminal.lock().set_config(config);
+    }
+
+    fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
+        Some(self.terminal.lock().get_config())
+    }
+
+    fn copy_user_vars(&self) -> std::collections::HashMap<String, String> {
+        self.terminal.lock().user_vars().clone()
+    }
+
     fn is_mouse_grabbed(&self) -> bool {
         self.terminal.lock().is_mouse_grabbed()
     }
