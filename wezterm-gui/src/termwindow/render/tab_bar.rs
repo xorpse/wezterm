@@ -48,6 +48,7 @@ impl crate::TermWindow {
                 });
             }
             self.paint_vertical_collapse_button()?;
+            self.paint_tab_hover_card()?;
             return Ok(());
         }
 
@@ -220,6 +221,267 @@ impl crate::TermWindow {
 
         self.render_element(&computed, self.render_state.as_ref().unwrap(), None)?;
         self.ui_items.append(&mut computed.ui_items());
+        Ok(())
+    }
+
+    pub fn tab_search_content(&self, tab_idx: usize) -> Option<String> {
+        let mux = mux::Mux::get();
+        let tab = mux
+            .get_window(self.mux_window_id)
+            .and_then(|w| w.get_by_idx(tab_idx).cloned())?;
+        let pane = tab.get_active_pane()?;
+        let dims = pane.get_dimensions();
+        let (_, lines) =
+            pane.get_lines(dims.physical_top..dims.physical_top + dims.viewport_rows as isize);
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if joined.trim().is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    fn paint_tab_hover_card(&mut self) -> anyhow::Result<()> {
+        use crate::termwindow::box_model::*;
+        use crate::termwindow::render::corners::{
+            BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
+            TOP_RIGHT_ROUNDED_CORNER,
+        };
+        use config::{Dimension, DimensionContext};
+        use mux::pane::CachePolicy;
+        use mux::Mux;
+
+        if !self.config.show_tab_hover_preview
+            || !self.resolved_tab_bar_placement().is_vertical()
+            || self.tab_bar_collapsed
+        {
+            self.hovered_card_rect = None;
+            return Ok(());
+        }
+        let tab_idx = match self.hovered_tab {
+            Some(idx) => idx,
+            None => {
+                self.hovered_card_rect = None;
+                return Ok(());
+            }
+        };
+
+        if let Some(since) = self.hovered_tab_since {
+            let ready_at =
+                since + std::time::Duration::from_millis(self.config.tab_hover_preview_delay_ms);
+            if std::time::Instant::now() < ready_at {
+                self.update_next_frame_time(Some(ready_at));
+                return Ok(());
+            }
+        }
+
+        if let Some((cached_idx, elem)) = self.hovered_card.as_ref() {
+            if *cached_idx == tab_idx {
+                self.render_element(elem, self.render_state.as_ref().unwrap(), None)?;
+                return Ok(());
+            }
+        }
+
+        let font = self.fonts.title_font()?;
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let cell_w = metrics.cell_size.width as f32;
+        let cell_h = metrics.cell_size.height as f32;
+        let pixel_width = self.dimensions.pixel_width as f32;
+        let pixel_height = self.dimensions.pixel_height as f32;
+
+        let card_w = (cell_w * 40.0).min(pixel_width * 0.45).max(cell_w * 16.0);
+        let card_h = (card_w * pixel_height / pixel_width).clamp(cell_h * 4.0, pixel_height * 0.85);
+        let inner_rows = (card_h / cell_h).floor().max(3.0) as usize;
+        let preview_rows = inner_rows.saturating_sub(2).max(1);
+        let cols = ((card_w / cell_w) as usize).saturating_sub(3).max(4);
+
+        let truncate = |s: &str, max: usize| -> String {
+            if s.chars().count() > max {
+                s.chars().take(max.saturating_sub(1)).collect::<String>() + "\u{2026}"
+            } else {
+                s.to_string()
+            }
+        };
+
+        let (title, meta, mut preview) = {
+            let mux = Mux::get();
+            let tab = match mux
+                .get_window(self.mux_window_id)
+                .and_then(|w| w.get_by_idx(tab_idx).cloned())
+            {
+                Some(t) => t,
+                None => {
+                    self.hovered_card_rect = None;
+                    return Ok(());
+                }
+            };
+            let pane = match tab.get_active_pane() {
+                Some(p) => p,
+                None => {
+                    self.hovered_card_rect = None;
+                    return Ok(());
+                }
+            };
+
+            let title = truncate(&pane.get_title(), cols);
+
+            let mut meta_parts = vec![];
+            if let Some(proc) = pane.get_foreground_process_name(CachePolicy::AllowStale) {
+                let short = std::path::Path::new(&proc)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or(proc);
+                meta_parts.push(short);
+            }
+            let pane_count = tab.count_panes().unwrap_or(1);
+            meta_parts.push(format!(
+                "{} pane{}",
+                pane_count,
+                if pane_count == 1 { "" } else { "s" }
+            ));
+            if let Some(cwd) = pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .and_then(|u| u.to_file_path().ok())
+            {
+                meta_parts.push(cwd.to_string_lossy().to_string());
+            }
+            let meta = truncate(&meta_parts.join(" \u{b7} "), cols);
+
+            let dims = pane.get_dimensions();
+            let (_, lines) =
+                pane.get_lines(dims.physical_top..dims.physical_top + dims.viewport_rows as isize);
+            let mut texts: Vec<String> = lines
+                .iter()
+                .map(|l| l.as_str().trim_end().to_string())
+                .collect();
+            while texts.last().map(|s| s.is_empty()).unwrap_or(false) {
+                texts.pop();
+            }
+            let first = texts.len().saturating_sub(preview_rows);
+            let preview: Vec<String> = texts[first..]
+                .iter()
+                .map(|s| truncate(s, cols))
+                .collect();
+
+            (title, meta, preview)
+        };
+
+        while preview.len() < preview_rows {
+            preview.push(String::new());
+        }
+        preview.truncate(preview_rows);
+
+        let palette = self.palette().clone();
+        let card_bg = palette.background.to_linear();
+        let card_fg = palette.foreground.to_linear();
+        let border_col = palette.split.to_linear();
+        let dim_fg = card_fg.mul_alpha(0.7);
+
+        let line_element = |text: String, color: LinearRgba| -> Element {
+            Element::new(&font, ElementContent::Text(text))
+                .display(DisplayType::Block)
+                .colors(ElementColors {
+                    border: BorderColor::default(),
+                    bg: LinearRgba::TRANSPARENT.into(),
+                    text: color.into(),
+                })
+        };
+
+        let mut children = vec![line_element(title, card_fg)];
+        if !meta.is_empty() {
+            children.push(line_element(meta, dim_fg));
+        }
+        for line in preview {
+            let shown = if line.is_empty() {
+                " ".to_string()
+            } else {
+                line
+            };
+            children.push(line_element(shown, dim_fg));
+        }
+
+        let radius = SizedPoly {
+            width: Dimension::Cells(0.3),
+            height: Dimension::Cells(0.3),
+            poly: TOP_LEFT_ROUNDED_CORNER,
+        };
+        let card = Element::new(&font, ElementContent::Children(children))
+            .display(DisplayType::Block)
+            .min_width(Some(Dimension::Pixels(card_w)))
+            .max_width(Some(Dimension::Pixels(card_w)))
+            .colors(ElementColors {
+                border: BorderColor::new(border_col),
+                bg: card_bg.into(),
+                text: card_fg.into(),
+            })
+            .padding(BoxDimension {
+                left: Dimension::Cells(0.5),
+                right: Dimension::Cells(0.5),
+                top: Dimension::Cells(0.3),
+                bottom: Dimension::Cells(0.3),
+            })
+            .border(BoxDimension::new(Dimension::Pixels(
+                self.config.tab_hover_preview_border_width,
+            )))
+            .border_corners(Some(Corners {
+                top_left: radius.clone(),
+                top_right: SizedPoly {
+                    poly: TOP_RIGHT_ROUNDED_CORNER,
+                    ..radius.clone()
+                },
+                bottom_left: SizedPoly {
+                    poly: BOTTOM_LEFT_ROUNDED_CORNER,
+                    ..radius.clone()
+                },
+                bottom_right: SizedPoly {
+                    poly: BOTTOM_RIGHT_ROUNDED_CORNER,
+                    ..radius.clone()
+                },
+            }))
+            .zindex(30);
+
+        let mut computed = self.compute_element(
+            &LayoutContext {
+                height: DimensionContext {
+                    dpi: self.dimensions.dpi as f32,
+                    pixel_max: pixel_height,
+                    pixel_cell: cell_h,
+                },
+                width: DimensionContext {
+                    dpi: self.dimensions.dpi as f32,
+                    pixel_max: card_w,
+                    pixel_cell: cell_w,
+                },
+                bounds: euclid::rect(0., 0., card_w, pixel_height),
+                metrics: &metrics,
+                gl_state: self.render_state.as_ref().unwrap(),
+                zindex: 30,
+            },
+            &card,
+        )?;
+
+        let w = computed.bounds.width();
+        let h = computed.bounds.height();
+        let border = self.get_os_border();
+        let strip = self.vertical_tab_bar_width();
+        let gap = 6.0;
+        let x = if self.resolved_tab_bar_placement() == config::TabBarPlacement::Right {
+            (pixel_width - strip - border.right.get() as f32 - w - gap).max(0.)
+        } else {
+            strip + border.left.get() as f32 + gap
+        };
+        let ty = self.hovered_tab_rect.map(|r| r.1).unwrap_or(border.top.get() as f32);
+        let max_y = (pixel_height - h - border.bottom.get() as f32).max(border.top.get() as f32);
+        let y = ty.min(max_y).max(border.top.get() as f32);
+
+        computed.translate(euclid::vec2(x, y));
+        self.render_element(&computed, self.render_state.as_ref().unwrap(), None)?;
+        self.hovered_card_rect = Some((x, y, w, h));
+        self.hovered_card = Some((tab_idx, computed));
         Ok(())
     }
 

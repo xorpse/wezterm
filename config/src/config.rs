@@ -501,6 +501,26 @@ pub struct Config {
     #[dynamic(default)]
     pub show_tab_icons: bool,
 
+    /// If true, a vertical tab bar shows a search field at the top that
+    /// filters the tab list (by substring, case-insensitive) as you type.
+    #[dynamic(default = "default_true")]
+    pub tab_bar_search: bool,
+
+    /// If true, hovering a tab in a vertical tab bar reveals a floating card
+    /// previewing the tab's active pane (metadata plus recent output).
+    #[dynamic(default = "default_true")]
+    pub show_tab_hover_preview: bool,
+
+    /// Delay, in milliseconds, before the vertical tab bar hover preview card
+    /// appears once the pointer settles on a tab.
+    #[dynamic(default = "default_tab_hover_preview_delay_ms")]
+    pub tab_hover_preview_delay_ms: u64,
+
+    /// Width, in pixels, of the border drawn around the vertical tab bar hover
+    /// preview card.
+    #[dynamic(default = "default_tab_hover_preview_border_width")]
+    pub tab_hover_preview_border_width: f32,
+
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
 
@@ -1916,6 +1936,14 @@ impl TabBarPlacement {
 
 fn default_tab_bar_width() -> usize {
     24
+}
+
+fn default_tab_hover_preview_delay_ms() -> u64 {
+    350
+}
+
+fn default_tab_hover_preview_border_width() -> f32 {
+    1.0
 }
 
 fn default_update_interval() -> u64 {

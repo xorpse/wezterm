@@ -45,6 +45,7 @@ impl super::TermWindow {
             | UIItemType::ScrollThumb
             | UIItemType::TabBarResize
             | UIItemType::TabBarCollapse
+            | UIItemType::TabSearch
             | UIItemType::Split(_) => {}
         }
     }
@@ -58,6 +59,7 @@ impl super::TermWindow {
             | UIItemType::ScrollThumb
             | UIItemType::TabBarResize
             | UIItemType::TabBarCollapse
+            | UIItemType::TabSearch
             | UIItemType::Split(_) => {}
         }
     }
@@ -71,6 +73,7 @@ impl super::TermWindow {
 
         self.current_mouse_event.replace(event.clone());
         self.update_tab_bar_edge_hover(&event, context);
+        self.update_tab_hover(&event, context);
 
         let border = self.get_os_border();
 
@@ -224,6 +227,18 @@ impl super::TermWindow {
             None
         };
 
+        if matches!(event.kind, WMEK::Press(_)) && self.tab_search_active {
+            let clicked_search = matches!(
+                &ui_item,
+                Some(item) if item.item_type == UIItemType::TabSearch
+            );
+            if !clicked_search {
+                self.tab_search_active = false;
+                self.invalidate_fancy_tab_bar();
+                context.invalidate();
+            }
+        }
+
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
@@ -255,6 +270,10 @@ impl super::TermWindow {
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
         self.tab_bar_revealed = false;
+        if self.hovered_tab.take().is_some() {
+            self.hovered_tab_rect = None;
+            self.hovered_tab_since = None;
+        }
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
@@ -400,6 +419,9 @@ impl super::TermWindow {
             UIItemType::TabBarCollapse => {
                 self.mouse_event_tab_bar_collapse(event);
             }
+            UIItemType::TabSearch => {
+                self.mouse_event_tab_search(event, context);
+            }
         }
     }
 
@@ -427,6 +449,76 @@ impl super::TermWindow {
         };
         if near != self.tab_bar_revealed {
             self.tab_bar_revealed = near;
+            context.invalidate();
+        }
+    }
+
+    fn clear_tab_hover(&mut self, context: &dyn WindowOps) {
+        if self.hovered_tab.take().is_some() {
+            self.hovered_tab_rect = None;
+            self.hovered_card_rect = None;
+            self.hovered_card = None;
+            self.hovered_tab_since = None;
+            context.invalidate();
+        }
+    }
+
+    fn update_tab_hover(&mut self, event: &MouseEvent, context: &dyn WindowOps) {
+        if !self.config.show_tab_hover_preview
+            || !self.resolved_tab_bar_placement().is_vertical()
+            || self.tab_bar_collapsed
+        {
+            self.clear_tab_hover(context);
+            return;
+        }
+
+        let x = event.coords.x as f32;
+        let y = event.coords.y as f32;
+
+        let over_card = self
+            .hovered_card_rect
+            .map(|(cx, cy, cw, ch)| x >= cx && x <= cx + cw && y >= cy && y <= cy + ch)
+            .unwrap_or(false);
+
+        let hovered = self.resolve_ui_item(event).and_then(|item| {
+            if let UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) = item.item_type {
+                Some((tab_idx, item))
+            } else {
+                None
+            }
+        });
+
+        match hovered {
+            Some((tab_idx, item)) => {
+                let rect = (
+                    item.x as f32,
+                    item.y as f32,
+                    item.width as f32,
+                    item.height as f32,
+                );
+                if self.hovered_tab != Some(tab_idx) {
+                    self.hovered_tab = Some(tab_idx);
+                    self.hovered_tab_rect = Some(rect);
+                    self.hovered_card = None;
+                    self.hovered_tab_since = Some(std::time::Instant::now());
+                    context.invalidate();
+                } else if self.hovered_tab_rect != Some(rect) {
+                    self.hovered_tab_rect = Some(rect);
+                    context.invalidate();
+                }
+            }
+            None => {
+                if !over_card {
+                    self.clear_tab_hover(context);
+                }
+            }
+        }
+    }
+
+    pub fn mouse_event_tab_search(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.tab_search_active = true;
+            self.invalidate_fancy_tab_bar();
             context.invalidate();
         }
     }
