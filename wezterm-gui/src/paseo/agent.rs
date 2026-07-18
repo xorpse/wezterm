@@ -1,6 +1,6 @@
-use crate::termwindow::TermWindow;
+use crate::termwindow::{TermWindow, TermWindowNotif};
 use anyhow::anyhow;
-use config::keyassignment::PaseoAgentArgs;
+use config::keyassignment::{KeyAssignment, PaseoAgentArgs};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -11,7 +11,10 @@ use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use parking_lot::Mutex;
-use paseo_client::{AgentStreamEvent, DaemonEvent, PaseoClient, TimelineItem, ToolCallDetail};
+use paseo_client::{
+    AgentStreamEvent, DaemonEvent, PaseoClient, PermissionRequest, PermissionResponse,
+    TimelineItem, ToolCallDetail,
+};
 use rangeset::RangeSet;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -202,10 +205,20 @@ fn is_message(kind: &str) -> bool {
     matches!(kind, "assistant_message" | "reasoning" | "user_message")
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Scroll,
+    Compose,
+}
+
 struct AgentState {
     title: String,
     status_message: Option<String>,
     items: Vec<TimelineItem>,
+    pending: Option<PermissionRequest>,
+    mode: Mode,
+    composer: String,
+    composer_row: usize,
     rows: Vec<AgentRow>,
     rows_version: u64,
     size: TerminalSize,
@@ -226,6 +239,47 @@ impl AgentState {
                 item_to_rows(item, cols, &mut rows);
             }
         }
+
+        if let Some(request) = &self.pending {
+            rows.push(blank_row());
+            let title = request
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| request.name.clone());
+            push_wrapped(
+                &mut rows,
+                "⚠ permission: ",
+                &title,
+                &attr_bold_fg(AnsiColor::Yellow),
+                cols,
+            );
+            if let Some(desc) = request.description.as_deref().filter(|d| !d.is_empty()) {
+                push_wrapped(&mut rows, "  ", desc, &attr_dim(), cols);
+            }
+            push_wrapped(
+                &mut rows,
+                "  ",
+                "[y] allow   [n] deny",
+                &attr_fg(AnsiColor::Yellow),
+                cols,
+            );
+        }
+
+        rows.push(blank_row());
+        let composer = match self.mode {
+            Mode::Compose => AgentRow {
+                text: format!("❯ {}", self.composer),
+                attrs: attr_default(),
+            },
+            Mode::Scroll => AgentRow {
+                text: "❯ (i: type · g/G: top/bottom · j/k: scroll)".to_string(),
+                attrs: attr_dim(),
+            },
+        };
+        self.composer_row = rows.len();
+        rows.push(composer);
+
         self.rows = rows;
     }
 
@@ -335,6 +389,79 @@ impl PaseoAgentPane {
         });
     }
 
+    fn set_pending(&self, request: PermissionRequest) {
+        self.mutate(|state| {
+            state.pending = Some(request);
+            state.rebuild_rows();
+        });
+    }
+
+    fn scroll(&self, assignment: KeyAssignment) {
+        let pane_id = self.pane_id;
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                if let Some(pane) = Mux::get().get_pane(pane_id) {
+                    let _ = tw.perform_key_assignment(&pane, &assignment);
+                }
+            })));
+    }
+
+    fn submit_composer(&self) {
+        let text = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.composer).trim().to_string()
+        };
+        if !text.is_empty() {
+            if let Some(agent_id) = self.agent_id.lock().clone() {
+                let client = self.client.clone();
+                promise::spawn::spawn(async move {
+                    let _ = client.send_agent_message(&agent_id, &text).await;
+                })
+                .detach();
+            }
+        }
+        self.mutate(|state| state.rebuild_rows());
+    }
+
+    fn respond_permission(&self, allow: bool) {
+        let (agent_id, request_id, action_id) = {
+            let state = self.state.lock();
+            let Some(request) = &state.pending else {
+                return;
+            };
+            let behavior = if allow { "allow" } else { "deny" };
+            let action_id = request
+                .actions
+                .iter()
+                .find(|a| a.behavior == behavior)
+                .map(|a| a.id.clone());
+            (self.agent_id.lock().clone(), request.id.clone(), action_id)
+        };
+        if let Some(agent_id) = agent_id {
+            let client = self.client.clone();
+            let response = if allow {
+                PermissionResponse::Allow {
+                    selected_action_id: action_id,
+                }
+            } else {
+                PermissionResponse::Deny {
+                    message: None,
+                    interrupt: false,
+                }
+            };
+            promise::spawn::spawn(async move {
+                let _ = client
+                    .respond_permission(&agent_id, &request_id, response)
+                    .await;
+            })
+            .detach();
+        }
+        self.mutate(|state| {
+            state.pending = None;
+            state.rebuild_rows();
+        });
+    }
+
     pub fn start(self: &Arc<Self>, requested_agent: Option<String>) {
         let weak = Arc::downgrade(self);
         let client = self.client.clone();
@@ -377,14 +504,20 @@ impl PaseoAgentPane {
                 let Some(pane) = weak.upgrade() else {
                     break;
                 };
-                if let DaemonEvent::AgentStream {
-                    agent_id: stream_agent,
-                    event,
-                } = event
-                {
-                    if stream_agent == agent_id {
+                match event {
+                    DaemonEvent::AgentStream {
+                        agent_id: stream_agent,
+                        event,
+                    } if stream_agent == agent_id => {
                         pane.apply_stream_event(&event);
                     }
+                    DaemonEvent::PermissionRequest {
+                        agent_id: perm_agent,
+                        request,
+                    } if perm_agent == agent_id => {
+                        pane.set_pending(*request);
+                    }
+                    _ => {}
                 }
             }
 
@@ -441,6 +574,15 @@ impl Pane for PaseoAgentPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
+        let state = self.state.lock();
+        if state.mode == Mode::Compose {
+            return StableCursorPosition {
+                x: 2 + state.composer.chars().count(),
+                y: state.composer_row as StableRowIndex,
+                shape: termwiz::surface::CursorShape::SteadyBlock,
+                visibility: CursorVisibility::Visible,
+            };
+        }
         StableCursorPosition {
             x: 0,
             y: 0,
@@ -527,7 +669,47 @@ impl Pane for PaseoAgentPane {
         Ok(())
     }
 
-    fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+    fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        let mode = self.state.lock().mode;
+        match mode {
+            Mode::Compose => match key {
+                KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(),
+                KeyCode::Backspace => self.mutate(|state| {
+                    state.composer.pop();
+                    state.rebuild_rows();
+                }),
+                KeyCode::Escape => self.mutate(|state| {
+                    state.mode = Mode::Scroll;
+                    state.rebuild_rows();
+                }),
+                KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CTRL) => self
+                    .mutate(|state| {
+                        state.composer.push(c);
+                        state.rebuild_rows();
+                    }),
+                _ => {}
+            },
+            Mode::Scroll => match key {
+                KeyCode::Char('i') | KeyCode::Char('\r') | KeyCode::Enter => {
+                    self.mutate(|state| {
+                        state.mode = Mode::Compose;
+                        state.rebuild_rows();
+                    });
+                    self.scroll(KeyAssignment::ScrollToBottom);
+                }
+                KeyCode::Char('y') => self.respond_permission(true),
+                KeyCode::Char('n') => self.respond_permission(false),
+                KeyCode::Char('g') | KeyCode::Home => self.scroll(KeyAssignment::ScrollToTop),
+                KeyCode::Char('G') | KeyCode::End => self.scroll(KeyAssignment::ScrollToBottom),
+                KeyCode::Char('j') | KeyCode::DownArrow => {
+                    self.scroll(KeyAssignment::ScrollByLine(1))
+                }
+                KeyCode::Char('k') | KeyCode::UpArrow => {
+                    self.scroll(KeyAssignment::ScrollByLine(-1))
+                }
+                _ => {}
+            },
+        }
         Ok(())
     }
 
@@ -617,6 +799,10 @@ pub fn open_paseo_agent_pane(
             title: "Agent (loading…)".to_string(),
             status_message: Some("⟳ loading agent…".to_string()),
             items: Vec::new(),
+            pending: None,
+            mode: Mode::Scroll,
+            composer: String::new(),
+            composer_row: 0,
             rows: Vec::new(),
             rows_version: 0,
             size: split_size.second,
