@@ -10,3 +10,4 @@ description = "Portable git diff model, invocation and unified-diff parsing for 
 anyhow = {workspace=true}
 thiserror = {workspace=true}
 log = {workspace=true}
+memmap2 = {workspace=true}

@@ -137,6 +137,7 @@ impl GitDiffData {
 pub struct DiffLimits {
     pub max_file_lines: usize,
     pub max_total_lines: usize,
+    pub max_file_bytes: u64,
 }
 
 impl Default for DiffLimits {
@@ -144,6 +145,17 @@ impl Default for DiffLimits {
         Self {
             max_file_lines: 20_000,
             max_total_lines: 200_000,
+            max_file_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl DiffLimits {
+    pub fn on_demand() -> Self {
+        Self {
+            max_file_lines: 500_000,
+            max_total_lines: usize::MAX,
+            max_file_bytes: 256 * 1024 * 1024,
         }
     }
 }

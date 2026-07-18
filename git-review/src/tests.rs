@@ -168,12 +168,83 @@ fn oversized_drops_hunks() {
     let limits = DiffLimits {
         max_file_lines: 1,
         max_total_lines: 1_000,
+        ..DiffLimits::default()
     };
     let f = &parse_bulk_diff(MODIFIED, &limits).unwrap()[0];
     assert!(f.oversized);
     assert!(f.hunks.is_empty());
     assert_eq!(f.additions, 1);
     assert_eq!(f.deletions, 1);
+}
+
+fn temp_repo(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("git-review-test-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn untracked_small_file_reads() {
+    let dir = temp_repo("small");
+    std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let mut retained = 0;
+    let f = crate::git::synth_untracked(dir.to_str().unwrap(), "a.txt", &DiffLimits::default(), &mut retained);
+    assert!(!f.oversized);
+    assert_eq!(f.additions, 3);
+    assert_eq!(retained, 3);
+    assert_eq!(f.hunks[0].lines.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn untracked_over_byte_cap_is_withheld() {
+    let dir = temp_repo("bytes");
+    std::fs::write(dir.join("big.dat"), vec![b'x'; 4096]).unwrap();
+    let limits = DiffLimits {
+        max_file_bytes: 1024,
+        ..DiffLimits::default()
+    };
+    let mut retained = 0;
+    let f = crate::git::synth_untracked(dir.to_str().unwrap(), "big.dat", &limits, &mut retained);
+    assert!(f.oversized);
+    assert!(f.hunks.is_empty());
+    assert_eq!(retained, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn untracked_withheld_once_total_budget_hit() {
+    let dir = temp_repo("budget");
+    std::fs::write(dir.join("a.txt"), "line\n").unwrap();
+    let limits = DiffLimits {
+        max_total_lines: 10,
+        ..DiffLimits::default()
+    };
+    let mut retained = 10;
+    let f = crate::git::synth_untracked(dir.to_str().unwrap(), "a.txt", &limits, &mut retained);
+    assert!(f.oversized);
+    assert!(f.hunks.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn untracked_over_line_cap_is_withheld() {
+    let dir = temp_repo("lines");
+    let body: String = (0..100).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(dir.join("many.txt"), body).unwrap();
+    let limits = DiffLimits {
+        max_file_lines: 10,
+        ..DiffLimits::default()
+    };
+    let mut retained = 0;
+    let f = crate::git::synth_untracked(dir.to_str().unwrap(), "many.txt", &limits, &mut retained);
+    assert!(f.oversized);
+    assert!(f.hunks.is_empty());
+    let generous = crate::git::synth_untracked(dir.to_str().unwrap(), "many.txt", &DiffLimits::on_demand(), &mut 0);
+    assert!(!generous.oversized);
+    assert_eq!(generous.additions, 100);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

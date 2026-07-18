@@ -5,8 +5,8 @@ use config::keyassignment::{
     SpawnCommand, SpawnTabDomain, SplitSize as ConfigSplitSize,
 };
 use git_review::{
-    compute_diff, current_branch, find_repo_root, hunk_gap, DiffLimits, DiffLineType, DiffMode,
-    GitDiffData, GitFileStatus, Host, Side,
+    compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, DiffLimits,
+    DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
 use percent_encoding::percent_decode_str;
 use std::collections::{HashMap, HashSet};
@@ -202,6 +202,11 @@ enum LoadStatus {
     Error(String),
 }
 
+enum FileLoad {
+    Loading,
+    Failed(String),
+}
+
 struct ReviewState {
     status: LoadStatus,
     mode: DiffMode,
@@ -209,6 +214,10 @@ struct ReviewState {
     repo_root: String,
     branch: Option<String>,
     data: Option<GitDiffData>,
+    cache: HashMap<DiffMode, GitDiffData>,
+    file_loads: HashMap<String, FileLoad>,
+    compute_seq: u64,
+    compute_started: Option<Instant>,
     annotations: HashMap<LineAnchor, Comment>,
     collapsed: HashSet<String>,
     find: Option<FindState>,
@@ -351,10 +360,35 @@ impl ReviewState {
         }
     }
 
+    fn set_collapsed_toggle(&mut self, file: &str) -> Option<(String, GitFileStatus)> {
+        let was_collapsed = self.collapsed.remove(file);
+        if !was_collapsed {
+            self.collapsed.insert(file.to_string());
+            return None;
+        }
+        let candidate = self
+            .data
+            .as_ref()
+            .and_then(|d| d.files.iter().find(|f| f.file_path == file))
+            .filter(|f| f.oversized && !f.is_binary)
+            .map(|f| (f.file_path.clone(), f.status.clone()))?;
+        if self.file_loads.contains_key(&candidate.0) {
+            return None;
+        }
+        self.file_loads.insert(candidate.0.clone(), FileLoad::Loading);
+        Some(candidate)
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows_version = self.rows_version.wrapping_add(1);
         if let Some(data) = &self.data {
-            self.rows = build_rows(data, &self.annotations, &self.collapsed, self.editing.as_ref());
+            self.rows = build_rows(
+                data,
+                &self.annotations,
+                &self.collapsed,
+                &self.file_loads,
+                self.editing.as_ref(),
+            );
         }
         self.edit_first_row = self.rows.iter().position(|r| r.kind == RowKind::NoteEdit);
         match (self.edit_first_row, &self.editing) {
@@ -541,6 +575,7 @@ impl ReviewPane {
             s.editing = None;
             s.edit_first_row = None;
             s.last_refresh = Some(Instant::now());
+            s.compute_seq = s.compute_seq.wrapping_add(1);
         }
         ReviewPane::spawn_compute(arc, reset_view);
     }
@@ -549,6 +584,15 @@ impl ReviewPane {
         {
             let mut s = self.state.lock();
             s.mode = s.mode.cycle();
+            if let Some(data) = s.cache.get(&s.mode).cloned() {
+                s.collapsed = data.files.iter().map(|f| f.file_path.clone()).collect();
+                s.file_loads.clear();
+                s.data = Some(data);
+                s.status = LoadStatus::Ready;
+                s.cursor = 0;
+                s.scroll = 0;
+                s.rebuild_rows();
+            }
         }
         self.recompute(true);
     }
@@ -837,11 +881,10 @@ impl ReviewPane {
     }
 
     fn toggle_fold(&self) {
+        let mut to_load = None;
         self.mutate(|s| {
             if let Some(file) = s.rows.get(s.cursor).and_then(|r| r.file.clone()) {
-                if !s.collapsed.remove(&file) {
-                    s.collapsed.insert(file.clone());
-                }
+                to_load = s.set_collapsed_toggle(&file);
                 s.rebuild_rows();
                 if let Some(idx) = s.rows.iter().position(|r| {
                     r.kind == RowKind::FileHeader && r.file.as_deref() == Some(file.as_str())
@@ -851,6 +894,11 @@ impl ReviewPane {
                 }
             }
         });
+        if let Some((path, status)) = to_load {
+            if let Some(arc) = self.weak.lock().upgrade() {
+                ReviewPane::spawn_file_load(arc, path, status);
+            }
+        }
     }
 
     fn render_find_bar(&self, state: &ReviewState) -> Line {
@@ -878,11 +926,27 @@ impl ReviewPane {
     }
 
     fn spawn_compute(pane: Arc<ReviewPane>, reset_view: bool) {
+        let (host, start, mode, seq, is_initial) = {
+            let mut s = pane.state.lock();
+            s.compute_started = Some(Instant::now());
+            let is_initial = s.data.is_none();
+            if is_initial {
+                s.status = LoadStatus::Loading;
+            }
+            (
+                s.host.clone(),
+                s.repo_root.clone(),
+                s.mode.clone(),
+                s.compute_seq,
+                is_initial,
+            )
+        };
+
+        if is_initial {
+            Self::spawn_loading_ticker(pane.clone(), seq);
+        }
+
         std::thread::spawn(move || {
-            let (host, start, mode) = {
-                let s = pane.state.lock();
-                (s.host.clone(), s.repo_root.clone(), s.mode.clone())
-            };
             let result = (|| {
                 let root = find_repo_root(&host, &start)?;
                 let branch = current_branch(&host, &root);
@@ -892,15 +956,20 @@ impl ReviewPane {
 
             {
                 let mut state = pane.state.lock();
+                if state.compute_seq != seq {
+                    return;
+                }
                 match result {
                     Ok((root, branch, data)) => {
                         state.repo_root = root;
                         state.branch = branch;
+                        state.cache.insert(mode.clone(), data.clone());
                         if reset_view {
                             state.collapsed =
                                 data.files.iter().map(|f| f.file_path.clone()).collect();
                             state.cursor = 0;
                             state.scroll = 0;
+                            state.file_loads.clear();
                         }
                         state.data = Some(data);
                         state.status = LoadStatus::Ready;
@@ -923,6 +992,72 @@ impl ReviewPane {
                     }
                 }
                 state.seqno += 1;
+            }
+            pane.window.invalidate();
+        });
+    }
+
+    fn spawn_loading_ticker(pane: Arc<ReviewPane>, seq: u64) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            {
+                let mut s = pane.state.lock();
+                if s.compute_seq != seq || !matches!(s.status, LoadStatus::Loading) {
+                    break;
+                }
+                let elapsed = s.compute_started.map_or(0, |t| t.elapsed().as_secs());
+                let hint = if elapsed >= 5 {
+                    " — scanning a large tree can take a while"
+                } else {
+                    ""
+                };
+                s.rows = vec![RenderRow::plain(
+                    format!("⟳ computing diff… ({elapsed}s){hint}"),
+                    RowKind::Info,
+                )];
+                s.seqno += 1;
+            }
+            pane.window.invalidate();
+        });
+    }
+
+    fn spawn_file_load(pane: Arc<ReviewPane>, path: String, status: GitFileStatus) {
+        std::thread::spawn(move || {
+            let (host, repo, mode, seq) = {
+                let s = pane.state.lock();
+                (s.host.clone(), s.repo_root.clone(), s.mode.clone(), s.compute_seq)
+            };
+            let result = compute_file_diff(&host, &repo, &mode, &path, &status, &DiffLimits::on_demand());
+
+            {
+                let mut s = pane.state.lock();
+                if s.compute_seq != seq {
+                    return;
+                }
+                match result {
+                    Ok(file) => {
+                        let still_oversized = file.oversized;
+                        if let Some(data) = &mut s.data {
+                            if let Some(slot) =
+                                data.files.iter_mut().find(|f| f.file_path == path)
+                            {
+                                *slot = file;
+                            }
+                            data.recompute_totals();
+                        }
+                        if still_oversized {
+                            s.file_loads
+                                .insert(path.clone(), FileLoad::Failed("file too large to display".to_string()));
+                        } else {
+                            s.file_loads.remove(&path);
+                        }
+                    }
+                    Err(err) => {
+                        s.file_loads.insert(path.clone(), FileLoad::Failed(format!("{err:#}")));
+                    }
+                }
+                s.seqno += 1;
+                s.rebuild_rows();
             }
             pane.window.invalidate();
         });
@@ -1137,6 +1272,7 @@ fn build_rows(
     data: &GitDiffData,
     annotations: &HashMap<LineAnchor, Comment>,
     collapsed: &HashSet<String>,
+    file_loads: &HashMap<String, FileLoad>,
     editing: Option<&EditState>,
 ) -> Vec<RenderRow> {
     let mut rows = Vec::new();
@@ -1185,13 +1321,20 @@ fn build_rows(
         if file.is_binary {
             rows.push(RenderRow::plain("  binary file".to_string(), RowKind::Summary));
         } else if file.oversized {
-            rows.push(RenderRow::plain(
-                format!(
-                    "  large diff (+{} -{}) — hunks hidden",
-                    file.additions, file.deletions
-                ),
-                RowKind::Summary,
-            ));
+            let msg = match file_loads.get(&file.file_path) {
+                Some(FileLoad::Loading) => "  loading…".to_string(),
+                Some(FileLoad::Failed(err)) => format!("  {err}"),
+                None => match file.status {
+                    GitFileStatus::Untracked => {
+                        "  large untracked file — press o/Tab to load".to_string()
+                    }
+                    _ => format!(
+                        "  large diff (+{} -{}) — press o/Tab to load",
+                        file.additions, file.deletions
+                    ),
+                },
+            };
+            rows.push(RenderRow::plain(msg, RowKind::Summary));
         } else {
             for (hi, hunk) in file.hunks.iter().enumerate() {
                 if hi > 0 {
@@ -1315,6 +1458,10 @@ pub fn open_review_pane(
             repo_root: start_path,
             branch: None,
             data: None,
+            cache: HashMap::new(),
+            file_loads: HashMap::new(),
+            compute_seq: 0,
+            compute_started: None,
             annotations: HashMap::new(),
             collapsed: HashSet::new(),
             find: None,
@@ -1646,6 +1793,7 @@ impl Pane for ReviewPane {
                     self.start_edit(true);
                     return Ok(());
                 }
+                let mut to_load = None;
                 self.mutate(|s| {
                     if doc >= s.rows.len() {
                         return;
@@ -1654,9 +1802,7 @@ impl Pane for ReviewPane {
                     s.select_start = None;
                     if s.rows[doc].kind == RowKind::FileHeader {
                         if let Some(file) = s.rows[doc].file.clone() {
-                            if !s.collapsed.remove(&file) {
-                                s.collapsed.insert(file);
-                            }
+                            to_load = s.set_collapsed_toggle(&file);
                             s.drag_anchor = None;
                             s.rebuild_rows();
                         }
@@ -1664,6 +1810,11 @@ impl Pane for ReviewPane {
                         s.drag_anchor = Some(doc);
                     }
                 });
+                if let Some((path, status)) = to_load {
+                    if let Some(arc) = self.weak.lock().upgrade() {
+                        ReviewPane::spawn_file_load(arc, path, status);
+                    }
+                }
             }
             (MouseButton::Left, MouseEventKind::Move) => {
                 self.mutate(|s| {
@@ -1784,7 +1935,7 @@ mod tests {
             total_deletions: 1,
         };
 
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert_eq!(rows[0].kind, RowKind::FileHeader);
         assert!(rows[0].text.contains("src/foo.rs"));
         assert!(rows[0].text.contains("+1 -1"));
@@ -1817,12 +1968,12 @@ mod tests {
             total_additions: 0,
             total_deletions: 0,
         };
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert!(rows
             .iter()
             .any(|r| r.kind == RowKind::Summary && r.text.contains("binary")));
 
-        let empty = build_rows(&GitDiffData::default(), &HashMap::new(), &HashSet::new(), None);
+        let empty = build_rows(&GitDiffData::default(), &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].kind, RowKind::Info);
     }
@@ -1842,7 +1993,7 @@ mod tests {
             total_additions: 9000,
             total_deletions: 10,
         };
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert!(rows
             .iter()
             .any(|r| r.kind == RowKind::Summary && r.text.contains("large diff")));
@@ -1880,13 +2031,13 @@ mod tests {
             cmt("needs work"),
         );
 
-        let rows = build_rows(&data, &ann, &HashSet::new(), None);
+        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
         let note = rows.iter().find(|r| r.kind == RowKind::Note).unwrap();
         assert!(note.text.contains("needs work"));
         let add = rows.iter().find(|r| r.kind == RowKind::Add).unwrap();
         assert!(add.text.starts_with('●'));
 
-        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert!(plain.iter().all(|r| r.kind != RowKind::Note));
     }
 
@@ -1924,7 +2075,7 @@ mod tests {
             },
             cmt("use the new api"),
         );
-        let rows = build_rows(&data, &ann, &HashSet::new(), None);
+        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
         let payload = build_send_payload(&rows, &ann, 0, rows.len() - 1);
 
         assert!(payload.contains("src/a.rs"));
@@ -1956,7 +2107,7 @@ mod tests {
             total_deletions: 0,
         };
 
-        let expanded = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let expanded = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         assert!(expanded.iter().any(|r| r.kind == RowKind::Add));
         assert!(expanded
             .iter()
@@ -1967,7 +2118,7 @@ mod tests {
 
         let mut collapsed = HashSet::new();
         collapsed.insert("src/foo.rs".to_string());
-        let folded = build_rows(&data, &HashMap::new(), &collapsed, None);
+        let folded = build_rows(&data, &HashMap::new(), &collapsed, &HashMap::new(), None);
         assert!(folded.iter().all(|r| r.kind == RowKind::FileHeader));
         assert!(folded[0].text.starts_with('▸'));
     }
@@ -2038,7 +2189,7 @@ mod tests {
         edit.newline();
         edit.insert_char('x');
 
-        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), Some(&edit));
+        let rows = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), Some(&edit));
         let edits: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::NoteEdit).collect();
         assert_eq!(edits.len(), 2);
         assert!(edits[0].text.ends_with("hi"));
@@ -2078,12 +2229,12 @@ mod tests {
         let mut ann = HashMap::new();
         ann.insert(anchor_a1(), cmt("note"));
 
-        let rows = build_rows(&data, &ann, &HashSet::new(), None);
+        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
         let header = rows.iter().find(|r| r.kind == RowKind::FileHeader).unwrap();
         assert!(header.commented);
         assert!(header.text.contains('💬'));
 
-        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), None);
+        let plain = build_rows(&data, &HashMap::new(), &HashSet::new(), &HashMap::new(), None);
         let h2 = plain.iter().find(|r| r.kind == RowKind::FileHeader).unwrap();
         assert!(!h2.commented);
         assert!(!h2.text.contains('💬'));
@@ -2145,7 +2296,7 @@ mod tests {
             },
             cmt("stale note"),
         );
-        let rows = build_rows(&data, &ann, &HashSet::new(), None);
+        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
         assert!(rows
             .iter()
             .any(|r| r.text.contains("(outdated)") && r.text.contains("stale note")));
@@ -2156,7 +2307,7 @@ mod tests {
         let data = one_add_file();
         let mut ann = HashMap::new();
         ann.insert(anchor_a1(), cmt("line one\nline two"));
-        let rows = build_rows(&data, &ann, &HashSet::new(), None);
+        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
         let notes: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::Note).collect();
         assert_eq!(notes.len(), 2);
         assert!(notes[0].text.contains("line one"));
