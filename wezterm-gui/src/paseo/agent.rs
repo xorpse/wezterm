@@ -20,10 +20,7 @@ use termwiz::color::AnsiColor;
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
 use url::Url;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{
-    unicode_column_width, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    StableRowIndex, TerminalSize,
-};
+use wezterm_term::{unicode_column_width, KeyCode, KeyModifiers, StableRowIndex, TerminalSize};
 use window::{Window, WindowOps};
 
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
@@ -64,6 +61,13 @@ struct AgentRow {
     attrs: CellAttributes,
 }
 
+fn blank_row() -> AgentRow {
+    AgentRow {
+        text: String::new(),
+        attrs: attr_default(),
+    }
+}
+
 fn push_wrapped(
     rows: &mut Vec<AgentRow>,
     prefix: &str,
@@ -98,25 +102,32 @@ fn push_wrapped(
     }
 }
 
-fn item_to_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
+fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
+    let mut rows = Vec::new();
     let text = item.text.clone().unwrap_or_default();
     match item.kind.as_str() {
-        "user_message" => push_wrapped(rows, "▸ ", &text, &attr_fg(AnsiColor::Teal), cols),
-        "assistant_message" => push_wrapped(rows, "", &text, &attr_default(), cols),
-        "reasoning" => push_wrapped(rows, "  ", &text, &attr_dim(), cols),
-        "error" => push_wrapped(rows, "error: ", &text, &attr_fg(AnsiColor::Maroon), cols),
-        "tool_call" => tool_call_rows(item, cols, rows),
-        "compaction" => push_wrapped(rows, "— ", "context compacted", &attr_dim(), cols),
+        "user_message" => push_wrapped(&mut rows, "▸ ", &text, &attr_fg(AnsiColor::Teal), cols),
+        "assistant_message" => push_wrapped(&mut rows, "", &text, &attr_default(), cols),
+        "reasoning" => push_wrapped(&mut rows, "  ", &text, &attr_dim(), cols),
+        "error" => push_wrapped(
+            &mut rows,
+            "error: ",
+            &text,
+            &attr_fg(AnsiColor::Maroon),
+            cols,
+        ),
+        "tool_call" => tool_call_rows(item, cols, &mut rows),
+        "compaction" => push_wrapped(&mut rows, "— ", "context compacted", &attr_dim(), cols),
         _ => {
             if !text.is_empty() {
-                push_wrapped(rows, "", &text, &attr_dim(), cols);
+                push_wrapped(&mut rows, "", &text, &attr_dim(), cols);
             }
         }
     }
-    rows.push(AgentRow {
-        text: String::new(),
-        attrs: attr_default(),
-    });
+    if !rows.is_empty() {
+        out.append(&mut rows);
+        out.push(blank_row());
+    }
 }
 
 fn tool_call_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
@@ -126,14 +137,12 @@ fn tool_call_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
         "completed" => "✓",
         "failed" => "✗",
         "canceled" => "⊘",
-        _ => "▶",
+        _ => "•",
     };
-    let header = format!("{glyph} {name}");
     rows.push(AgentRow {
-        text: header,
+        text: format!("{glyph} {name}"),
         attrs: attr_bold_fg(AnsiColor::Blue),
     });
-
     if let Some(detail) = &item.detail {
         tool_detail_rows(detail, cols, rows);
     }
@@ -146,8 +155,7 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
                 push_wrapped(rows, "  $ ", command, &attr_fg(AnsiColor::Silver), cols);
             }
             if let Some(output) = &detail.output {
-                let trimmed = truncate_lines(output, 40);
-                push_wrapped(rows, "  ", &trimmed, &attr_dim(), cols);
+                push_wrapped(rows, "  ", &truncate_lines(output, 40), &attr_dim(), cols);
             }
         }
         "edit" => {
@@ -189,63 +197,69 @@ fn truncate_lines(text: &str, max: usize) -> String {
     }
 }
 
+fn item_key(item: &TimelineItem) -> Option<String> {
+    if item.kind == "tool_call" {
+        item.call_id.clone()
+    } else {
+        item.message_id.clone()
+    }
+}
+
 struct AgentState {
     title: String,
+    status_message: Option<String>,
+    items: Vec<TimelineItem>,
     rows: Vec<AgentRow>,
     rows_version: u64,
-    rendered: Vec<Line>,
-    rendered_keys: Vec<u64>,
-    scroll: usize,
-    follow: bool,
     size: TerminalSize,
     seqno: SequenceNo,
     dead: bool,
 }
 
 impl AgentState {
-    fn max_scroll(&self) -> usize {
-        self.rows.len().saturating_sub(self.size.rows.max(1))
-    }
-
-    fn clamp_scroll(&mut self) {
-        if self.follow {
-            self.scroll = self.max_scroll();
+    fn rebuild_rows(&mut self) {
+        let cols = self.size.cols;
+        let mut rows = Vec::new();
+        if self.items.is_empty() {
+            if let Some(message) = &self.status_message {
+                push_wrapped(&mut rows, "", message, &attr_dim(), cols);
+            }
         } else {
-            self.scroll = self.scroll.min(self.max_scroll());
-        }
-    }
-
-    fn row_key(&self, doc: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.rows_version.hash(&mut h);
-        doc.hash(&mut h);
-        h.finish()
-    }
-
-    fn build_row_line(&self, doc: usize) -> Line {
-        match self.rows.get(doc) {
-            Some(row) => make_line(&row.text, &row.attrs, self.seqno, self.size.cols),
-            None => make_line("", &CellAttributes::default(), self.seqno, self.size.cols),
-        }
-    }
-
-    fn sync_view(&mut self) {
-        let h = self.size.rows;
-        if self.rendered.len() != h {
-            self.rendered = (0..h)
-                .map(|_| make_line("", &CellAttributes::default(), 0, self.size.cols))
-                .collect();
-            self.rendered_keys = vec![u64::MAX; h];
-        }
-        for r in 0..h {
-            let doc = self.scroll + r;
-            let key = self.row_key(doc);
-            if self.rendered_keys[r] != key {
-                self.rendered[r] = self.build_row_line(doc);
-                self.rendered_keys[r] = key;
+            for item in &self.items {
+                item_to_rows(item, cols, &mut rows);
             }
         }
+        self.rows = rows;
+    }
+
+    fn upsert(&mut self, item: TimelineItem) {
+        match item_key(&item) {
+            Some(key) => {
+                if let Some(existing) = self
+                    .items
+                    .iter_mut()
+                    .find(|it| item_key(it).as_deref() == Some(key.as_str()))
+                {
+                    *existing = item;
+                } else {
+                    self.items.push(item);
+                }
+            }
+            None => self.items.push(item),
+        }
+    }
+
+    fn row_line(&self, index: StableRowIndex) -> Line {
+        if index >= 0 && (index as usize) < self.rows.len() {
+            let row = &self.rows[index as usize];
+            make_line(&row.text, &row.attrs, self.seqno, self.size.cols)
+        } else {
+            make_line("", &CellAttributes::default(), self.seqno, self.size.cols)
+        }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.rows.len().max(self.size.rows)
     }
 }
 
@@ -273,13 +287,9 @@ impl PaseoAgentPane {
 
     fn set_timeline(&self, items: &[TimelineItem]) {
         self.mutate(|state| {
-            let cols = state.size.cols;
-            let mut rows = Vec::new();
-            for item in items {
-                item_to_rows(item, cols, &mut rows);
-            }
-            state.rows = rows;
-            state.clamp_scroll();
+            state.status_message = None;
+            state.items = items.to_vec();
+            state.rebuild_rows();
         });
     }
 
@@ -287,9 +297,9 @@ impl PaseoAgentPane {
         self.mutate(|state| {
             state.title = title;
             if let Some(message) = message {
-                state.rows = Vec::new();
-                push_wrapped(&mut state.rows, "", &message, &attr_dim(), state.size.cols);
-                state.clamp_scroll();
+                state.items.clear();
+                state.status_message = Some(message);
+                state.rebuild_rows();
             }
         });
     }
@@ -302,9 +312,9 @@ impl PaseoAgentPane {
             return;
         };
         self.mutate(|state| {
-            let cols = state.size.cols;
-            item_to_rows(item, cols, &mut state.rows);
-            state.clamp_scroll();
+            state.status_message = None;
+            state.upsert(item.clone());
+            state.rebuild_rows();
         });
     }
 
@@ -424,25 +434,20 @@ impl Pane for PaseoAgentPane {
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let state = self.state.lock();
-        let start = lines.start.max(0);
         let mut out = Vec::new();
-        for r in start..lines.end.max(start) {
-            let doc = state.scroll + r as usize;
-            out.push(state.build_row_line(doc));
+        for index in lines.start..lines.end {
+            out.push(state.row_line(index));
         }
-        (start, out)
+        (lines.start, out)
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        let mut state = self.state.lock();
-        state.sync_view();
-        let h = state.rendered.len() as StableRowIndex;
-        let start = lines.start.clamp(0, h);
-        let end = lines.end.clamp(start, h);
-        let mut refs: Vec<&mut Line> = state.rendered[start as usize..end as usize]
-            .iter_mut()
+        let state = self.state.lock();
+        let mut built: Vec<Line> = (lines.start..lines.end)
+            .map(|index| state.row_line(index))
             .collect();
-        with_lines.with_lines_mut(start, &mut refs);
+        let mut refs: Vec<&mut Line> = built.iter_mut().collect();
+        with_lines.with_lines_mut(lines.start, &mut refs);
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -459,11 +464,13 @@ impl Pane for PaseoAgentPane {
 
     fn get_dimensions(&self) -> RenderableDimensions {
         let state = self.state.lock();
+        let total = state.total_rows();
+        let viewport = state.size.rows;
         RenderableDimensions {
             cols: state.size.cols,
-            viewport_rows: state.size.rows,
-            scrollback_rows: state.size.rows,
-            physical_top: 0,
+            viewport_rows: viewport,
+            scrollback_rows: total,
+            physical_top: total.saturating_sub(viewport) as StableRowIndex,
             scrollback_top: 0,
             dpi: state.size.dpi,
             pixel_width: state.size.pixel_width,
@@ -494,9 +501,7 @@ impl Pane for PaseoAgentPane {
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.mutate(|state| {
             state.size = size;
-            state.rendered.clear();
-            state.rendered_keys.clear();
-            state.clamp_scroll();
+            state.rebuild_rows();
         });
         Ok(())
     }
@@ -505,56 +510,11 @@ impl Pane for PaseoAgentPane {
         Ok(())
     }
 
-    fn key_down(&self, key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
-        self.mutate(|state| {
-            let page = state.size.rows.saturating_sub(1).max(1);
-            let max_scroll = state.max_scroll();
-            match key {
-                KeyCode::Char('j') | KeyCode::DownArrow => {
-                    state.follow = false;
-                    state.scroll = (state.scroll + 1).min(max_scroll);
-                }
-                KeyCode::Char('k') | KeyCode::UpArrow => {
-                    state.follow = false;
-                    state.scroll = state.scroll.saturating_sub(1);
-                }
-                KeyCode::PageDown => {
-                    state.follow = false;
-                    state.scroll = (state.scroll + page).min(max_scroll);
-                }
-                KeyCode::PageUp => {
-                    state.follow = false;
-                    state.scroll = state.scroll.saturating_sub(page);
-                }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    state.follow = false;
-                    state.scroll = 0;
-                }
-                KeyCode::Char('G') | KeyCode::End => {
-                    state.follow = true;
-                    state.scroll = max_scroll;
-                }
-                _ => {}
-            }
-        });
+    fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
-        if event.kind == MouseEventKind::Press {
-            match event.button {
-                MouseButton::WheelUp(_) => self.mutate(|state| {
-                    state.follow = false;
-                    state.scroll = state.scroll.saturating_sub(3);
-                }),
-                MouseButton::WheelDown(_) => self.mutate(|state| {
-                    state.follow = false;
-                    let max_scroll = state.max_scroll();
-                    state.scroll = (state.scroll + 3).min(max_scroll);
-                }),
-                _ => {}
-            }
-        }
+    fn mouse_event(&self, _event: wezterm_term::MouseEvent) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -638,21 +598,17 @@ pub fn open_paseo_agent_pane(
         weak: Mutex::new(Weak::new()),
         state: Mutex::new(AgentState {
             title: "Agent (loading…)".to_string(),
-            rows: vec![AgentRow {
-                text: "⟳ loading agent…".to_string(),
-                attrs: attr_dim(),
-            }],
+            status_message: Some("⟳ loading agent…".to_string()),
+            items: Vec::new(),
+            rows: Vec::new(),
             rows_version: 0,
-            rendered: Vec::new(),
-            rendered_keys: Vec::new(),
-            scroll: 0,
-            follow: true,
             size: split_size.second,
             seqno: 1,
             dead: false,
         }),
     });
 
+    pane.mutate(|state| state.rebuild_rows());
     *pane.weak.lock() = Arc::downgrade(&pane);
 
     let pane_dyn: Arc<dyn Pane> = pane.clone();

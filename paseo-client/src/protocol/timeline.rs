@@ -26,6 +26,8 @@ pub struct TimelineItem {
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(rename = "messageId", default)]
+    pub message_id: Option<String>,
     #[serde(rename = "callId", default)]
     pub call_id: Option<String>,
     #[serde(default)]
