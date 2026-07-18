@@ -7427,6 +7427,7 @@ dependencies = [
  "libc",
  "log",
  "mux",
+ "paseo-mux",
  "portable-pty",
  "promise",
  "rangeset",

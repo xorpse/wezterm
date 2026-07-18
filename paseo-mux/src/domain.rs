@@ -108,7 +108,14 @@ impl Domain for PaseoDomain {
     }
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
+        log::info!("paseo domain {} connecting", self.name);
         let client = self.connect().await?;
+        log::info!(
+            "paseo domain {} connected to {:?} v{:?}",
+            self.name,
+            client.server_info().hostname,
+            client.server_info().version
+        );
         *self.client.lock() = Some(client.clone());
 
         {
@@ -127,6 +134,11 @@ impl Domain for PaseoDomain {
 
         let size = default_size();
         let terminals = client.list_terminals(None).await?;
+        log::info!(
+            "paseo domain {} attaching {} terminals",
+            self.name,
+            terminals.len()
+        );
         for info in terminals {
             let handle = client.subscribe_terminal(&info.id, "live").await?;
             let remote = handle.writer();

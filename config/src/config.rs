@@ -5,6 +5,7 @@ use crate::color::{
 };
 use crate::daemon::DaemonOptions;
 use crate::exec_domain::ExecDomain;
+use crate::paseo::PaseoDaemon;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
     FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
@@ -360,6 +361,9 @@ pub struct Config {
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
+
+    #[dynamic(default)]
+    pub paseo_daemons: Vec<PaseoDaemon>,
 
     #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,

@@ -20,6 +20,7 @@ lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
 mux.workspace = true
+paseo-mux.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true

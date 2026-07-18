@@ -79,6 +79,33 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         mux.add_domain(&domain);
     }
 
+    for paseo_dom in &config.paseo_daemons {
+        if mux.get_domain_by_name(&paseo_dom.name).is_some() {
+            continue;
+        }
+
+        let target = if let Some(url) = &paseo_dom.pairing_offer_url {
+            paseo_mux::ConnectTarget::Relay {
+                offer_url: url.clone(),
+            }
+        } else if let Some(host_port) = &paseo_dom.local_endpoint {
+            paseo_mux::ConnectTarget::Local {
+                host_port: host_port.clone(),
+                use_tls: paseo_dom.use_tls,
+                password: paseo_dom.password.clone(),
+            }
+        } else {
+            log::warn!(
+                "paseo daemon {} has neither pairing_offer_url nor local_endpoint; skipping",
+                paseo_dom.name
+            );
+            continue;
+        };
+
+        let domain: Arc<dyn Domain> = paseo_mux::PaseoDomain::new(paseo_dom.name.clone(), target);
+        mux.add_domain(&domain);
+    }
+
     for serial in &config.serial_ports {
         if mux.get_domain_by_name(&serial.name).is_some() {
             continue;
