@@ -105,10 +105,11 @@ fn push_wrapped(
 fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
     let mut rows = Vec::new();
     let text = item.text.clone().unwrap_or_default();
+    let trimmed = text.trim();
     match item.kind.as_str() {
-        "user_message" => push_wrapped(&mut rows, "▸ ", &text, &attr_fg(AnsiColor::Teal), cols),
-        "assistant_message" => push_wrapped(&mut rows, "", &text, &attr_default(), cols),
-        "reasoning" => push_wrapped(&mut rows, "  ", &text, &attr_dim(), cols),
+        "user_message" => push_wrapped(&mut rows, "▸ ", trimmed, &attr_fg(AnsiColor::Teal), cols),
+        "assistant_message" => push_wrapped(&mut rows, "", trimmed, &attr_default(), cols),
+        "reasoning" => push_wrapped(&mut rows, "  ", trimmed, &attr_dim(), cols),
         "error" => push_wrapped(
             &mut rows,
             "error: ",
@@ -201,7 +202,7 @@ fn item_key(item: &TimelineItem) -> Option<String> {
     if item.kind == "tool_call" {
         item.call_id.clone()
     } else {
-        item.message_id.clone()
+        None
     }
 }
 

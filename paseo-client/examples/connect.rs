@@ -8,6 +8,7 @@ struct Options {
     probe: bool,
     restore: String,
     create_probe: Option<String>,
+    dump_timeline: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -28,6 +29,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         probe: false,
         restore: "live".to_string(),
         create_probe: None,
+        dump_timeline: None,
     };
 
     if first == "--local" {
@@ -49,6 +51,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--create-probe" => {
                 options.create_probe = Some(iter.next().cloned().ok_or_else(usage)?);
+            }
+            "--dump-timeline" => {
+                options.dump_timeline = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -101,7 +106,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(cwd) = &options.create_probe {
+    if let Some(agent_arg) = &options.dump_timeline {
+        dump_timeline(&client, agent_arg, &agents).await?;
+    } else if let Some(cwd) = &options.create_probe {
         create_probe(&client, cwd).await?;
     } else if options.stream {
         if let Some(terminal) = terminals.first() {
@@ -112,6 +119,40 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
     }
 
     client.close().await;
+    Ok(())
+}
+
+async fn dump_timeline(
+    client: &PaseoClient,
+    agent_arg: &str,
+    agents: &[paseo_client::AgentListEntry],
+) -> anyhow::Result<()> {
+    let agent_id = if agent_arg.is_empty() {
+        agents
+            .iter()
+            .find(|e| e.agent.archived_at.is_none())
+            .map(|e| e.agent.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no agents"))?
+    } else {
+        agent_arg.to_string()
+    };
+    println!("timeline for agent {agent_id}");
+    let items = client.fetch_agent_timeline(&agent_id, "tail", 200).await?;
+    println!("items: {}", items.len());
+    for (i, item) in items.iter().enumerate() {
+        let msg = item.message_id.as_deref().unwrap_or("-");
+        let call = item.call_id.as_deref().unwrap_or("-");
+        let text = item.text.clone().unwrap_or_default();
+        let preview: String = text.chars().take(50).collect();
+        println!(
+            "{i:3} kind={:20} msg={:10} call={:10} len={:4} | {}",
+            item.kind,
+            &msg[..msg.len().min(10)],
+            &call[..call.len().min(10)],
+            text.chars().count(),
+            preview.replace('\n', "⏎")
+        );
+    }
     Ok(())
 }
 
