@@ -1,0 +1,415 @@
+use crate::binary_frames::{self, encode_input, encode_resize, Opcode};
+use crate::envelope::{
+    hello_message, parse_top_level, session_envelope, session_message_type, session_request_id,
+    Incoming,
+};
+use crate::error::{PaseoError, Result};
+use crate::events::{DaemonEvent, TerminalStreamEvent};
+use crate::offer::{build_relay_ws_url, decode_daemon_public_key, ConnectionOffer};
+use crate::protocol::agents::{AgentListEntry, PermissionResponse};
+use crate::protocol::stream::{AgentStreamEvent, AgentUpdate};
+use crate::protocol::terminals::{self, CreateTerminalOpts, TerminalInfo};
+use crate::protocol::{agents, ServerInfo};
+use crate::transport::{Frame, Transport, WsTransport};
+use futures::channel::oneshot;
+use parking_lot::Mutex;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+struct Inner {
+    transport: Arc<dyn Transport>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>,
+    events_tx: async_broadcast::Sender<DaemonEvent>,
+    _events_keep: async_broadcast::InactiveReceiver<DaemonEvent>,
+    terminals: Mutex<HashMap<u8, flume::Sender<TerminalStreamEvent>>>,
+    server_info: ServerInfo,
+}
+
+#[derive(Clone)]
+pub struct PaseoClient {
+    inner: Arc<Inner>,
+}
+
+pub struct TerminalHandle {
+    terminal_id: String,
+    slot: u8,
+    transport: Arc<dyn Transport>,
+    owner: PaseoClient,
+    output_rx: flume::Receiver<TerminalStreamEvent>,
+}
+
+impl PaseoClient {
+    pub async fn connect_relay(offer: &ConnectionOffer, client_id: &str) -> Result<PaseoClient> {
+        let daemon_public_key = decode_daemon_public_key(offer)?;
+        let url = build_relay_ws_url(&offer.relay.endpoint, offer.use_tls(), &offer.server_id)?;
+        let transport = WsTransport::connect_relay(&url, daemon_public_key).await?;
+        Self::finish_connect(transport, client_id).await
+    }
+
+    pub async fn connect_local(
+        host_port: &str,
+        use_tls: bool,
+        password: Option<&str>,
+        client_id: &str,
+    ) -> Result<PaseoClient> {
+        let transport = WsTransport::connect_local(host_port, use_tls, password).await?;
+        Self::finish_connect(transport, client_id).await
+    }
+
+    async fn finish_connect(transport: Arc<WsTransport>, client_id: &str) -> Result<PaseoClient> {
+        let transport: Arc<dyn Transport> = transport;
+        transport
+            .send_text(hello_message(client_id, None).to_string())
+            .await?;
+
+        let server_info = loop {
+            match transport.recv().await? {
+                None => return Err(PaseoError::Handshake("closed before server_info".into())),
+                Some(Frame::Json(text)) => {
+                    if let Some(info) = try_parse_server_info(&text) {
+                        break info;
+                    }
+                }
+                Some(Frame::Binary(_)) => continue,
+            }
+        };
+
+        let (mut events_tx, events_rx) = async_broadcast::broadcast(1024);
+        events_tx.set_overflow(true);
+
+        let inner = Arc::new(Inner {
+            transport,
+            pending: Mutex::new(HashMap::new()),
+            events_tx,
+            _events_keep: events_rx.deactivate(),
+            terminals: Mutex::new(HashMap::new()),
+            server_info,
+        });
+
+        Ok(PaseoClient { inner })
+    }
+
+    pub fn server_info(&self) -> &ServerInfo {
+        &self.inner.server_info
+    }
+
+    pub fn events(&self) -> async_broadcast::Receiver<DaemonEvent> {
+        self.inner.events_tx.new_receiver()
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        loop {
+            match self.inner.transport.recv().await {
+                Ok(Some(frame)) => self.dispatch(frame),
+                Ok(None) => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn request(&self, message: Value) -> Result<Value> {
+        let request_id = message
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("request missing requestId".into()))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending.lock().insert(request_id.clone(), tx);
+
+        let envelope = session_envelope(message).to_string();
+        if let Err(err) = self.inner.transport.send_text(envelope).await {
+            self.inner.pending.lock().remove(&request_id);
+            return Err(err);
+        }
+
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(PaseoError::Closed),
+        }
+    }
+
+    pub async fn fetch_agents(&self) -> Result<Vec<AgentListEntry>> {
+        let id = new_id();
+        let payload = self.request(agents::fetch_agents_request(&id)).await?;
+        let entries = payload.get("entries").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::from_value(entries).unwrap_or_default())
+    }
+
+    pub async fn set_timeline_subscription(&self, agent_ids: &[String]) -> Result<()> {
+        let id = new_id();
+        self.request(agents::set_timeline_subscription_request(&id, agent_ids))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn send_agent_message(&self, agent_id: &str, text: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::send_agent_message_request(&id, agent_id, text))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn respond_permission(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> Result<()> {
+        let message = agents::permission_response_message(agent_id, request_id, &response);
+        self.inner
+            .transport
+            .send_text(session_envelope(message).to_string())
+            .await
+    }
+
+    pub async fn open_project(&self, cwd: &str) -> Result<String> {
+        let id = new_id();
+        let payload = self
+            .request(serde_json::json!({
+                "type": "open_project_request",
+                "cwd": cwd,
+                "requestId": id
+            }))
+            .await?;
+        if let Some(err) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(err.to_string()));
+        }
+        payload
+            .get("workspace")
+            .and_then(|workspace| workspace.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                PaseoError::Protocol("open_project_response missing workspace.id".into())
+            })
+    }
+
+    pub async fn list_terminals(&self, cwd: Option<&str>) -> Result<Vec<TerminalInfo>> {
+        let id = new_id();
+        let payload = self
+            .request(terminals::list_terminals_request(&id, cwd))
+            .await?;
+        Ok(terminals::parse_terminal_list(&payload))
+    }
+
+    pub async fn create_terminal(
+        &self,
+        cwd: &str,
+        opts: CreateTerminalOpts,
+    ) -> Result<TerminalInfo> {
+        let id = new_id();
+        let payload = self
+            .request(terminals::create_terminal_request(&id, cwd, &opts))
+            .await?;
+        if let Some(err) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(err.to_string()));
+        }
+        let terminal = payload.get("terminal").cloned().ok_or_else(|| {
+            PaseoError::Protocol("create_terminal_response missing terminal".into())
+        })?;
+        serde_json::from_value(terminal).map_err(PaseoError::from)
+    }
+
+    pub async fn subscribe_terminal(
+        &self,
+        terminal_id: &str,
+        restore_mode: &str,
+    ) -> Result<TerminalHandle> {
+        let id = new_id();
+        let payload = self
+            .request(terminals::subscribe_terminal_request(
+                &id,
+                terminal_id,
+                restore_mode,
+            ))
+            .await?;
+        let slot = terminals::parse_subscribe_slot(&payload)?;
+
+        let (tx, rx) = flume::unbounded();
+        self.inner.terminals.lock().insert(slot, tx);
+
+        Ok(TerminalHandle {
+            terminal_id: terminal_id.to_string(),
+            slot,
+            transport: self.inner.transport.clone(),
+            owner: self.clone(),
+            output_rx: rx,
+        })
+    }
+
+    pub async fn kill_terminal(&self, terminal_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(terminals::kill_terminal_request(&id, terminal_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        self.inner.transport.close().await;
+    }
+
+    fn dispatch(&self, frame: Frame) {
+        match frame {
+            Frame::Json(text) => match parse_top_level(&text) {
+                Ok(Incoming::Session(message)) => self.dispatch_session(message),
+                Ok(Incoming::Pong) | Ok(Incoming::Unknown(_)) => {}
+                Err(_) => {}
+            },
+            Frame::Binary(bytes) => self.dispatch_binary(&bytes),
+        }
+    }
+
+    fn dispatch_session(&self, message: Value) {
+        let ty = session_message_type(&message).to_string();
+        let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+
+        if let Some(request_id) = session_request_id(&message) {
+            let waiter = self.inner.pending.lock().remove(&request_id);
+            if let Some(tx) = waiter {
+                if ty == "rpc_error" {
+                    let err = payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("rpc error")
+                        .to_string();
+                    let _ = tx.send(Err(PaseoError::Rpc(err)));
+                } else {
+                    let _ = tx.send(Ok(payload));
+                }
+                return;
+            }
+        }
+
+        match ty.as_str() {
+            "agent_update" => {
+                if let Ok(update) = serde_json::from_value::<AgentUpdate>(payload) {
+                    match update.kind.as_str() {
+                        "remove" => {
+                            if let Some(id) = update.agent_id {
+                                self.emit(DaemonEvent::AgentRemove(id));
+                            }
+                        }
+                        _ => {
+                            if let Some(agent) = update.agent {
+                                self.emit(DaemonEvent::AgentUpsert(Box::new(agent)));
+                            }
+                        }
+                    }
+                }
+            }
+            "agent_stream" => {
+                let agent_id = payload
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(event) = payload.get("event").cloned() {
+                    if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(event) {
+                        self.emit(DaemonEvent::AgentStream {
+                            agent_id,
+                            event: Box::new(event),
+                        });
+                    }
+                }
+            }
+            "agent_permission_request" => {
+                let agent_id = payload
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(request) = payload.get("request").cloned() {
+                    if let Ok(request) = serde_json::from_value(request) {
+                        self.emit(DaemonEvent::PermissionRequest {
+                            agent_id,
+                            request: Box::new(request),
+                        });
+                    }
+                }
+            }
+            "terminals_changed" => {
+                let terminals = terminals::parse_terminal_list(&payload);
+                self.emit(DaemonEvent::TerminalsChanged { terminals });
+            }
+            "terminal_stream_exit" => {
+                if let Some(terminal_id) = payload.get("terminalId").and_then(Value::as_str) {
+                    self.emit(DaemonEvent::TerminalExit(terminal_id.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn dispatch_binary(&self, bytes: &[u8]) {
+        let Some(frame) = binary_frames::decode(bytes) else {
+            return;
+        };
+        let senders = self.inner.terminals.lock();
+        let Some(tx) = senders.get(&frame.slot) else {
+            return;
+        };
+        let event = match frame.opcode {
+            Opcode::Output => TerminalStreamEvent::Output(frame.payload),
+            Opcode::Restore => TerminalStreamEvent::Restore(frame.payload),
+            Opcode::Snapshot => TerminalStreamEvent::Snapshot(
+                serde_json::from_slice(&frame.payload).unwrap_or(Value::Null),
+            ),
+            Opcode::Input | Opcode::Resize => return,
+        };
+        let _ = tx.send(event);
+    }
+
+    fn emit(&self, event: DaemonEvent) {
+        let _ = self.inner.events_tx.try_broadcast(event);
+    }
+}
+
+impl TerminalHandle {
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    pub fn output(&self) -> flume::Receiver<TerminalStreamEvent> {
+        self.output_rx.clone()
+    }
+
+    pub async fn send_input(&self, data: &[u8]) -> Result<()> {
+        self.transport
+            .send_binary(encode_input(self.slot, data))
+            .await
+    }
+
+    pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
+        self.transport
+            .send_binary(encode_resize(self.slot, rows, cols)?)
+            .await
+    }
+
+    pub async fn unsubscribe(self) -> Result<()> {
+        self.owner.inner.terminals.lock().remove(&self.slot);
+        let message = terminals::unsubscribe_terminal_request(&self.terminal_id);
+        self.transport
+            .send_text(session_envelope(message).to_string())
+            .await
+    }
+}
+
+fn try_parse_server_info(text: &str) -> Option<ServerInfo> {
+    let Incoming::Session(message) = parse_top_level(text).ok()? else {
+        return None;
+    };
+    if session_message_type(&message) != "status" {
+        return None;
+    }
+    let payload = message.get("payload")?;
+    if payload.get("status").and_then(Value::as_str) != Some("server_info") {
+        return None;
+    }
+    serde_json::from_value(payload.clone()).ok()
+}

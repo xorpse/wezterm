@@ -6,6 +6,7 @@ members = [
   "sync-color-schemes",
   "deps/cairo",
   "git-review",
+  "paseo-client",
   "wezterm",
   "wezterm-blob-leases",
   "wezterm-cell",
