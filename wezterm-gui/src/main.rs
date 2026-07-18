@@ -45,6 +45,7 @@ mod overlay;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;
+mod review;
 mod scripting;
 mod scrollbar;
 mod selection;

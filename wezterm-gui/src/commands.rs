@@ -1969,6 +1969,22 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit", "Copy Mode"],
             icon: None,
         },
+        OpenReviewPane(_) => CommandDef {
+            brief: "Open git review pane".into(),
+            doc: "Split the current pane and show a git diff review".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
+        ReviewMode(action) => CommandDef {
+            brief: format!("{action:?}").into(),
+            doc: "".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit", "Review Mode"],
+            icon: None,
+        },
         RotatePanes(direction) => CommandDef {
             brief: format!("Rotate panes {direction:?}").into(),
             doc: format!("Rotate panes {direction:?}").into(),
@@ -2040,6 +2056,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         CloseCurrentPane { confirm: true },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),
         ResetTerminal,
+        OpenReviewPane(ReviewPaneArgs::default()),
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
         PasteFrom(ClipboardPasteSource::PrimarySelection),

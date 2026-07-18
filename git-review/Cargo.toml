@@ -1,0 +1,12 @@
+[package]
+name = "git-review"
+version = "0.1.0"
+authors = ["Wez Furlong"]
+edition = "2021"
+license = "MIT"
+description = "Portable git diff model, invocation and unified-diff parsing for the wezterm review pane"
+
+[dependencies]
+anyhow = {workspace=true}
+thiserror = {workspace=true}
+log = {workspace=true}

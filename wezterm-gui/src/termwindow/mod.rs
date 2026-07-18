@@ -3097,6 +3097,12 @@ impl TermWindow {
             CopyMode(_) => {
                 // NOP here; handled by the overlay directly
             }
+            OpenReviewPane(args) => {
+                if let Err(err) = crate::review::open_review_pane(self, args) {
+                    log::error!("failed to open review pane: {err:#}");
+                }
+            }
+            ReviewMode(_) => {}
             RotatePanes(direction) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {

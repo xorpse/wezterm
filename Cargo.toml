@@ -5,6 +5,7 @@ members = [
   "strip-ansi-escapes",
   "sync-color-schemes",
   "deps/cairo",
+  "git-review",
   "wezterm",
   "wezterm-blob-leases",
   "wezterm-cell",
@@ -105,6 +106,7 @@ futures-lite = "2.3"
 futures-util = "0.3"
 gethostname = "0.5"
 getrandom = "0.3.1"
+git-review = { path = "git-review" }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 gl_generator = "0.14"
 glium = { version = "0.35", default-features = false }

@@ -646,8 +646,73 @@ pub enum KeyAssignment {
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
+
+    OpenReviewPane(ReviewPaneArgs),
+    ReviewMode(ReviewModeAssignment),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
+
+#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ReviewDiffMode {
+    WorkingTree,
+    Staged,
+    Branch(String),
+    MergeBase(String),
+}
+
+impl Default for ReviewDiffMode {
+    fn default() -> Self {
+
+        Self::WorkingTree
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct ReviewPaneArgs {
+    #[dynamic(default = "review_default_direction")]
+    pub direction: PaneDirection,
+    #[dynamic(default)]
+    pub size: SplitSize,
+    #[dynamic(default)]
+    pub mode: ReviewDiffMode,
+}
+
+fn review_default_direction() -> PaneDirection {
+    PaneDirection::Right
+}
+
+impl Default for ReviewPaneArgs {
+    fn default() -> Self {
+        Self {
+            direction: review_default_direction(),
+            size: SplitSize::default(),
+            mode: ReviewDiffMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ReviewModeAssignment {
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    MoveToTop,
+    MoveToBottom,
+    NextHunk,
+    PrevHunk,
+    NextFile,
+    PrevFile,
+    ToggleSelect,
+    Annotate,
+    SendSelection,
+    SendAll,
+    ToggleFold,
+    FindFile,
+    CycleDiffMode,
+    Refresh,
+    Close,
+}
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct SplitPane {
