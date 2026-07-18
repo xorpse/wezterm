@@ -5,6 +5,34 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentMode {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectOption {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDefinition {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub thinking_options: Vec<SelectOption>,
+    #[serde(default)]
+    pub default_thinking_option_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSnapshot {
     pub id: String,
     #[serde(default)]
@@ -17,6 +45,12 @@ pub struct AgentSnapshot {
     pub model: Option<String>,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub current_mode_id: Option<String>,
+    #[serde(default)]
+    pub available_modes: Vec<AgentMode>,
+    #[serde(default)]
+    pub thinking_option_id: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -153,6 +187,53 @@ pub fn send_agent_message_request(request_id: &str, agent_id: &str, text: &str) 
         "agentId": agent_id,
         "text": text
     })
+}
+
+pub fn cancel_agent_request(request_id: &str, agent_id: &str) -> Value {
+    json!({ "type": "cancel_agent_request", "agentId": agent_id, "requestId": request_id })
+}
+
+pub fn set_agent_mode_request(request_id: &str, agent_id: &str, mode_id: &str) -> Value {
+    json!({
+        "type": "set_agent_mode_request",
+        "agentId": agent_id,
+        "modeId": mode_id,
+        "requestId": request_id
+    })
+}
+
+pub fn set_agent_model_request(request_id: &str, agent_id: &str, model_id: &str) -> Value {
+    json!({
+        "type": "set_agent_model_request",
+        "agentId": agent_id,
+        "modelId": model_id,
+        "requestId": request_id
+    })
+}
+
+pub fn set_agent_thinking_request(
+    request_id: &str,
+    agent_id: &str,
+    thinking_option_id: &str,
+) -> Value {
+    json!({
+        "type": "set_agent_thinking_request",
+        "agentId": agent_id,
+        "thinkingOptionId": thinking_option_id,
+        "requestId": request_id
+    })
+}
+
+pub fn list_provider_models_request(request_id: &str, provider: &str, cwd: Option<&str>) -> Value {
+    let mut msg = json!({
+        "type": "list_provider_models_request",
+        "provider": provider,
+        "requestId": request_id
+    });
+    if let Some(cwd) = cwd {
+        msg["cwd"] = json!(cwd);
+    }
+    msg
 }
 
 pub fn permission_response_message(

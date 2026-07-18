@@ -12,8 +12,8 @@ use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
-    AgentStreamEvent, DaemonEvent, PaseoClient, PermissionRequest, PermissionResponse,
-    TimelineItem, ToolCallDetail,
+    AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent, ModelDefinition, PaseoClient,
+    PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail,
 };
 use rangeset::RangeSet;
 use std::ops::Range;
@@ -219,11 +219,47 @@ struct AgentState {
     mode: Mode,
     composer: String,
     composer_row: usize,
+    provider: String,
+    agent_status: String,
+    model: Option<String>,
+    current_mode_id: Option<String>,
+    available_modes: Vec<AgentMode>,
+    thinking_option_id: Option<String>,
+    models: Vec<ModelDefinition>,
     rows: Vec<AgentRow>,
     rows_version: u64,
     size: TerminalSize,
     seqno: SequenceNo,
     dead: bool,
+}
+
+impl AgentState {
+    fn mode_label(&self) -> String {
+        let id = self.current_mode_id.clone().unwrap_or_default();
+        self.available_modes
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or(id)
+    }
+
+    fn effort_label(&self) -> String {
+        let id = self.thinking_option_id.clone().unwrap_or_default();
+        if id.is_empty() {
+            return "—".to_string();
+        }
+        self.current_model()
+            .and_then(|m| m.thinking_options.iter().find(|o| o.id == id))
+            .map(|o| o.label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or(id)
+    }
+
+    fn current_model(&self) -> Option<&ModelDefinition> {
+        let id = self.model.as_deref()?;
+        self.models.iter().find(|m| m.id == id)
+    }
 }
 
 impl AgentState {
@@ -264,6 +300,25 @@ impl AgentState {
                 &attr_fg(AnsiColor::Yellow),
                 cols,
             );
+        }
+
+        if !self.agent_status.is_empty() || self.model.is_some() {
+            rows.push(blank_row());
+            let model = self.model.clone().unwrap_or_else(|| "—".to_string());
+            rows.push(AgentRow {
+                text: format!(
+                    "[{}]  mode:{}  model:{}  effort:{}",
+                    self.agent_status,
+                    self.mode_label(),
+                    model,
+                    self.effort_label()
+                ),
+                attrs: attr_fg(AnsiColor::Teal),
+            });
+            rows.push(AgentRow {
+                text: "m:mode  M:model  e:effort  x:stop".to_string(),
+                attrs: attr_dim(),
+            });
         }
 
         rows.push(blank_row());
@@ -396,6 +451,102 @@ impl PaseoAgentPane {
         });
     }
 
+    fn set_snapshot(&self, snapshot: &AgentSnapshot) {
+        self.mutate(|state| {
+            state.provider = snapshot.provider.clone();
+            state.agent_status = snapshot.status.clone();
+            state.model = snapshot.model.clone();
+            state.current_mode_id = snapshot.current_mode_id.clone();
+            state.available_modes = snapshot.available_modes.clone();
+            state.thinking_option_id = snapshot.thinking_option_id.clone();
+            state.rebuild_rows();
+        });
+    }
+
+    fn set_models(&self, models: Vec<ModelDefinition>) {
+        self.mutate(|state| {
+            state.models = models;
+            state.rebuild_rows();
+        });
+    }
+
+    fn agent_id(&self) -> Option<String> {
+        self.agent_id.lock().clone()
+    }
+
+    fn stop(&self) {
+        if let Some(agent_id) = self.agent_id() {
+            let client = self.client.clone();
+            promise::spawn::spawn(async move {
+                let _ = client.cancel_agent(&agent_id).await;
+            })
+            .detach();
+        }
+    }
+
+    fn cycle_mode(&self) {
+        let (agent_id, next) = {
+            let state = self.state.lock();
+            let next = cycle_next(
+                &state
+                    .available_modes
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>(),
+                state.current_mode_id.as_deref(),
+            );
+            (self.agent_id(), next)
+        };
+        if let (Some(agent_id), Some(next)) = (agent_id, next) {
+            let client = self.client.clone();
+            promise::spawn::spawn(async move {
+                let _ = client.set_agent_mode(&agent_id, &next).await;
+            })
+            .detach();
+        }
+    }
+
+    fn cycle_model(&self) {
+        let (agent_id, next) = {
+            let state = self.state.lock();
+            let next = cycle_next(
+                &state
+                    .models
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>(),
+                state.model.as_deref(),
+            );
+            (self.agent_id(), next)
+        };
+        if let (Some(agent_id), Some(next)) = (agent_id, next) {
+            let client = self.client.clone();
+            promise::spawn::spawn(async move {
+                let _ = client.set_agent_model(&agent_id, &next).await;
+            })
+            .detach();
+        }
+    }
+
+    fn cycle_effort(&self) {
+        let (agent_id, next) = {
+            let state = self.state.lock();
+            let options: Vec<String> = state
+                .current_model()
+                .map(|m| m.thinking_options.iter().map(|o| o.id.clone()).collect())
+                .unwrap_or_default();
+            let next = cycle_next(&options, state.thinking_option_id.as_deref());
+            (self.agent_id(), next)
+        };
+        if let (Some(agent_id), Some(next)) = (agent_id, next) {
+            let client = self.client.clone();
+            promise::spawn::spawn(async move {
+                let _ = client.set_agent_thinking(&agent_id, &next).await;
+            })
+            .detach();
+        }
+    }
+
     fn scroll(&self, assignment: KeyAssignment) {
         let pane_id = self.pane_id;
         self.window
@@ -466,8 +617,8 @@ impl PaseoAgentPane {
         let weak = Arc::downgrade(self);
         let client = self.client.clone();
         promise::spawn::spawn(async move {
-            let agent_id = match resolve_agent(&client, requested_agent).await {
-                Ok(id) => id,
+            let snapshot = match resolve_agent(&client, requested_agent).await {
+                Ok(snapshot) => snapshot,
                 Err(err) => {
                     if let Some(pane) = weak.upgrade() {
                         pane.set_status("Agent (error)".to_string(), Some(format!("{err}")));
@@ -475,10 +626,22 @@ impl PaseoAgentPane {
                     return;
                 }
             };
+            let agent_id = snapshot.id.clone();
+            let provider = snapshot.provider.clone();
+            let cwd = snapshot.cwd.clone();
 
             if let Some(pane) = weak.upgrade() {
                 *pane.agent_id.lock() = Some(agent_id.clone());
                 pane.set_status(format!("Agent {}", short_id(&agent_id)), None);
+                pane.set_snapshot(&snapshot);
+            }
+
+            if !provider.is_empty() {
+                if let Ok(models) = client.list_provider_models(&provider, Some(&cwd)).await {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_models(models);
+                    }
+                }
             }
 
             let _ = client.set_timeline_subscription(&[agent_id.clone()]).await;
@@ -517,6 +680,9 @@ impl PaseoAgentPane {
                     } if perm_agent == agent_id => {
                         pane.set_pending(*request);
                     }
+                    DaemonEvent::AgentUpsert(snapshot) if snapshot.id == agent_id => {
+                        pane.set_snapshot(&snapshot);
+                    }
                     _ => {}
                 }
             }
@@ -529,16 +695,30 @@ impl PaseoAgentPane {
     }
 }
 
-async fn resolve_agent(client: &PaseoClient, requested: Option<String>) -> anyhow::Result<String> {
-    if let Some(id) = requested {
-        return Ok(id);
-    }
+async fn resolve_agent(
+    client: &PaseoClient,
+    requested: Option<String>,
+) -> anyhow::Result<AgentSnapshot> {
     let agents = client.fetch_agents().await?;
-    agents
-        .into_iter()
-        .find(|entry| entry.agent.archived_at.is_none())
-        .map(|entry| entry.agent.id)
+    let entry = match requested {
+        Some(id) => agents.into_iter().find(|entry| entry.agent.id == id),
+        None => agents
+            .into_iter()
+            .find(|entry| entry.agent.archived_at.is_none()),
+    };
+    entry
+        .map(|entry| entry.agent)
         .ok_or_else(|| anyhow!("no agents available"))
+}
+
+fn cycle_next(options: &[String], current: Option<&str>) -> Option<String> {
+    if options.is_empty() {
+        return None;
+    }
+    let idx = current
+        .and_then(|c| options.iter().position(|o| o == c))
+        .unwrap_or(0);
+    Some(options[(idx + 1) % options.len()].clone())
 }
 
 fn short_id(id: &str) -> String {
@@ -699,6 +879,11 @@ impl Pane for PaseoAgentPane {
                 }
                 KeyCode::Char('y') => self.respond_permission(true),
                 KeyCode::Char('n') => self.respond_permission(false),
+                KeyCode::Char('x') => self.stop(),
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.stop(),
+                KeyCode::Char('m') => self.cycle_mode(),
+                KeyCode::Char('M') => self.cycle_model(),
+                KeyCode::Char('e') => self.cycle_effort(),
                 KeyCode::Char('g') | KeyCode::Home => self.scroll(KeyAssignment::ScrollToTop),
                 KeyCode::Char('G') | KeyCode::End => self.scroll(KeyAssignment::ScrollToBottom),
                 KeyCode::Char('j') | KeyCode::DownArrow => {
@@ -803,6 +988,13 @@ pub fn open_paseo_agent_pane(
             mode: Mode::Scroll,
             composer: String::new(),
             composer_row: 0,
+            provider: String::new(),
+            agent_status: String::new(),
+            model: None,
+            current_mode_id: None,
+            available_modes: Vec::new(),
+            thinking_option_id: None,
+            models: Vec::new(),
             rows: Vec::new(),
             rows_version: 0,
             size: split_size.second,

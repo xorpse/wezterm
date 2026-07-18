@@ -181,6 +181,51 @@ impl PaseoClient {
         Ok(())
     }
 
+    pub async fn cancel_agent(&self, agent_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::cancel_agent_request(&id, agent_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_agent_mode(&self, agent_id: &str, mode_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::set_agent_mode_request(&id, agent_id, mode_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_agent_model(&self, agent_id: &str, model_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::set_agent_model_request(&id, agent_id, model_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_agent_thinking(&self, agent_id: &str, thinking_option_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::set_agent_thinking_request(
+            &id,
+            agent_id,
+            thinking_option_id,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_provider_models(
+        &self,
+        provider: &str,
+        cwd: Option<&str>,
+    ) -> Result<Vec<crate::protocol::agents::ModelDefinition>> {
+        let id = new_id();
+        let payload = self
+            .request(agents::list_provider_models_request(&id, provider, cwd))
+            .await?;
+        let models = payload.get("models").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::from_value(models).unwrap_or_default())
+    }
+
     pub async fn respond_permission(
         &self,
         agent_id: &str,

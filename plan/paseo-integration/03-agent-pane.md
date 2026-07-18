@@ -2,8 +2,29 @@
 
 **Output:** `wezterm-gui/src/paseo/{mod,agent,open}.rs` — a custom-rendered pane
 that shows an agent session's structured timeline (assistant text, reasoning,
-tool-call cards, diffs), a prompt composer, and inline permission approve/deny.
+tool-call cards, diffs), a prompt composer, inline permission approve/deny, and
+**agent controls** (stop/interrupt, mode/model/effort selection).
 This is the headline feature.
+
+## Agent controls (part of this phase)
+
+The pane must also drive the agent, not just read it. All are in
+[05 §5](05-protocol-reference.md#5-agent-rpcs--push-messages):
+
+| Control | RPC | Options source |
+| --- | --- | --- |
+| **Stop / interrupt** | `cancel_agent(agentId)` | — |
+| **Mode** (plan/default/full-access) | `set_agent_mode(agentId, modeId)` | snapshot `availableModes` + `currentModeId` (self-describing) |
+| **Model** | `set_agent_model(agentId, modelId)` | `list_provider_models(provider)` → `AgentModelDefinition[]` |
+| **Effort** (thinking) | `set_agent_thinking(agentId, optionId)` | the selected model's `thinkingOptions` + `defaultThinkingOptionId` |
+
+To drive these the pane captures the **agent snapshot** (provider, model,
+currentModeId, availableModes, thinkingOptionId, status) from the initial
+`fetch_agents` entry and live `agent_update` (`AgentUpsert`) events, and fetches
+provider models once the provider is known. A **header line** shows
+`status · mode · model · effort`. MVP interaction is keyboard cycling in Scroll
+mode (`x`/Ctrl-C stop, `m` mode, `M` model, `e` effort); a fuzzy `InputSelector`
+picker is a later enhancement for long model lists.
 
 Prereq: Stage 1 gate green; Stage 2 recommended first (it validates the
 async→GUI bridge with a simpler payload). Template: `wezterm-gui/src/review/mod.rs`
