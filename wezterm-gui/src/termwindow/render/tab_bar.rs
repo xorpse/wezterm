@@ -13,6 +13,7 @@ impl crate::TermWindow {
         // when this is the soonest pending animation and rebuilds the tab bar
         // to advance the frame.
         self.update_next_frame_time(self.tab_bar.next_progress_frame_due());
+        self.update_next_frame_time(self.tab_bar.next_attention_frame_due());
 
         if self.config.use_fancy_tab_bar {
             let collapsed_vertical =

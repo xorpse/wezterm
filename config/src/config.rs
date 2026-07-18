@@ -1,5 +1,6 @@
 use crate::background::{BackgroundLayer, Gradient};
 use crate::bell::{AudibleBell, EasingFunction, VisualBell};
+use crate::tab_attention::TabAttention;
 use crate::color::{
     ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
 };
@@ -864,6 +865,9 @@ pub struct Config {
 
     #[dynamic(default)]
     pub visual_bell: VisualBell,
+
+    #[dynamic(default)]
+    pub tab_attention: TabAttention,
 
     #[dynamic(default)]
     pub audible_bell: AudibleBell,

@@ -60,6 +60,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use termwiz::color::SrgbaTuple;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
@@ -205,7 +206,32 @@ pub struct PaneState {
     pub overlay: Option<OverlayState>,
 
     bell_start: Option<Instant>,
+    attention_start: Option<Instant>,
+    attention_kind: Option<String>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+}
+
+fn attention_pulse(
+    start: Instant,
+    fade_in_ms: u64,
+    fade_in_function: config::EasingFunction,
+    fade_out_ms: u64,
+    fade_out_function: config::EasingFunction,
+    fps: u64,
+) -> (f32, Instant) {
+    let fade_in_ms = fade_in_ms.max(1);
+    let fade_out_ms = fade_out_ms.max(1);
+    let cycle_ms = fade_in_ms + fade_out_ms;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let phase = elapsed_ms % cycle_ms;
+    let intensity = if phase < fade_in_ms {
+        fade_in_function.evaluate_at_position(phase as f32 / fade_in_ms as f32)
+    } else {
+        1.0 - fade_out_function.evaluate_at_position((phase - fade_in_ms) as f32 / fade_out_ms as f32)
+    };
+    let frame_interval = (1000 / fps.max(1)).max(1);
+    let next_tick = (elapsed_ms / frame_interval + 1) * frame_interval;
+    (intensity, start + Duration::from_millis(next_tick))
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -1945,6 +1971,22 @@ impl TermWindow {
             return;
         }
 
+        let attention_var = &self.config.tab_attention.var;
+        if !attention_var.is_empty() && name == *attention_var {
+            let mut state = self.pane_state(pane_id);
+            if value.is_empty() {
+                state.attention_start = None;
+                state.attention_kind = None;
+            } else {
+                if state.attention_start.is_none()
+                    || state.attention_kind.as_deref() != Some(value.as_str())
+                {
+                    state.attention_start = Some(Instant::now());
+                }
+                state.attention_kind = Some(value.clone());
+            }
+        }
+
         let mux = Mux::get();
         let window = GuiWin::new(self);
         let pane = match mux.get_pane(pane_id) {
@@ -1989,6 +2031,58 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    fn compute_tab_attention(
+        &self,
+        tabs: &[TabInformation],
+    ) -> (HashMap<PaneId, (f32, SrgbaTuple)>, Option<Instant>) {
+        let cfg = &self.config.tab_attention;
+        let mut colors = HashMap::new();
+        let mut next_due: Option<Instant> = None;
+        if cfg.var.is_empty() {
+            return (colors, next_due);
+        }
+        let fps = self.config.animation_fps.max(1) as u64;
+        for tab in tabs {
+            let pane = match &tab.active_pane {
+                Some(pane) => pane,
+                None => continue,
+            };
+            if tab.is_active {
+                let mut state = self.pane_state(pane.pane_id);
+                state.attention_start = None;
+                state.attention_kind = None;
+                continue;
+            }
+            let (start, kind) = {
+                let state = self.pane_state(pane.pane_id);
+                match (state.attention_start, state.attention_kind.clone()) {
+                    (Some(start), Some(kind)) => (start, kind),
+                    _ => continue,
+                }
+            };
+            let color = cfg
+                .colors
+                .get(&kind)
+                .copied()
+                .map(SrgbaTuple::from)
+                .unwrap_or(SrgbaTuple(0.941, 0.875, 0.686, 1.0));
+            let (intensity, due) = attention_pulse(
+                start,
+                cfg.fade_in_duration_ms,
+                cfg.fade_in_function,
+                cfg.fade_out_duration_ms,
+                cfg.fade_out_function,
+                fps,
+            );
+            colors.insert(pane.pane_id, (intensity, color));
+            next_due = Some(match next_due {
+                Some(existing) => existing.min(due),
+                None => due,
+            });
+        }
+        (colors, next_due)
+    }
+
     fn update_title_impl(&mut self) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -2019,6 +2113,8 @@ impl TermWindow {
             None => false,
         };
 
+        let (attention_colors, next_attention_frame_due) = self.compute_tab_attention(&tabs);
+
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
@@ -2032,6 +2128,8 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
+            &attention_colors,
+            next_attention_frame_due,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;

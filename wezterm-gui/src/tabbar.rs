@@ -2,10 +2,12 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
+use mux::pane::PaneId;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
-use termwiz::color::{AnsiColor, ColorSpec};
+use termwiz::color::{AnsiColor, ColorSpec, SrgbaTuple};
 use termwiz::escape::csi::Sgr;
 use termwiz::escape::parser::Parser;
 use termwiz::escape::{Action, ControlCode, CSI};
@@ -22,6 +24,7 @@ pub struct TabBarState {
     /// at which the tab bar should be rebuilt to advance to the next frame;
     /// None when no spinner is visible.
     next_progress_frame_due: Option<Instant>,
+    next_attention_frame_due: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,6 +329,16 @@ fn compute_tab_title(
     }
 }
 
+fn lerp_srgba(a: SrgbaTuple, b: SrgbaTuple, t: f32) -> SrgbaTuple {
+    let t = t.clamp(0.0, 1.0);
+    SrgbaTuple(
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+        a.3 + (b.3 - a.3) * t,
+    )
+}
+
 fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool {
     return mouse_x
         .map(|mouse_x| mouse_x >= x && mouse_x < x + tab_title_len)
@@ -343,6 +356,7 @@ impl TabBarState {
                 width: 1,
             }],
             next_progress_frame_due: None,
+            next_attention_frame_due: None,
         }
     }
 
@@ -356,6 +370,10 @@ impl TabBarState {
 
     pub fn next_progress_frame_due(&self) -> Option<Instant> {
         self.next_progress_frame_due
+    }
+
+    pub fn next_attention_frame_due(&self) -> Option<Instant> {
+        self.next_attention_frame_due
     }
 
     fn integrated_title_buttons(
@@ -458,6 +476,8 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
+        attention: &HashMap<PaneId, (f32, SrgbaTuple)>,
+        next_attention_frame_due: Option<Instant>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -601,14 +621,22 @@ impl TabBarState {
             has_indeterminate_progress |= tab_title.has_indeterminate;
 
             let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
-            let mut tab_line = parse_status_text(
-                &esc,
-                if config.use_fancy_tab_bar {
-                    CellAttributes::default()
-                } else {
-                    cell_attrs.clone()
-                },
-            );
+            let attention_bg = tab_info[tab_idx]
+                .active_pane
+                .as_ref()
+                .and_then(|pane| attention.get(&pane.pane_id))
+                .map(|(intensity, target)| {
+                    lerp_srgba(colors.inactive_tab().bg_color.into(), *target, *intensity)
+                });
+            let mut default_cell = if config.use_fancy_tab_bar {
+                CellAttributes::default()
+            } else {
+                cell_attrs.clone()
+            };
+            if let Some(bg) = attention_bg {
+                default_cell.set_background(ColorSpec::TrueColor(bg));
+            }
+            let mut tab_line = parse_status_text(&esc, default_cell);
 
             let title = tab_line.clone();
             if tab_line.len() > tab_width_max {
@@ -729,6 +757,7 @@ impl TabBarState {
             line,
             items,
             next_progress_frame_due: has_indeterminate_progress.then(next_spinner_frame_due),
+            next_attention_frame_due,
         }
     }
 
