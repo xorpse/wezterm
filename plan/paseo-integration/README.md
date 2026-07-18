@@ -1,0 +1,68 @@
+# Paseo → WezTerm integration
+
+Bring your [Paseo](https://paseo.sh) agent sessions and terminals into WezTerm as
+first-class tabs/panes, alongside local tabs. Connect to a remote (relay/E2EE) or
+local Paseo daemon the way the web UI does, and interact with sessions natively.
+
+This directory is the implementation plan, split into stages. Each stage doc is
+self-contained enough to hand to an implementer (or an agent) working in a
+worktree of this repo.
+
+## Decisions (fixed)
+
+- **Both surfaces, agents-first.** Structured agent sessions are the headline;
+  PTY terminals come along because they map cleanly onto panes.
+- **Native Rust in this fork.** Mirrors the existing `git-review` feature; no Lua
+  plugin layer, no external sidecar process.
+- **Remote relay (E2EE) first.** The priority path is a remote daemon over the
+  encrypted relay; the local `127.0.0.1:6767` path is a strict subset added
+  alongside.
+- **Full structured agent interaction.** Tool-call cards, diffs, reasoning, a
+  prompt composer, and inline permission approve/deny — not a plain text dump.
+- **smol/futures, no tokio.** Stay in WezTerm's own async family
+  (`async_executor`/`smol`/`futures`/`flume`). Introducing tokio would mean a
+  second runtime and the classic cross-runtime deadlock; nothing in the Paseo
+  protocol needs it.
+
+## The two surfaces (this is why the design is shaped the way it is)
+
+Paseo exposes two fundamentally different things over one `/ws` WebSocket:
+
+| Surface | What it is | WezTerm representation |
+| --- | --- | --- |
+| **Terminal** | Raw PTY byte stream over a 2-byte-header binary frame protocol | A real WezTerm pane with **local** `wezterm_term::Terminal` emulation, hosted in a custom `PaseoDomain` |
+| **Agent** | A *structured* message/turn timeline (assistant text, reasoning, tool-call cards, diffs) + prompt input + permission prompts | A **custom-rendered** virtual pane, cloned from `ReviewPane` |
+
+## Stages
+
+| Doc | Stage | Output |
+| --- | --- | --- |
+| [00-architecture.md](00-architecture.md) | — | System design, crate layering, async/threading model, data flow, risks |
+| [01-paseo-client-crate.md](01-paseo-client-crate.md) | 1 | New `paseo-client` crate: connection, relay+E2EE, RPCs, streams. Gated by a standalone CLI example. |
+| [02-terminal-panes.md](02-terminal-panes.md) | 2 | New `paseo-mux` crate: `PaseoTerminalPane` + `PaseoDomain` (attach + render first) |
+| [03-agent-pane.md](03-agent-pane.md) | 3 | `wezterm-gui/src/paseo/`: `PaseoAgentPane` (transcript, composer, permissions) |
+| [04-config-keybindings-discovery.md](04-config-keybindings-discovery.md) | 4 | `PaseoDaemon` config, key assignments, domain registration, launcher/picker UX |
+| [05-protocol-reference.md](05-protocol-reference.md) | ref | Exact wire reference cited by every stage (offer, handshake, envelopes, RPCs, binary frames, forward-compat) |
+| [06-testing-and-verification.md](06-testing-and-verification.md) | ref | Per-stage test strategy, the E2EE parity test, end-to-end manual verification |
+
+## Recommended build order
+
+1. **Stage 1 first, in full**, including the CLI example gate. It de-risks the
+   hardest part (E2EE byte-parity + `async-tungstenite`/`futures-rustls` against
+   the relay) with zero WezTerm code in the way.
+2. **Stage 2** (terminals) before Stage 3 (agents): terminals validate the
+   `Domain`/pane plumbing and the async→GUI bridge with a simpler payload (raw
+   bytes) before the agent pane adds custom rendering + input modes on top.
+3. **Stage 4** last, once there is something real to attach to and pick from.
+
+Read [05-protocol-reference.md](05-protocol-reference.md) alongside Stages 1–3 —
+it is the load-bearing wire spec; the stage docs reference it rather than
+repeating it.
+
+## Source repos
+
+- This repo: `/Users/slt/Projects/wezterm` — the WezTerm fork, where all impl code lands.
+- Paseo: `/Users/slt/Projects/paseo` — protocol source of truth (read-only reference).
+  Key files: `packages/protocol/src/messages.ts`, `packages/protocol/src/binary-frames/terminal.ts`,
+  `packages/protocol/src/connection-offer.ts`, `packages/relay/src/{crypto,encrypted-channel}.ts`,
+  `packages/client/src/daemon-client.ts` (the reference client).
