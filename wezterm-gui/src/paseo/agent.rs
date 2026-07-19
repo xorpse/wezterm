@@ -300,6 +300,22 @@ fn pending_is_question(request: &PermissionRequest) -> bool {
             .unwrap_or(false)
 }
 
+fn build_question_response(
+    request: &PermissionRequest,
+    answer: String,
+) -> Option<PermissionResponse> {
+    let input = request.input.clone().unwrap_or_default();
+    let header = parse_questions(&input).into_iter().next()?.header;
+    let mut answers = serde_json::Map::new();
+    answers.insert(header, Value::from(answer));
+    let mut updated = input.as_object().cloned().unwrap_or_default();
+    updated.insert("answers".to_string(), Value::Object(answers));
+    Some(PermissionResponse::Allow {
+        selected_action_id: None,
+        updated_input: Some(Value::Object(updated)),
+    })
+}
+
 fn question_rows(request: &PermissionRequest, cols: usize) -> Vec<AgentRow> {
     let mut rows = vec![blank_row()];
     let questions = request
@@ -936,7 +952,8 @@ impl AgentState {
         if let Some(request) = &self.pending {
             if question_pending {
                 footer.push(AgentRow {
-                    text: "⚠ question — [1-9]: answer · n/Esc: dismiss".to_string(),
+                    text: "⚠ question — [1-9]: pick · i: type your own · n/Esc: dismiss"
+                        .to_string(),
                     attrs: attr_fg(AnsiColor::Yellow),
                 });
             } else {
@@ -1389,13 +1406,45 @@ impl PaseoAgentPane {
             let mut state = self.state.lock();
             std::mem::take(&mut state.composer).trim().to_string()
         };
-        if !text.is_empty() {
+        if text.is_empty() {
+            self.mutate(|state| state.rebuild_rows());
+            return;
+        }
+
+        let question_response = {
+            let state = self.state.lock();
+            state
+                .pending
+                .as_ref()
+                .filter(|r| pending_is_question(r))
+                .and_then(|request| {
+                    build_question_response(request, text.clone())
+                        .map(|response| (request.id.clone(), response))
+                })
+        };
+
+        if let Some((request_id, response)) = question_response {
             if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
                 promise::spawn::spawn(async move {
-                    let _ = client.send_agent_message(&agent_id, &text).await;
+                    let _ = client
+                        .respond_permission(&agent_id, &request_id, response)
+                        .await;
                 })
                 .detach();
             }
+            self.mutate(|state| {
+                state.pending = None;
+                state.mode = Mode::Scroll;
+                state.rebuild_rows();
+            });
+            return;
+        }
+
+        if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
+            promise::spawn::spawn(async move {
+                let _ = client.send_agent_message(&agent_id, &text).await;
+            })
+            .detach();
         }
         self.mutate(|state| state.rebuild_rows());
     }
@@ -1447,21 +1496,17 @@ impl PaseoAgentPane {
             };
             let response = if pending_is_question(request) {
                 let input = request.input.clone().unwrap_or_default();
-                let questions = parse_questions(&input);
-                let Some(question) = questions.first() else {
+                let label = parse_questions(&input)
+                    .into_iter()
+                    .next()
+                    .and_then(|q| q.options.into_iter().nth(index))
+                    .map(|option| option.label);
+                let Some(response) =
+                    label.and_then(|label| build_question_response(request, label))
+                else {
                     return;
                 };
-                let Some(option) = question.options.get(index) else {
-                    return;
-                };
-                let mut answers = serde_json::Map::new();
-                answers.insert(question.header.clone(), Value::from(option.label.clone()));
-                let mut updated = input.as_object().cloned().unwrap_or_default();
-                updated.insert("answers".to_string(), Value::Object(answers));
-                PermissionResponse::Allow {
-                    selected_action_id: None,
-                    updated_input: Some(Value::Object(updated)),
-                }
+                response
             } else {
                 let Some(action) = request.actions.get(index) else {
                     return;
