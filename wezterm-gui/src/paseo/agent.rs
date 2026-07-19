@@ -329,14 +329,42 @@ impl PickerState {
     }
 }
 
-fn picker_label(agent: &AgentSnapshot) -> String {
-    let title = agent.title.clone().unwrap_or_default();
-    let title = if title.is_empty() {
-        short_id(&agent.id)
+fn is_active_status(status: &str) -> bool {
+    matches!(
+        status,
+        "running" | "working" | "thinking" | "streaming" | "in_progress" | "busy" | "active"
+    )
+}
+
+fn status_glyph(agent: &AgentSnapshot) -> &'static str {
+    if agent.requires_attention {
+        "⚠"
+    } else if is_active_status(&agent.status) {
+        "●"
     } else {
-        title.replace('\n', " ").chars().take(60).collect()
-    };
-    format!("[{}] {} ({})", agent.status, title, agent.provider)
+        "○"
+    }
+}
+
+fn session_title(agent: &AgentSnapshot) -> String {
+    match agent.title.clone().filter(|t| !t.trim().is_empty()) {
+        Some(title) => title.replace('\n', " ").trim().chars().take(80).collect(),
+        None => "New session".to_string(),
+    }
+}
+
+fn picker_label(agent: &AgentSnapshot) -> String {
+    let worktree = basename(&agent.cwd);
+    if worktree.is_empty() {
+        format!("{} {}", status_glyph(agent), session_title(agent))
+    } else {
+        format!(
+            "{} {}  ·  {}",
+            status_glyph(agent),
+            session_title(agent),
+            worktree
+        )
+    }
 }
 
 fn basename(path: &str) -> &str {
@@ -437,10 +465,15 @@ fn parse_connect_target(input: &str) -> Option<(String, paseo_mux::ConnectTarget
 
 fn agent_rank(agent: &AgentSnapshot) -> (u8, u8) {
     let attention = if agent.requires_attention { 0 } else { 1 };
-    let activity = match agent.status.as_str() {
-        "running" | "working" | "thinking" | "streaming" | "in_progress" | "busy" | "active" => 0,
-        "waiting" | "paused" | "blocked" | "input_required" => 1,
-        _ => 2,
+    let activity = if is_active_status(&agent.status) {
+        0
+    } else if matches!(
+        agent.status.as_str(),
+        "waiting" | "paused" | "blocked" | "input_required"
+    ) {
+        1
+    } else {
+        2
     };
     (attention, activity)
 }
@@ -532,7 +565,7 @@ fn build_picker_groups(
                 rank: agent_rank(&agent),
                 sort_title: agent.title.clone().unwrap_or_default().to_lowercase(),
                 entry: PickerEntry {
-                    label: format!("open  {}", picker_label(&agent)),
+                    label: picker_label(&agent),
                     action: PickerAction::OpenAgent(agent.id.clone()),
                 },
             });
@@ -968,6 +1001,7 @@ impl PaseoAgentPane {
     fn set_snapshot(&self, snapshot: &AgentSnapshot) {
         self.mutate(|state| {
             state.cwd = snapshot.cwd.clone();
+            state.title = session_title(snapshot);
             state.provider = snapshot.provider.clone();
             state.agent_status = snapshot.status.clone();
             state.model = snapshot.model.clone();
@@ -1260,7 +1294,6 @@ impl PaseoAgentPane {
             state.picker = None;
             state.follow = true;
             state.scroll = 0;
-            state.title = format!("Agent {}", short_id(&agent_id));
         });
         self.set_snapshot(&snapshot);
 
