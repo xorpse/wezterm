@@ -1,6 +1,6 @@
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use anyhow::anyhow;
-use config::keyassignment::{KeyAssignment, PaseoAgentArgs};
+use config::keyassignment::{KeyAssignment, PaseoAgentArgs, SpawnCommand, SpawnTabDomain};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -19,6 +19,7 @@ use rangeset::RangeSet;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use termwiz::cell::{CellAttributes, Intensity};
 use termwiz::color::AnsiColor;
@@ -1135,18 +1136,32 @@ impl AgentState {
         }
         if !self.agent_status.is_empty() || self.model.is_some() {
             let model = self.model.clone().unwrap_or_else(|| "—".to_string());
+            let location = match self.workspace_name.as_deref() {
+                Some(ws) if !ws.is_empty() && !self.cwd.is_empty() => {
+                    format!("{ws}  ·  {}", self.cwd)
+                }
+                Some(ws) if !ws.is_empty() => ws.to_string(),
+                _ => self.cwd.clone(),
+            };
+            if !location.is_empty() {
+                footer.push(AgentRow {
+                    text: truncate_to(&location, cols),
+                    attrs: attr_dim(),
+                });
+            }
             footer.push(AgentRow {
                 text: format!(
-                    "[{}]  mode:{}  model:{}  effort:{}",
+                    "[{}]  {}  ·  model:{}  ·  mode:{}  ·  effort:{}",
                     self.agent_status,
-                    self.mode_label(),
+                    provider_display(&self.provider),
                     model,
+                    self.mode_label(),
                     self.effort_label()
                 ),
                 attrs: attr_fg(AnsiColor::Teal),
             });
             footer.push(AgentRow {
-                text: "m:mode  M:model  e:effort  x:stop".to_string(),
+                text: "d:diff  t:terminal  ·  m:mode  M:model  e:effort  x:stop".to_string(),
                 attrs: attr_dim(),
             });
         }
@@ -1416,6 +1431,30 @@ impl PaseoAgentPane {
                 if let Err(err) = crate::review::open_review_pane(term_window, &args) {
                     log::error!("failed to open review pane: {err:#}");
                 }
+            })));
+    }
+
+    fn open_terminal(&self) {
+        let cwd = self.state.lock().cwd.clone();
+        if cwd.is_empty() {
+            return;
+        }
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let pane = match term_window.get_active_pane_or_overlay() {
+                    Some(pane) => pane,
+                    None => return,
+                };
+                let command = SpawnCommand {
+                    label: None,
+                    args: None,
+                    cwd: Some(PathBuf::from(&cwd)),
+                    set_environment_variables: HashMap::new(),
+                    domain: SpawnTabDomain::CurrentPaneDomain,
+                    position: None,
+                };
+                let _ = term_window
+                    .perform_key_assignment(&pane, &KeyAssignment::SpawnCommandInNewTab(command));
             })));
     }
 
@@ -3221,6 +3260,7 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('d') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(1),
                 KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
                 KeyCode::Char('d') => self.open_review(),
+                KeyCode::Char('t') => self.open_terminal(),
                 KeyCode::Char('q') | KeyCode::Escape => self.close(),
                 KeyCode::Char(c @ '1'..='9') if self.state.lock().pending.is_some() => {
                     self.respond_action(c as usize - '1' as usize)

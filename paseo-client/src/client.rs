@@ -121,9 +121,16 @@ impl PaseoClient {
     }
 
     pub async fn run(&self) -> Result<()> {
+        const OFFLOAD_JSON_BYTES: usize = 64 * 1024;
         let result = loop {
             match self.inner.transport.recv().await {
-                Ok(Some(frame)) => self.dispatch(frame),
+                Ok(Some(frame)) => match &frame {
+                    Frame::Json(text) if text.len() > OFFLOAD_JSON_BYTES => {
+                        let client = self.clone();
+                        std::thread::spawn(move || client.dispatch(frame));
+                    }
+                    _ => self.dispatch(frame),
+                },
                 Ok(None) => break Ok(()),
                 Err(err) => break Err(err),
             }
