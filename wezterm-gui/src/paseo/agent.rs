@@ -244,7 +244,6 @@ struct AgentState {
     pending: Option<PermissionRequest>,
     mode: Mode,
     composer: String,
-    composer_row: usize,
     provider: String,
     agent_status: String,
     model: Option<String>,
@@ -252,7 +251,10 @@ struct AgentState {
     available_modes: Vec<AgentMode>,
     thinking_option_id: Option<String>,
     models: Vec<ModelDefinition>,
-    rows: Vec<AgentRow>,
+    transcript: Vec<AgentRow>,
+    footer: Vec<AgentRow>,
+    scroll: usize,
+    follow: bool,
     rows_version: u64,
     size: TerminalSize,
     seqno: SequenceNo,
@@ -291,47 +293,44 @@ impl AgentState {
 impl AgentState {
     fn rebuild_rows(&mut self) {
         let cols = self.size.cols;
-        let mut rows = Vec::new();
+
+        let mut transcript = Vec::new();
         if self.items.is_empty() {
             if let Some(message) = &self.status_message {
-                push_wrapped(&mut rows, "", message, &attr_dim(), cols);
+                push_wrapped(&mut transcript, "", message, &attr_dim(), cols);
             }
         } else {
             for item in &self.items {
-                item_to_rows(item, cols, &mut rows);
+                item_to_rows(item, cols, &mut transcript);
             }
         }
+        self.transcript = transcript;
 
+        let mut footer = Vec::new();
         if let Some(request) = &self.pending {
-            rows.push(blank_row());
             let title = request
                 .title
                 .clone()
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| request.name.clone());
             push_wrapped(
-                &mut rows,
+                &mut footer,
                 "⚠ permission: ",
                 &title,
                 &attr_bold_fg(AnsiColor::Yellow),
                 cols,
             );
-            if let Some(desc) = request.description.as_deref().filter(|d| !d.is_empty()) {
-                push_wrapped(&mut rows, "  ", desc, &attr_dim(), cols);
-            }
             push_wrapped(
-                &mut rows,
+                &mut footer,
                 "  ",
                 "[y] allow   [n] deny",
                 &attr_fg(AnsiColor::Yellow),
                 cols,
             );
         }
-
         if !self.agent_status.is_empty() || self.model.is_some() {
-            rows.push(blank_row());
             let model = self.model.clone().unwrap_or_else(|| "—".to_string());
-            rows.push(AgentRow {
+            footer.push(AgentRow {
                 text: format!(
                     "[{}]  mode:{}  model:{}  effort:{}",
                     self.agent_status,
@@ -341,13 +340,11 @@ impl AgentState {
                 ),
                 attrs: attr_fg(AnsiColor::Teal),
             });
-            rows.push(AgentRow {
+            footer.push(AgentRow {
                 text: "m:mode  M:model  e:effort  x:stop".to_string(),
                 attrs: attr_dim(),
             });
         }
-
-        rows.push(blank_row());
         let composer = match self.mode {
             Mode::Compose => AgentRow {
                 text: format!("❯ {}", self.composer),
@@ -358,10 +355,44 @@ impl AgentState {
                 attrs: attr_dim(),
             },
         };
-        self.composer_row = rows.len();
-        rows.push(composer);
+        footer.push(composer);
+        self.footer = footer;
 
-        self.rows = rows;
+        self.clamp_scroll();
+    }
+
+    fn view_rows(&self) -> usize {
+        self.size.rows.saturating_sub(self.footer.len())
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.transcript.len().saturating_sub(self.view_rows())
+    }
+
+    fn clamp_scroll(&mut self) {
+        if self.follow {
+            self.scroll = self.max_scroll();
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
+        }
+    }
+
+    fn composer_screen_row(&self) -> usize {
+        self.size.rows.saturating_sub(1)
+    }
+
+    fn row_line(&self, screen_row: usize) -> Line {
+        let cols = self.size.cols;
+        let view_rows = self.view_rows();
+        let row = if screen_row < view_rows {
+            self.transcript.get(self.scroll + screen_row)
+        } else {
+            self.footer.get(screen_row - view_rows)
+        };
+        match row {
+            Some(row) => make_line(&row.text, &row.attrs, self.seqno, cols),
+            None => make_line("", &CellAttributes::default(), self.seqno, cols),
+        }
     }
 
     fn apply_live_item(&mut self, item: TimelineItem) {
@@ -399,19 +430,6 @@ impl AgentState {
         }
 
         self.items.push(item);
-    }
-
-    fn row_line(&self, index: StableRowIndex) -> Line {
-        if index >= 0 && (index as usize) < self.rows.len() {
-            let row = &self.rows[index as usize];
-            make_line(&row.text, &row.attrs, self.seqno, self.size.cols)
-        } else {
-            make_line("", &CellAttributes::default(), self.seqno, self.size.cols)
-        }
-    }
-
-    fn total_rows(&self) -> usize {
-        self.rows.len().max(self.size.rows)
     }
 }
 
@@ -630,30 +648,49 @@ impl PaseoAgentPane {
         }
     }
 
-    fn scroll(&self, assignment: KeyAssignment) {
-        {
-            let state = self.state.lock();
-            let total = state.total_rows();
-            log::error!(
-                "PASEO_SCROLL {:?}: rows={} size.rows={} total={} physical_top={} scrollback_top=0",
-                assignment,
-                state.rows.len(),
-                state.size.rows,
-                total,
-                total.saturating_sub(state.size.rows)
-            );
-        }
+    fn scroll_lines(&self, delta: isize) {
+        self.mutate(|state| {
+            if delta < 0 {
+                state.follow = false;
+                state.scroll = state.scroll.saturating_sub((-delta) as usize);
+            } else {
+                let max = state.max_scroll();
+                state.scroll = (state.scroll + delta as usize).min(max);
+                state.follow = state.scroll >= max;
+            }
+        });
+    }
+
+    fn scroll_page(&self, dir: isize) {
+        let page = self.state.lock().view_rows().max(1) as isize;
+        self.scroll_lines(dir * page);
+    }
+
+    fn scroll_to_top(&self) {
+        self.mutate(|state| {
+            state.follow = false;
+            state.scroll = 0;
+        });
+    }
+
+    fn scroll_to_bottom(&self) {
+        self.mutate(|state| {
+            state.follow = true;
+            state.scroll = state.max_scroll();
+        });
+    }
+
+    fn close(&self) {
         let pane_id = self.pane_id;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 if let Some(pane) = Mux::get().get_pane(pane_id) {
-                    let _ = tw.perform_key_assignment(&pane, &assignment);
+                    let _ = tw.perform_key_assignment(
+                        &pane,
+                        &KeyAssignment::CloseCurrentPane { confirm: false },
+                    );
                 }
             })));
-    }
-
-    fn close(&self) {
-        self.scroll(KeyAssignment::CloseCurrentPane { confirm: false });
     }
 
     fn submit_composer(&self) {
@@ -895,7 +932,7 @@ impl Pane for PaseoAgentPane {
         if state.mode == Mode::Compose {
             return StableCursorPosition {
                 x: 2 + state.composer.chars().count(),
-                y: state.composer_row as StableRowIndex,
+                y: state.composer_screen_row() as StableRowIndex,
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: CursorVisibility::Visible,
             };
@@ -910,20 +947,22 @@ impl Pane for PaseoAgentPane {
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let state = self.state.lock();
+        let start = lines.start.max(0);
         let mut out = Vec::new();
-        for index in lines.start..lines.end {
-            out.push(state.row_line(index));
+        for index in start..lines.end.max(start) {
+            out.push(state.row_line(index as usize));
         }
-        (lines.start, out)
+        (start, out)
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
         let state = self.state.lock();
-        let mut built: Vec<Line> = (lines.start..lines.end)
-            .map(|index| state.row_line(index))
+        let start = lines.start.max(0);
+        let mut built: Vec<Line> = (start..lines.end.max(start))
+            .map(|index| state.row_line(index as usize))
             .collect();
         let mut refs: Vec<&mut Line> = built.iter_mut().collect();
-        with_lines.with_lines_mut(lines.start, &mut refs);
+        with_lines.with_lines_mut(start, &mut refs);
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -940,13 +979,11 @@ impl Pane for PaseoAgentPane {
 
     fn get_dimensions(&self) -> RenderableDimensions {
         let state = self.state.lock();
-        let total = state.total_rows();
-        let viewport = state.size.rows;
         RenderableDimensions {
             cols: state.size.cols,
-            viewport_rows: viewport,
-            scrollback_rows: total,
-            physical_top: total.saturating_sub(viewport) as StableRowIndex,
+            viewport_rows: state.size.rows,
+            scrollback_rows: state.size.rows,
+            physical_top: 0,
             scrollback_top: 0,
             dpi: state.size.dpi,
             pixel_width: state.size.pixel_width,
@@ -1012,7 +1049,7 @@ impl Pane for PaseoAgentPane {
                         state.mode = Mode::Compose;
                         state.rebuild_rows();
                     });
-                    self.scroll(KeyAssignment::ScrollToBottom);
+                    self.scroll_to_bottom();
                 }
                 KeyCode::Char('q') => self.close(),
                 KeyCode::Char('y') => self.respond_permission(true),
@@ -1022,21 +1059,27 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('m') => self.cycle_mode(),
                 KeyCode::Char('M') => self.cycle_model(),
                 KeyCode::Char('e') => self.cycle_effort(),
-                KeyCode::Char('g') | KeyCode::Home => self.scroll(KeyAssignment::ScrollToTop),
-                KeyCode::Char('G') | KeyCode::End => self.scroll(KeyAssignment::ScrollToBottom),
-                KeyCode::Char('j') | KeyCode::DownArrow => {
-                    self.scroll(KeyAssignment::ScrollByLine(3))
-                }
-                KeyCode::Char('k') | KeyCode::UpArrow => {
-                    self.scroll(KeyAssignment::ScrollByLine(-3))
-                }
+                KeyCode::Char('g') | KeyCode::Home => self.scroll_to_top(),
+                KeyCode::Char('G') | KeyCode::End => self.scroll_to_bottom(),
+                KeyCode::PageDown => self.scroll_page(1),
+                KeyCode::PageUp => self.scroll_page(-1),
+                KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_lines(3),
+                KeyCode::Char('k') | KeyCode::UpArrow => self.scroll_lines(-3),
                 _ => {}
             },
         }
         Ok(())
     }
 
-    fn mouse_event(&self, _event: wezterm_term::MouseEvent) -> anyhow::Result<()> {
+    fn mouse_event(&self, event: wezterm_term::MouseEvent) -> anyhow::Result<()> {
+        use wezterm_term::{MouseButton, MouseEventKind};
+        if event.kind == MouseEventKind::Press {
+            match event.button {
+                MouseButton::WheelUp(n) => self.scroll_lines(-(n.max(1) as isize)),
+                MouseButton::WheelDown(n) => self.scroll_lines(n.max(1) as isize),
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -1049,7 +1092,7 @@ impl Pane for PaseoAgentPane {
     }
 
     fn is_mouse_grabbed(&self) -> bool {
-        false
+        true
     }
 
     fn is_alt_screen_active(&self) -> bool {
@@ -1123,7 +1166,6 @@ pub fn open_paseo_agent_pane(
             pending: None,
             mode: Mode::Scroll,
             composer: String::new(),
-            composer_row: 0,
             provider: String::new(),
             agent_status: String::new(),
             model: None,
@@ -1131,7 +1173,10 @@ pub fn open_paseo_agent_pane(
             available_modes: Vec::new(),
             thinking_option_id: None,
             models: Vec::new(),
-            rows: Vec::new(),
+            transcript: Vec::new(),
+            footer: Vec::new(),
+            scroll: 0,
+            follow: true,
             rows_version: 0,
             size: split_size.second,
             seqno: 1,
