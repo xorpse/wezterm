@@ -828,7 +828,7 @@ impl AgentState {
         if let Some(request) = &self.pending {
             let is_question = request.kind == "question";
             let prefix = if is_question {
-                "❓ question: "
+                "⚠ question: "
             } else {
                 "⚠ permission: "
             };
