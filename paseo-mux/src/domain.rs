@@ -49,6 +49,26 @@ impl PaseoDomain {
         format!("wezterm-paseo-{}", self.name)
     }
 
+    pub fn client(&self) -> Option<PaseoClient> {
+        self.client.lock().clone()
+    }
+
+    pub async fn ensure_client(&self) -> anyhow::Result<PaseoClient> {
+        if let Some(client) = self.client() {
+            return Ok(client);
+        }
+        let client = self.connect().await?;
+        *self.client.lock() = Some(client.clone());
+        {
+            let client = client.clone();
+            promise::spawn::spawn(async move {
+                let _ = client.run().await;
+            })
+            .detach();
+        }
+        Ok(client)
+    }
+
     async fn connect(&self) -> anyhow::Result<PaseoClient> {
         let client = match &self.target {
             ConnectTarget::Relay { offer_url } => {
@@ -87,15 +107,54 @@ fn default_size() -> TerminalSize {
 impl Domain for PaseoDomain {
     async fn spawn_pane(
         &self,
-        _size: TerminalSize,
-        _command: Option<CommandBuilder>,
-        _command_dir: Option<String>,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        anyhow::bail!("paseo domain does not support spawn yet")
+        let client = self.ensure_client().await?;
+        let cwd = command_dir.unwrap_or_else(|| "/tmp".to_string());
+        let workspace_id = client.open_project(&cwd).await?;
+
+        let (program, args) = match command {
+            Some(builder) => {
+                let argv: Vec<String> = builder
+                    .get_argv()
+                    .iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect();
+                match argv.split_first() {
+                    Some((prog, rest)) => (Some(prog.clone()), Some(rest.to_vec())),
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
+
+        let opts = paseo_client::CreateTerminalOpts {
+            command: program,
+            args,
+            workspace_id: Some(workspace_id),
+            rows: size.rows as u32,
+            cols: size.cols as u32,
+            ..Default::default()
+        };
+        let info = client.create_terminal(&cwd, opts).await?;
+        let handle = client.subscribe_terminal(&info.id, "live").await?;
+        let remote = handle.writer();
+        let (pane, input_rx) = PaseoTerminalPane::new(
+            alloc_pane_id(),
+            self.domain_id,
+            info.id.clone(),
+            size,
+            remote,
+        );
+        self.attached_terminals.lock().insert(info.id.clone());
+        pane.start_io(handle, input_rx);
+        Ok(pane as Arc<dyn Pane>)
     }
 
     fn spawnable(&self) -> bool {
-        false
+        true
     }
 
     fn detachable(&self) -> bool {
@@ -112,22 +171,13 @@ impl Domain for PaseoDomain {
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
         log::info!("paseo domain {} connecting", self.name);
-        let client = self.connect().await?;
+        let client = self.ensure_client().await?;
         log::info!(
             "paseo domain {} connected to {:?} v{:?}",
             self.name,
             client.server_info().hostname,
             client.server_info().version
         );
-        *self.client.lock() = Some(client.clone());
-
-        {
-            let client = client.clone();
-            promise::spawn::spawn(async move {
-                let _ = client.run().await;
-            })
-            .detach();
-        }
 
         let mux = Mux::get();
         let window_id = match window_id {
@@ -146,7 +196,9 @@ impl Domain for PaseoDomain {
             if !self.attached_terminals.lock().insert(info.id.clone()) {
                 continue;
             }
-            let handle = client.subscribe_terminal(&info.id, "visible-snapshot").await?;
+            let handle = client
+                .subscribe_terminal(&info.id, "visible-snapshot")
+                .await?;
             let remote = handle.writer();
             let (pane, input_rx) = PaseoTerminalPane::new(
                 alloc_pane_id(),
