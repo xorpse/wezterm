@@ -12,8 +12,9 @@ use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab as M
 use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
-    AgentListEntry, AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent, ModelDefinition,
-    PaseoClient, PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail, Workspace,
+    AgentFeature, AgentListEntry, AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent,
+    ModelDefinition, PaseoClient, PermissionRequest, PermissionResponse, SlashCommand,
+    TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
 use serde_json::Value;
@@ -1045,6 +1046,8 @@ struct AgentState {
     current_mode_id: Option<String>,
     available_modes: Vec<AgentMode>,
     thinking_option_id: Option<String>,
+    features: Vec<AgentFeature>,
+    slash_commands: Vec<SlashCommand>,
     models: Vec<ModelDefinition>,
     transcript: Vec<AgentRow>,
     footer: Vec<AgentRow>,
@@ -1057,7 +1060,41 @@ struct AgentState {
     create_stack: Vec<WizardFrame>,
 }
 
+fn is_core_agent_key(ch: char) -> bool {
+    matches!(
+        ch,
+        'i' | 'd'
+            | 't'
+            | 'q'
+            | 'y'
+            | 'n'
+            | 'x'
+            | 'm'
+            | 'e'
+            | 'g'
+            | 'c'
+            | 'u'
+            | 'j'
+            | 'k'
+            | 'o'
+            | 'r'
+    )
+}
+
 impl AgentState {
+    fn feature_keys(&self) -> Vec<(char, usize)> {
+        let mut out = Vec::new();
+        let mut used = std::collections::HashSet::new();
+        for (i, feature) in self.features.iter().enumerate() {
+            if let Some(ch) = feature.label.chars().next().map(|c| c.to_ascii_lowercase()) {
+                if ch.is_ascii_alphabetic() && !is_core_agent_key(ch) && used.insert(ch) {
+                    out.push((ch, i));
+                }
+            }
+        }
+        out
+    }
+
     fn composer_char_len(&self) -> usize {
         self.composer.chars().count()
     }
@@ -1419,6 +1456,31 @@ impl AgentState {
                 attrs: attr_fg(AnsiColor::Teal),
                 line: None,
             });
+            let feature_keys = self.feature_keys();
+            if !feature_keys.is_empty() {
+                let chips: Vec<String> = feature_keys
+                    .iter()
+                    .filter_map(|(ch, idx)| {
+                        self.features.get(*idx).map(|feature| {
+                            if feature.is_toggle() {
+                                let mark = if feature.toggle_value() { "●" } else { "○" };
+                                format!("{mark} [{ch}]{}", feature.label)
+                            } else {
+                                format!(
+                                    "[{ch}]{}:{}",
+                                    feature.label,
+                                    feature.select_value().unwrap_or("—")
+                                )
+                            }
+                        })
+                    })
+                    .collect();
+                footer.push(AgentRow {
+                    text: chips.join("   "),
+                    attrs: attr_fg(AnsiColor::Fuchsia),
+                    line: None,
+                });
+            }
             footer.push(AgentRow {
                 text: "d:diff  t:terminal  ·  m:mode  M:model  e:effort  x:stop".to_string(),
                 attrs: attr_dim(),
@@ -1631,6 +1693,7 @@ impl PaseoAgentPane {
             state.current_mode_id = snapshot.current_mode_id.clone();
             state.available_modes = snapshot.available_modes.clone();
             state.thinking_option_id = snapshot.thinking_option_id.clone();
+            state.features = snapshot.features.clone();
             state.requires_attention = snapshot.requires_attention;
             if state.pending.is_none() {
                 state.pending = snapshot.pending_permissions.first().cloned();
@@ -1724,6 +1787,35 @@ impl PaseoAgentPane {
             }
         })
         .detach();
+    }
+
+    fn toggle_feature(&self, index: usize) {
+        let feature = self.state.lock().features.get(index).cloned();
+        let Some(feature) = feature else {
+            return;
+        };
+        let id = feature.id.clone();
+        if feature.is_toggle() {
+            let new_value = !feature.toggle_value();
+            self.refresh_after(move |client, agent_id| {
+                Box::pin(async move {
+                    let _ = client
+                        .set_agent_feature(&agent_id, &id, Value::Bool(new_value))
+                        .await;
+                })
+            });
+        } else {
+            let options: Vec<String> = feature.options.iter().map(|o| o.id.clone()).collect();
+            if let Some(next) = cycle_next(&options, feature.select_value()) {
+                self.refresh_after(move |client, agent_id| {
+                    Box::pin(async move {
+                        let _ = client
+                            .set_agent_feature(&agent_id, &id, Value::String(next))
+                            .await;
+                    })
+                });
+            }
+        }
     }
 
     fn cycle_mode(&self) {
@@ -3580,6 +3672,18 @@ impl Pane for PaseoAgentPane {
                 KeyCode::PageUp => self.scroll_page(-1),
                 KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_lines(3),
                 KeyCode::Char('k') | KeyCode::UpArrow => self.scroll_lines(-3),
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CTRL) => {
+                    let idx = self
+                        .state
+                        .lock()
+                        .feature_keys()
+                        .into_iter()
+                        .find(|(ch, _)| *ch == c.to_ascii_lowercase())
+                        .map(|(_, i)| i);
+                    if let Some(idx) = idx {
+                        self.toggle_feature(idx);
+                    }
+                }
                 _ => {}
             },
         }
@@ -3729,6 +3833,8 @@ pub fn open_paseo_agent_pane(
             current_mode_id: None,
             available_modes: Vec::new(),
             thinking_option_id: None,
+            features: Vec::new(),
+            slash_commands: Vec::new(),
             models: Vec::new(),
             transcript: Vec::new(),
             footer: Vec::new(),

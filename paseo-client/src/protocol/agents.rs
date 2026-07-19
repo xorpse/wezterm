@@ -21,6 +21,46 @@ pub struct SelectOption {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentFeature {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub options: Vec<SelectOption>,
+}
+
+impl AgentFeature {
+    pub fn is_toggle(&self) -> bool {
+        self.kind == "toggle"
+    }
+
+    pub fn toggle_value(&self) -> bool {
+        self.value.as_bool().unwrap_or(false)
+    }
+
+    pub fn select_value(&self) -> Option<&str> {
+        self.value.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub argument_hint: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     pub id: String,
     #[serde(default)]
@@ -67,6 +107,8 @@ pub struct AgentSnapshot {
     pub archived_at: Option<String>,
     #[serde(default)]
     pub pending_permissions: Vec<PermissionRequest>,
+    #[serde(default)]
+    pub features: Vec<AgentFeature>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +266,29 @@ pub fn set_agent_mode_request(request_id: &str, agent_id: &str, mode_id: &str) -
         "type": "set_agent_mode_request",
         "agentId": agent_id,
         "modeId": mode_id,
+        "requestId": request_id
+    })
+}
+
+pub fn set_agent_feature_request(
+    request_id: &str,
+    agent_id: &str,
+    feature_id: &str,
+    value: Value,
+) -> Value {
+    json!({
+        "type": "set_agent_feature_request",
+        "agentId": agent_id,
+        "featureId": feature_id,
+        "value": value,
+        "requestId": request_id
+    })
+}
+
+pub fn list_commands_request(request_id: &str, agent_id: &str) -> Value {
+    json!({
+        "type": "list_commands_request",
+        "agentId": agent_id,
         "requestId": request_id
     })
 }

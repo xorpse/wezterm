@@ -377,6 +377,34 @@ impl PaseoClient {
         Ok(())
     }
 
+    pub async fn set_agent_feature(
+        &self,
+        agent_id: &str,
+        feature_id: &str,
+        value: Value,
+    ) -> Result<()> {
+        let id = new_id();
+        self.request(agents::set_agent_feature_request(
+            &id, agent_id, feature_id, value,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_commands(&self, agent_id: &str) -> Result<Vec<agents::SlashCommand>> {
+        let id = new_id();
+        let payload = self
+            .request(agents::list_commands_request(&id, agent_id))
+            .await?;
+        let commands = payload
+            .get("commands")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(commands)
+    }
+
     pub async fn set_agent_thinking(&self, agent_id: &str, thinking_option_id: &str) -> Result<()> {
         let id = new_id();
         self.request(agents::set_agent_thinking_request(
