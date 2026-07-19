@@ -424,6 +424,7 @@ enum PickerStage {
         context: Option<String>,
         suggestions: Vec<String>,
         suggestion_selected: usize,
+        suggest_gen: u64,
     },
 }
 
@@ -467,10 +468,10 @@ fn is_active_status(status: &str) -> bool {
 }
 
 fn status_glyph(agent: &AgentSnapshot) -> &'static str {
-    if agent.requires_attention {
-        "⚠"
-    } else if is_active_status(&agent.status) {
+    if is_active_status(&agent.status) {
         "●"
+    } else if agent.requires_attention {
+        "⚠"
     } else {
         "○"
     }
@@ -725,7 +726,7 @@ fn build_picker_groups(
                     });
                 }
                 entries.push(PickerEntry {
-                    label: "  ⊕ new agent here".to_string(),
+                    label: "  ⊕ new agent".to_string(),
                     action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
                 });
                 Unit {
@@ -2190,19 +2191,23 @@ impl PaseoAgentPane {
         let Some(client) = self.client() else {
             return;
         };
-        let (kind, query, context) = {
-            let state = self.state.lock();
-            match &state.picker {
+        let (kind, query, context, generation) = {
+            let mut state = self.state.lock();
+            match &mut state.picker {
                 Some(PickerState {
                     stage:
                         PickerStage::Input {
                             kind,
                             buffer,
                             context,
+                            suggest_gen,
                             ..
                         },
                     ..
-                }) if kind.autocompletes() => (*kind, buffer.clone(), context.clone()),
+                }) if kind.autocompletes() => {
+                    *suggest_gen += 1;
+                    (*kind, buffer.clone(), context.clone(), *suggest_gen)
+                }
                 _ => return,
             }
         };
@@ -2217,14 +2222,14 @@ impl PaseoAgentPane {
                     .await
                     .unwrap_or_default();
                 if let Some(pane) = weak.upgrade() {
-                    pane.apply_suggestions(query, branches);
+                    pane.apply_suggestions(generation, branches);
                 }
             })
             .detach();
             return;
         }
         if !query.starts_with('/') && !query.starts_with('~') {
-            self.apply_suggestions(query, Vec::new());
+            self.apply_suggestions(generation, Vec::new());
             return;
         }
         promise::spawn::spawn(async move {
@@ -2233,26 +2238,26 @@ impl PaseoAgentPane {
                 .await
                 .unwrap_or_default();
             if let Some(pane) = weak.upgrade() {
-                pane.apply_suggestions(query, directories);
+                pane.apply_suggestions(generation, directories);
             }
         })
         .detach();
     }
 
-    fn apply_suggestions(&self, query: String, directories: Vec<String>) {
+    fn apply_suggestions(&self, generation: u64, directories: Vec<String>) {
         self.mutate(|state| {
             if let Some(PickerState {
                 stage:
                     PickerStage::Input {
-                        buffer,
                         suggestions,
                         suggestion_selected,
+                        suggest_gen,
                         ..
                     },
                 ..
             }) = &mut state.picker
             {
-                if *buffer == query {
+                if *suggest_gen == generation {
                     *suggestions = directories;
                     *suggestion_selected = 0;
                 }
@@ -2448,6 +2453,7 @@ impl PaseoAgentPane {
                             context,
                             suggestions: Vec::new(),
                             suggestion_selected: 0,
+                            suggest_gen: 0,
                         };
                     }
                     state.rebuild_rows();
@@ -2460,9 +2466,7 @@ impl PaseoAgentPane {
                 if !value.is_empty() {
                     match kind {
                         InputKind::AddConnection => self.run_add_connection(value),
-                        InputKind::SearchDirectory => {
-                            self.begin_create(PendingCreate::Workspace(value))
-                        }
+                        InputKind::SearchDirectory => self.begin_worktree_choice(value),
                         InputKind::BranchOff => {
                             if let Some(cwd) = context {
                                 self.begin_create(PendingCreate::WorktreeBranchOff {
@@ -2765,11 +2769,12 @@ impl Pane for PaseoAgentPane {
 
     fn get_title(&self) -> String {
         let state = self.state.lock();
-        let glyph = if state.pending.is_some() || state.requires_attention {
+        let glyph = if is_active_status(&state.agent_status) {
+            "● "
+        } else if state.pending.is_some() || state.requires_attention {
             "⚠ "
         } else {
             match state.agent_status.as_str() {
-                "running" => "● ",
                 "error" => "✗ ",
                 _ => "",
             }
