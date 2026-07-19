@@ -96,6 +96,7 @@ impl RenderRow {
 struct FindState {
     buffer: LineEditBuffer,
     browsing: bool,
+    scope: Option<String>,
 }
 
 struct EditState {
@@ -471,11 +472,19 @@ impl ReviewState {
             return;
         }
         let q = query.to_lowercase();
-        let is_match = |r: &RenderRow| {
-            r.kind == RowKind::FileHeader
-                && r.file
-                    .as_ref()
-                    .is_some_and(|f| f.to_lowercase().contains(&q))
+        let scope = self.find.as_ref().and_then(|f| f.scope.clone());
+        let is_match = |r: &RenderRow| match &scope {
+            Some(file) => {
+                r.kind != RowKind::FileHeader
+                    && r.file.as_deref() == Some(file.as_str())
+                    && r.text.to_lowercase().contains(&q)
+            }
+            None => {
+                r.kind == RowKind::FileHeader
+                    && r.file
+                        .as_ref()
+                        .is_some_and(|f| f.to_lowercase().contains(&q))
+            }
         };
         let found = if forward {
             let start = (self.cursor + 1).min(self.rows.len());
@@ -841,9 +850,15 @@ impl ReviewPane {
             if s.find.is_some() {
                 return;
             }
+            let scope = s
+                .rows
+                .get(s.cursor)
+                .and_then(|r| r.file.clone())
+                .filter(|file| !s.collapsed.contains(file));
             s.find = Some(FindState {
                 buffer: LineEditBuffer::new("", 0),
                 browsing: false,
+                scope,
             });
         });
     }
@@ -933,13 +948,20 @@ impl ReviewPane {
 
     fn render_find_bar(&self, state: &ReviewState) -> Line {
         let text = match &state.find {
-            Some(find) if find.browsing => {
-                format!(
-                    "/{}    n/p: next/prev · Enter/Esc: done",
-                    find.buffer.get_line()
-                )
+            Some(find) => {
+                let scope = match &find.scope {
+                    Some(file) => format!("in {}", file.rsplit('/').next().unwrap_or(file)),
+                    None => "file names".to_string(),
+                };
+                if find.browsing {
+                    format!(
+                        "/{}    ({scope})  n/p: next/prev · Enter/Esc: done",
+                        find.buffer.get_line()
+                    )
+                } else {
+                    format!("/{}    ({scope})", find.buffer.get_line())
+                }
             }
-            Some(find) => format!("/{}", find.buffer.get_line()),
             None => String::new(),
         };
         let mut a = CellAttributes::default();
