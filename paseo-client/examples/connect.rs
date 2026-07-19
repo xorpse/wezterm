@@ -11,6 +11,7 @@ struct Options {
     dump_timeline: Option<String>,
     watch_stream: Option<String>,
     create_agent: Option<String>,
+    inspect: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -34,6 +35,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         dump_timeline: None,
         watch_stream: None,
         create_agent: None,
+        inspect: None,
     };
 
     if first == "--local" {
@@ -55,6 +57,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--create-probe" => {
                 options.create_probe = Some(iter.next().cloned().ok_or_else(usage)?);
+            }
+            "--inspect" => {
+                options.inspect = Some(iter.next().cloned().unwrap_or_default());
             }
             "--create-agent" => {
                 options.create_agent = Some(iter.next().cloned().unwrap_or_default());
@@ -116,7 +121,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(spec) = &options.create_agent {
+    if let Some(a) = &options.inspect {
+        inspect_agent(&client, a, &agents).await?;
+    } else if let Some(spec) = &options.create_agent {
         create_agent(&client, spec).await?;
     } else if let Some(agent_arg) = &options.watch_stream {
         watch_stream(&client, agent_arg, &agents).await?;
@@ -133,6 +140,77 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
     }
 
     client.close().await;
+    Ok(())
+}
+
+async fn inspect_agent(
+    client: &PaseoClient,
+    agent_arg: &str,
+    agents: &[paseo_client::AgentListEntry],
+) -> anyhow::Result<()> {
+    let agent_id = if agent_arg.is_empty() {
+        agents
+            .iter()
+            .find(|e| e.agent.archived_at.is_none())
+            .map(|e| e.agent.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no agents"))?
+    } else {
+        agent_arg.to_string()
+    };
+    let snap = client.fetch_agent(&agent_id).await?;
+    println!(
+        "agent {} provider={} status={} model={:?} mode={:?} thinking={:?}",
+        snap.id,
+        snap.provider,
+        snap.status,
+        snap.model,
+        snap.current_mode_id,
+        snap.thinking_option_id
+    );
+    println!(
+        "availableModes: {:?}",
+        snap.available_modes
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>()
+    );
+    let models = client.list_provider_models(&snap.provider, None).await?;
+    println!("provider models ({}):", models.len());
+    for m in &models {
+        println!(
+            "  {} thinking={:?} default={:?}",
+            m.id,
+            m.thinking_options
+                .iter()
+                .map(|o| o.id.clone())
+                .collect::<Vec<_>>(),
+            m.default_thinking_option_id
+        );
+    }
+
+    if snap.available_modes.len() >= 2 {
+        let current = snap.current_mode_id.clone().unwrap_or_default();
+        let next = snap
+            .available_modes
+            .iter()
+            .find(|m| m.id != current)
+            .map(|m| m.id.clone())
+            .unwrap();
+        println!("setting mode {current:?} -> {next}");
+        client.set_agent_mode(&agent_id, &next).await?;
+        println!("set_agent_mode returned ok");
+        smol::Timer::after(Duration::from_millis(800)).await;
+        let after = client.fetch_agent(&agent_id).await?;
+        println!(
+            "  re-fetched: mode={:?} (expected {next}) — {}",
+            after.current_mode_id,
+            if after.current_mode_id.as_deref() == Some(next.as_str()) {
+                "APPLIED"
+            } else {
+                "NOT applied (deferred or rejected)"
+            }
+        );
+    }
     Ok(())
 }
 

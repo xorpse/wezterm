@@ -181,6 +181,18 @@ impl PaseoClient {
         Ok(())
     }
 
+    pub async fn fetch_agent(&self, agent_id: &str) -> Result<crate::protocol::AgentSnapshot> {
+        let id = new_id();
+        let payload = self
+            .request(agents::fetch_agent_request(&id, agent_id))
+            .await?;
+        let agent = payload
+            .get("agent")
+            .cloned()
+            .ok_or_else(|| PaseoError::Protocol("fetch_agent missing agent".into()))?;
+        serde_json::from_value(agent).map_err(PaseoError::from)
+    }
+
     pub async fn create_agent(
         &self,
         provider: &str,

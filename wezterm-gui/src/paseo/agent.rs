@@ -457,8 +457,30 @@ impl PaseoAgentPane {
     }
 
     fn apply_stream_event(&self, event: &AgentStreamEvent) {
-        if event.kind != "timeline" {
-            return;
+        match event.kind.as_str() {
+            "turn_started" => {
+                self.mutate(|state| {
+                    state.agent_status = "running".to_string();
+                    state.rebuild_rows();
+                });
+                return;
+            }
+            "turn_completed" | "turn_canceled" => {
+                self.mutate(|state| {
+                    state.agent_status = "idle".to_string();
+                    state.rebuild_rows();
+                });
+                return;
+            }
+            "turn_failed" => {
+                self.mutate(|state| {
+                    state.agent_status = "error".to_string();
+                    state.rebuild_rows();
+                });
+                return;
+            }
+            "timeline" => {}
+            _ => return,
         }
         let Some(item) = &event.item else {
             return;
@@ -500,14 +522,37 @@ impl PaseoAgentPane {
         self.agent_id.lock().clone()
     }
 
+    fn refresh_after<F>(&self, action: F)
+    where
+        F: FnOnce(
+                PaseoClient,
+                String,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    {
+        let Some(agent_id) = self.agent_id() else {
+            return;
+        };
+        let client = self.client.clone();
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            action(client.clone(), agent_id.clone()).await;
+            if let Ok(snapshot) = client.fetch_agent(&agent_id).await {
+                if let Some(pane) = weak.upgrade() {
+                    pane.set_snapshot(&snapshot);
+                }
+            }
+        })
+        .detach();
+    }
+
     fn stop(&self) {
-        if let Some(agent_id) = self.agent_id() {
-            let client = self.client.clone();
-            promise::spawn::spawn(async move {
+        self.refresh_after(|client, agent_id| {
+            Box::pin(async move {
                 let _ = client.cancel_agent(&agent_id).await;
             })
-            .detach();
-        }
+        });
     }
 
     fn cycle_mode(&self) {
@@ -523,12 +568,13 @@ impl PaseoAgentPane {
             );
             (self.agent_id(), next)
         };
-        if let (Some(agent_id), Some(next)) = (agent_id, next) {
-            let client = self.client.clone();
-            promise::spawn::spawn(async move {
-                let _ = client.set_agent_mode(&agent_id, &next).await;
-            })
-            .detach();
+        let _ = agent_id;
+        if let Some(next) = next {
+            self.refresh_after(move |client, agent_id| {
+                Box::pin(async move {
+                    let _ = client.set_agent_mode(&agent_id, &next).await;
+                })
+            });
         }
     }
 
@@ -545,12 +591,13 @@ impl PaseoAgentPane {
             );
             (self.agent_id(), next)
         };
-        if let (Some(agent_id), Some(next)) = (agent_id, next) {
-            let client = self.client.clone();
-            promise::spawn::spawn(async move {
-                let _ = client.set_agent_model(&agent_id, &next).await;
-            })
-            .detach();
+        let _ = agent_id;
+        if let Some(next) = next {
+            self.refresh_after(move |client, agent_id| {
+                Box::pin(async move {
+                    let _ = client.set_agent_model(&agent_id, &next).await;
+                })
+            });
         }
     }
 
@@ -564,16 +611,29 @@ impl PaseoAgentPane {
             let next = cycle_next(&options, state.thinking_option_id.as_deref());
             (self.agent_id(), next)
         };
-        if let (Some(agent_id), Some(next)) = (agent_id, next) {
-            let client = self.client.clone();
-            promise::spawn::spawn(async move {
-                let _ = client.set_agent_thinking(&agent_id, &next).await;
-            })
-            .detach();
+        let _ = agent_id;
+        if let Some(next) = next {
+            self.refresh_after(move |client, agent_id| {
+                Box::pin(async move {
+                    let _ = client.set_agent_thinking(&agent_id, &next).await;
+                })
+            });
         }
     }
 
     fn scroll(&self, assignment: KeyAssignment) {
+        {
+            let state = self.state.lock();
+            let total = state.total_rows();
+            log::info!(
+                "paseo scroll {:?}: rows={} size.rows={} total={} physical_top={} scrollback_top=0",
+                assignment,
+                state.rows.len(),
+                state.size.rows,
+                total,
+                total.saturating_sub(state.size.rows)
+            );
+        }
         let pane_id = self.pane_id;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |tw| {
