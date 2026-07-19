@@ -1,3 +1,4 @@
+use crate::protocol::diff::CheckoutDiff;
 use crate::protocol::{AgentSnapshot, AgentStreamEvent, PermissionRequest, TerminalInfo};
 use serde_json::Value;
 
@@ -32,5 +33,6 @@ pub enum DaemonEvent {
         terminals: Vec<TerminalInfo>,
     },
     TerminalExit(String),
+    CheckoutDiff(Box<CheckoutDiff>),
     Disconnected,
 }

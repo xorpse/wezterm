@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod diff;
 pub mod stream;
 pub mod terminals;
 pub mod timeline;

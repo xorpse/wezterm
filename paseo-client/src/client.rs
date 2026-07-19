@@ -7,6 +7,7 @@ use crate::error::{PaseoError, Result};
 use crate::events::{DaemonEvent, TerminalStreamEvent};
 use crate::offer::{build_relay_ws_url, decode_daemon_public_key, ConnectionOffer};
 use crate::protocol::agents::{AgentListEntry, PermissionResponse};
+use crate::protocol::diff;
 use crate::protocol::stream::{AgentStreamEvent, AgentUpdate};
 use crate::protocol::terminals::{self, CreateTerminalOpts, TerminalInfo};
 use crate::protocol::{agents, ServerInfo};
@@ -185,6 +186,32 @@ impl PaseoClient {
         self.request(agents::set_timeline_subscription_request(&id, agent_ids))
             .await?;
         Ok(())
+    }
+
+    pub async fn subscribe_checkout_diff(
+        &self,
+        cwd: &str,
+        mode: &str,
+    ) -> Result<crate::protocol::diff::CheckoutDiff> {
+        let id = new_id();
+        let subscription_id = new_id();
+        let payload = self
+            .request(diff::subscribe_checkout_diff_request(
+                &id,
+                &subscription_id,
+                cwd,
+                mode,
+            ))
+            .await?;
+        Ok(diff::parse_checkout_diff(&payload))
+    }
+
+    pub async fn unsubscribe_checkout_diff(&self, subscription_id: &str) -> Result<()> {
+        let message = diff::unsubscribe_checkout_diff_request(subscription_id);
+        self.inner
+            .transport
+            .send_text(session_envelope(message).to_string())
+            .await
     }
 
     pub async fn send_agent_message(&self, agent_id: &str, text: &str) -> Result<()> {
@@ -538,6 +565,10 @@ impl PaseoClient {
                     }
                     self.emit(DaemonEvent::TerminalExit(terminal_id.to_string()));
                 }
+            }
+            "checkout_diff_update" => {
+                let diff = diff::parse_checkout_diff(&payload);
+                self.emit(DaemonEvent::CheckoutDiff(Box::new(diff)));
             }
             _ => {}
         }

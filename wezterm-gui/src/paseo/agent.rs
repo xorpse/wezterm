@@ -12,8 +12,9 @@ use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
-    AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent, ModelDefinition, PaseoClient,
-    PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail,
+    AgentMode, AgentSnapshot, AgentStreamEvent, CheckoutDiff, DaemonEvent, DiffFile,
+    ModelDefinition, PaseoClient, PermissionRequest, PermissionResponse, TimelineItem,
+    ToolCallDetail,
 };
 use rangeset::RangeSet;
 use std::ops::Range;
@@ -231,6 +232,88 @@ fn is_message(kind: &str) -> bool {
     matches!(kind, "assistant_message" | "reasoning" | "user_message")
 }
 
+fn diff_rows(diff: &DiffView, cwd: &str, cols: usize) -> Vec<AgentRow> {
+    let mut rows = Vec::new();
+    rows.push(AgentRow {
+        text: format!("Workspace diff — {cwd}"),
+        attrs: attr_bold_fg(AnsiColor::Teal),
+    });
+    rows.push(blank_row());
+
+    if let Some(error) = &diff.error {
+        push_wrapped(
+            &mut rows,
+            "error: ",
+            error,
+            &attr_fg(AnsiColor::Maroon),
+            cols,
+        );
+        return rows;
+    }
+    if diff.files.is_empty() {
+        let message = if diff.loading {
+            "⟳ loading diff…"
+        } else {
+            "no uncommitted changes"
+        };
+        push_wrapped(&mut rows, "", message, &attr_dim(), cols);
+        return rows;
+    }
+
+    for file in &diff.files {
+        let tag = if file.is_new {
+            " (new)"
+        } else if file.is_deleted {
+            " (deleted)"
+        } else {
+            ""
+        };
+        rows.push(AgentRow {
+            text: format!(
+                "{}  +{} -{}{tag}",
+                file.path, file.additions, file.deletions
+            ),
+            attrs: attr_bold_fg(AnsiColor::Blue),
+        });
+        if file.status.as_deref() == Some("too_large") {
+            push_wrapped(
+                &mut rows,
+                "  ",
+                "diff too large to display",
+                &attr_dim(),
+                cols,
+            );
+            rows.push(blank_row());
+            continue;
+        }
+        if file.status.as_deref() == Some("binary") {
+            push_wrapped(&mut rows, "  ", "binary file", &attr_dim(), cols);
+            rows.push(blank_row());
+            continue;
+        }
+        for hunk in &file.hunks {
+            rows.push(AgentRow {
+                text: format!(
+                    "  @@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                ),
+                attrs: attr_fg(AnsiColor::Fuchsia),
+            });
+            for line in &hunk.lines {
+                let (prefix, attrs) = match line.r#type.as_str() {
+                    "add" => ("+", attr_fg(AnsiColor::Green)),
+                    "remove" => ("-", attr_fg(AnsiColor::Maroon)),
+                    "header" => (" ", attr_dim()),
+                    _ => (" ", attr_default()),
+                };
+                push_wrapped(&mut rows, prefix, &line.content, &attrs, cols);
+            }
+        }
+        rows.push(blank_row());
+    }
+    rows
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Mode {
     Scroll,
@@ -281,12 +364,21 @@ fn picker_label(agent: &AgentSnapshot) -> String {
     format!("[{}] {} ({})", agent.status, title, agent.provider)
 }
 
+struct DiffView {
+    subscription_id: Option<String>,
+    files: Vec<DiffFile>,
+    error: Option<String>,
+    loading: bool,
+}
+
 struct AgentState {
     title: String,
     status_message: Option<String>,
     items: Vec<TimelineItem>,
     pending: Option<PermissionRequest>,
     picker: Option<PickerState>,
+    diff: Option<DiffView>,
+    cwd: String,
     mode: Mode,
     composer: String,
     provider: String,
@@ -386,6 +478,16 @@ impl AgentState {
             return;
         }
 
+        if let Some(diff) = &self.diff {
+            self.transcript = diff_rows(diff, &self.cwd, cols);
+            self.footer = vec![AgentRow {
+                text: "[diff] d:transcript · j/k:scroll · g/G:top/bottom · q:close".to_string(),
+                attrs: attr_dim(),
+            }];
+            self.clamp_scroll();
+            return;
+        }
+
         let mut transcript = Vec::new();
         if self.items.is_empty() {
             if let Some(message) = &self.status_message {
@@ -443,7 +545,8 @@ impl AgentState {
                 attrs: attr_default(),
             },
             Mode::Scroll => AgentRow {
-                text: "❯ (i: type · j/k: scroll · g/G: top/bottom · q: close)".to_string(),
+                text: "❯ (i: type · j/k: scroll · g/G: top/bottom · d: diff · q: close)"
+                    .to_string(),
                 attrs: attr_dim(),
             },
         };
@@ -618,6 +721,7 @@ impl PaseoAgentPane {
 
     fn set_snapshot(&self, snapshot: &AgentSnapshot) {
         self.mutate(|state| {
+            state.cwd = snapshot.cwd.clone();
             state.provider = snapshot.provider.clone();
             state.agent_status = snapshot.status.clone();
             state.model = snapshot.model.clone();
@@ -673,6 +777,98 @@ impl PaseoAgentPane {
                 let _ = client.cancel_agent(&agent_id).await;
             })
         });
+    }
+
+    fn apply_checkout_diff(&self, diff: CheckoutDiff) {
+        self.mutate(|state| {
+            let matches = state
+                .diff
+                .as_ref()
+                .and_then(|v| v.subscription_id.as_deref())
+                == Some(diff.subscription_id.as_str());
+            if matches {
+                if let Some(view) = &mut state.diff {
+                    view.files = diff.files;
+                    view.error = diff.error.map(|e| e.message);
+                    view.loading = false;
+                }
+                state.rebuild_rows();
+            }
+        });
+    }
+
+    fn toggle_diff(self: &Arc<Self>) {
+        let (activate, cwd, prev_sub) = {
+            let state = self.state.lock();
+            (
+                state.diff.is_none(),
+                state.cwd.clone(),
+                state.diff.as_ref().and_then(|v| v.subscription_id.clone()),
+            )
+        };
+
+        if !activate {
+            self.mutate(|state| {
+                state.diff = None;
+                state.follow = true;
+                state.rebuild_rows();
+            });
+            if let (Some(client), Some(sub)) = (self.client(), prev_sub) {
+                promise::spawn::spawn(async move {
+                    let _ = client.unsubscribe_checkout_diff(&sub).await;
+                })
+                .detach();
+            }
+            return;
+        }
+
+        if cwd.is_empty() {
+            return;
+        }
+        self.mutate(|state| {
+            state.diff = Some(DiffView {
+                subscription_id: None,
+                files: Vec::new(),
+                error: None,
+                loading: true,
+            });
+            state.follow = false;
+            state.scroll = 0;
+            state.rebuild_rows();
+        });
+        let Some(client) = self.client() else {
+            return;
+        };
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            match client.subscribe_checkout_diff(&cwd, "uncommitted").await {
+                Ok(initial) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.mutate(|state| {
+                            if let Some(view) = &mut state.diff {
+                                view.subscription_id = Some(initial.subscription_id.clone());
+                                view.files = initial.files;
+                                view.error = initial.error.map(|e| e.message);
+                                view.loading = false;
+                            }
+                            state.rebuild_rows();
+                        });
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.mutate(|state| {
+                            if let Some(view) = &mut state.diff {
+                                view.error = Some(format!("{err}"));
+                                view.loading = false;
+                            }
+                            state.rebuild_rows();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn cycle_mode(&self) {
@@ -985,6 +1181,9 @@ impl PaseoAgentPane {
                     }
                     DaemonEvent::AgentUpsert(snapshot) if snapshot.id == agent_id => {
                         pane.set_snapshot(&snapshot);
+                    }
+                    DaemonEvent::CheckoutDiff(diff) => {
+                        pane.apply_checkout_diff(*diff);
                     }
                     DaemonEvent::Disconnected => {
                         pane.mutate(|state| {
@@ -1512,12 +1711,19 @@ impl Pane for PaseoAgentPane {
                 _ => {}
             },
             Mode::Scroll => match key {
-                KeyCode::Char('i') | KeyCode::Char('\r') | KeyCode::Enter => {
+                KeyCode::Char('i') | KeyCode::Char('\r') | KeyCode::Enter
+                    if self.state.lock().diff.is_none() =>
+                {
                     self.mutate(|state| {
                         state.mode = Mode::Compose;
                         state.rebuild_rows();
                     });
                     self.scroll_to_bottom();
+                }
+                KeyCode::Char('d') => {
+                    if let Some(pane) = self.weak.lock().upgrade() {
+                        pane.toggle_diff();
+                    }
                 }
                 KeyCode::Char('q') => self.close(),
                 KeyCode::Char('y') => self.respond_permission(true),
@@ -1633,6 +1839,8 @@ pub fn open_paseo_agent_pane(
             items: Vec::new(),
             pending: None,
             picker: None,
+            diff: None,
+            cwd: String::new(),
             mode: Mode::Scroll,
             composer: String::new(),
             provider: String::new(),

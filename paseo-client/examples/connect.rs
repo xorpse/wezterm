@@ -12,6 +12,7 @@ struct Options {
     watch_stream: Option<String>,
     create_agent: Option<String>,
     inspect: Option<String>,
+    diff: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -36,6 +37,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         watch_stream: None,
         create_agent: None,
         inspect: None,
+        diff: None,
     };
 
     if first == "--local" {
@@ -69,6 +71,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--dump-timeline" => {
                 options.dump_timeline = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--diff" => {
+                options.diff = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -133,7 +138,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(a) = &options.inspect {
+    if let Some(cwd) = &options.diff {
+        probe_diff(&client, cwd).await?;
+    } else if let Some(a) = &options.inspect {
         inspect_agent(&client, a, &agents).await?;
     } else if let Some(spec) = &options.create_agent {
         create_agent(&client, spec).await?;
@@ -382,6 +389,34 @@ async fn create_probe(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
     handle.unsubscribe().await?;
     println!("killing terminal {}", terminal.id);
     client.kill_terminal(&terminal.id).await?;
+    Ok(())
+}
+
+async fn probe_diff(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
+    println!("subscribing to uncommitted diff for {cwd}");
+    let diff = client.subscribe_checkout_diff(cwd, "uncommitted").await?;
+    println!(
+        "subscription {} — {} file(s)",
+        diff.subscription_id,
+        diff.files.len()
+    );
+    if let Some(error) = &diff.error {
+        println!("error [{}]: {}", error.code, error.message);
+    }
+    for file in &diff.files {
+        println!(
+            "  {} +{} -{} new={} deleted={} hunks={}",
+            file.path,
+            file.additions,
+            file.deletions,
+            file.is_new,
+            file.is_deleted,
+            file.hunks.len()
+        );
+    }
+    client
+        .unsubscribe_checkout_diff(&diff.subscription_id)
+        .await?;
     Ok(())
 }
 
