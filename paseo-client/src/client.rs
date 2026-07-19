@@ -101,6 +101,15 @@ impl PaseoClient {
         &self.inner.server_info
     }
 
+    pub fn feature_enabled(&self, name: &str) -> bool {
+        self.inner
+            .server_info
+            .features
+            .get(name)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     pub fn events(&self) -> async_broadcast::Receiver<DaemonEvent> {
         self.inner.events_tx.new_receiver()
     }
@@ -182,6 +191,9 @@ impl PaseoClient {
     }
 
     pub async fn set_timeline_subscription(&self, agent_ids: &[String]) -> Result<()> {
+        if !self.feature_enabled("selectiveAgentTimeline") {
+            return Ok(());
+        }
         let id = new_id();
         self.request(agents::set_timeline_subscription_request(&id, agent_ids))
             .await?;

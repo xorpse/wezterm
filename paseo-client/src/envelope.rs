@@ -6,7 +6,8 @@ pub fn capabilities() -> Value {
         "reasoning_merge_enum": true,
         "terminal_reflowable_snapshot": true,
         "provider_subagents": true,
-        "project_updates": true
+        "project_updates": true,
+        "selective_agent_timeline": true
     })
 }
 
