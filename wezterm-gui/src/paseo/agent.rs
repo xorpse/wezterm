@@ -356,6 +356,9 @@ enum Mode {
 enum PickerAction {
     OpenAgent(String),
     NewAgentInWorkspace(String),
+    WorktreeInPlace(String),
+    WorktreeNewBranch(String),
+    WorktreeCheckoutBranch(String),
     SearchDirectory,
     NewDirectory,
     CloneRepo,
@@ -367,6 +370,8 @@ enum PickerAction {
 #[derive(Clone)]
 enum PendingCreate {
     Workspace(String),
+    WorktreeBranchOff { cwd: String, base_branch: String },
+    WorktreeCheckout { cwd: String, ref_name: String },
     NewDirectory(String),
     CloneRepo(String),
 }
@@ -390,6 +395,8 @@ enum PickerRow {
 #[derive(Clone, Copy, PartialEq)]
 enum InputKind {
     SearchDirectory,
+    BranchOff,
+    CheckoutBranch,
     NewDirectory,
     CloneRepo,
     AddConnection,
@@ -397,7 +404,14 @@ enum InputKind {
 
 impl InputKind {
     fn autocompletes(self) -> bool {
-        matches!(self, InputKind::SearchDirectory)
+        matches!(
+            self,
+            InputKind::SearchDirectory | InputKind::BranchOff | InputKind::CheckoutBranch
+        )
+    }
+
+    fn is_branch(self) -> bool {
+        matches!(self, InputKind::BranchOff | InputKind::CheckoutBranch)
     }
 }
 
@@ -407,6 +421,7 @@ enum PickerStage {
         kind: InputKind,
         label: String,
         buffer: String,
+        context: Option<String>,
         suggestions: Vec<String>,
         suggestion_selected: usize,
     },
@@ -873,6 +888,7 @@ impl AgentState {
                 buffer,
                 suggestions,
                 suggestion_selected,
+                ..
             } = &picker.stage
             {
                 let mut transcript = Vec::new();
@@ -1837,6 +1853,12 @@ impl PaseoAgentPane {
     fn execute_create(self: &Arc<Self>, pending: PendingCreate, provider: String) {
         match pending {
             PendingCreate::Workspace(cwd) => self.create_agent_with(cwd, provider),
+            PendingCreate::WorktreeBranchOff { cwd, base_branch } => {
+                self.create_worktree_agent(cwd, "branch-off", None, Some(base_branch), provider)
+            }
+            PendingCreate::WorktreeCheckout { cwd, ref_name } => {
+                self.create_worktree_agent(cwd, "checkout", Some(ref_name), None, provider)
+            }
             PendingCreate::NewDirectory(value) => {
                 self.run_project_creation(InputKind::NewDirectory, value, provider)
             }
@@ -1844,6 +1866,95 @@ impl PaseoAgentPane {
                 self.run_project_creation(InputKind::CloneRepo, value, provider)
             }
         }
+    }
+
+    fn begin_worktree_choice(self: &Arc<Self>, cwd: String) {
+        let groups = vec![PickerGroup {
+            label: "New agent".to_string(),
+            collapsed: false,
+            entries: vec![
+                PickerEntry {
+                    label: "in this checkout".to_string(),
+                    action: PickerAction::WorktreeInPlace(cwd.clone()),
+                },
+                PickerEntry {
+                    label: "new branch in a worktree".to_string(),
+                    action: PickerAction::WorktreeNewBranch(cwd.clone()),
+                },
+                PickerEntry {
+                    label: "existing branch in a worktree".to_string(),
+                    action: PickerAction::WorktreeCheckoutBranch(cwd),
+                },
+            ],
+        }];
+        let selected = first_entry_row(&groups);
+        self.enter_picker(
+            "How should this agent run?".to_string(),
+            PickerKind::Providers,
+            groups,
+            None,
+            selected,
+        );
+    }
+
+    fn create_worktree_agent(
+        self: &Arc<Self>,
+        cwd: String,
+        action: &'static str,
+        ref_name: Option<String>,
+        base_branch: Option<String>,
+        provider: String,
+    ) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        self.mutate(|state| {
+            state.picker = None;
+            state.follow = true;
+            state.scroll = 0;
+            state.status_message = Some(format!("⟳ creating worktree from {cwd}…"));
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let created = client
+                .workspace_create_worktree(
+                    &cwd,
+                    action,
+                    ref_name.as_deref(),
+                    base_branch.as_deref(),
+                    None,
+                )
+                .await;
+            match created {
+                Ok(workspace) => {
+                    match client
+                        .create_agent(&provider, &workspace.cwd, Some(&workspace.id), None)
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            if let Some(pane) = weak.upgrade() {
+                                pane.load_agent(snapshot);
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(pane) = weak.upgrade() {
+                                pane.set_status(
+                                    "Agent (error)".into(),
+                                    Some(format!("create agent: {err}")),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status("Error".into(), Some(format!("create worktree: {err}")));
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn take_pending_delete(&self) -> bool {
@@ -2079,21 +2190,43 @@ impl PaseoAgentPane {
         let Some(client) = self.client() else {
             return;
         };
-        let query = {
+        let (kind, query, context) = {
             let state = self.state.lock();
             match &state.picker {
                 Some(PickerState {
-                    stage: PickerStage::Input { kind, buffer, .. },
+                    stage:
+                        PickerStage::Input {
+                            kind,
+                            buffer,
+                            context,
+                            ..
+                        },
                     ..
-                }) if kind.autocompletes() => buffer.clone(),
+                }) if kind.autocompletes() => (*kind, buffer.clone(), context.clone()),
                 _ => return,
             }
         };
+        let weak = self.weak.lock().clone();
+        if kind.is_branch() {
+            let Some(cwd) = context else {
+                return;
+            };
+            promise::spawn::spawn(async move {
+                let branches = client
+                    .branch_suggestions(&cwd, &query, 30)
+                    .await
+                    .unwrap_or_default();
+                if let Some(pane) = weak.upgrade() {
+                    pane.apply_suggestions(query, branches);
+                }
+            })
+            .detach();
+            return;
+        }
         if !query.starts_with('/') && !query.starts_with('~') {
             self.apply_suggestions(query, Vec::new());
             return;
         }
-        let weak = self.weak.lock().clone();
         promise::spawn::spawn(async move {
             let directories = client
                 .directory_suggestions(&query, 20)
@@ -2203,8 +2336,9 @@ impl PaseoAgentPane {
         enum Chosen {
             Open(String),
             NewIn(String),
-            StartInput(InputKind, String),
-            RunInput(InputKind, String),
+            InPlace(String),
+            StartInput(InputKind, String, Option<String>),
+            RunInput(InputKind, String, Option<String>),
             ToggleGroup(usize),
             ChooseDomain(String),
             SelectProvider(String),
@@ -2218,6 +2352,7 @@ impl PaseoAgentPane {
                 PickerStage::Input {
                     kind,
                     buffer,
+                    context,
                     suggestions,
                     suggestion_selected,
                     ..
@@ -2226,44 +2361,59 @@ impl PaseoAgentPane {
                         .get(*suggestion_selected)
                         .cloned()
                         .unwrap_or_else(|| buffer.trim().to_string());
-                    Some(Chosen::RunInput(*kind, value))
+                    Some(Chosen::RunInput(*kind, value, context.clone()))
                 }
                 PickerStage::Browse => {
                     let rows = picker.visible_rows();
                     match rows.get(picker.selected) {
                         Some(PickerRow::Header(gi)) => Some(Chosen::ToggleGroup(*gi)),
-                        Some(PickerRow::Entry(gi, ei)) => {
-                            picker.groups.get(*gi).and_then(|g| g.entries.get(*ei)).map(
-                                |e| match &e.action {
-                                    PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
-                                    PickerAction::NewAgentInWorkspace(cwd) => {
-                                        Chosen::NewIn(cwd.clone())
-                                    }
-                                    PickerAction::SearchDirectory => Chosen::StartInput(
-                                        InputKind::SearchDirectory,
-                                        "Search for a directory on the daemon:".to_string(),
-                                    ),
-                                    PickerAction::NewDirectory => Chosen::StartInput(
-                                        InputKind::NewDirectory,
-                                        "New directory (full path on the daemon):".to_string(),
-                                    ),
-                                    PickerAction::CloneRepo => Chosen::StartInput(
-                                        InputKind::CloneRepo,
-                                        "Clone GitHub repo (owner/name):".to_string(),
-                                    ),
-                                    PickerAction::ChooseDomain(name) => {
-                                        Chosen::ChooseDomain(name.clone())
-                                    }
-                                    PickerAction::AddConnection => Chosen::StartInput(
-                                        InputKind::AddConnection,
-                                        "Connect (relay URL or host:port):".to_string(),
-                                    ),
-                                    PickerAction::SelectProvider(id) => {
-                                        Chosen::SelectProvider(id.clone())
-                                    }
-                                },
-                            )
-                        }
+                        Some(PickerRow::Entry(gi, ei)) => picker
+                            .groups
+                            .get(*gi)
+                            .and_then(|g| g.entries.get(*ei))
+                            .map(|e| match &e.action {
+                                PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
+                                PickerAction::NewAgentInWorkspace(cwd) => {
+                                    Chosen::NewIn(cwd.clone())
+                                }
+                                PickerAction::WorktreeInPlace(cwd) => Chosen::InPlace(cwd.clone()),
+                                PickerAction::WorktreeNewBranch(cwd) => Chosen::StartInput(
+                                    InputKind::BranchOff,
+                                    "Base branch for the new worktree:".to_string(),
+                                    Some(cwd.clone()),
+                                ),
+                                PickerAction::WorktreeCheckoutBranch(cwd) => Chosen::StartInput(
+                                    InputKind::CheckoutBranch,
+                                    "Branch to check out in a worktree:".to_string(),
+                                    Some(cwd.clone()),
+                                ),
+                                PickerAction::SearchDirectory => Chosen::StartInput(
+                                    InputKind::SearchDirectory,
+                                    "Search for a directory on the daemon:".to_string(),
+                                    None,
+                                ),
+                                PickerAction::NewDirectory => Chosen::StartInput(
+                                    InputKind::NewDirectory,
+                                    "New directory (full path on the daemon):".to_string(),
+                                    None,
+                                ),
+                                PickerAction::CloneRepo => Chosen::StartInput(
+                                    InputKind::CloneRepo,
+                                    "Clone GitHub repo (owner/name):".to_string(),
+                                    None,
+                                ),
+                                PickerAction::ChooseDomain(name) => {
+                                    Chosen::ChooseDomain(name.clone())
+                                }
+                                PickerAction::AddConnection => Chosen::StartInput(
+                                    InputKind::AddConnection,
+                                    "Connect (relay URL or host:port):".to_string(),
+                                    None,
+                                ),
+                                PickerAction::SelectProvider(id) => {
+                                    Chosen::SelectProvider(id.clone())
+                                }
+                            }),
                         None => None,
                     }
                 }
@@ -2271,7 +2421,8 @@ impl PaseoAgentPane {
         };
         match chosen {
             Some(Chosen::Open(id)) => self.open_agent_by_id(id),
-            Some(Chosen::NewIn(cwd)) => self.begin_create(PendingCreate::Workspace(cwd)),
+            Some(Chosen::NewIn(cwd)) => self.begin_worktree_choice(cwd),
+            Some(Chosen::InPlace(cwd)) => self.begin_create(PendingCreate::Workspace(cwd)),
             Some(Chosen::ToggleGroup(gi)) => self.mutate(|state| {
                 if let Some(picker) = &mut state.picker {
                     if let Some(group) = picker.groups.get_mut(gi) {
@@ -2282,7 +2433,7 @@ impl PaseoAgentPane {
                 }
                 state.rebuild_rows();
             }),
-            Some(Chosen::StartInput(kind, label)) => {
+            Some(Chosen::StartInput(kind, label, context)) => {
                 let buffer = if kind == InputKind::SearchDirectory {
                     "~/".to_string()
                 } else {
@@ -2294,6 +2445,7 @@ impl PaseoAgentPane {
                             kind,
                             label,
                             buffer,
+                            context,
                             suggestions: Vec::new(),
                             suggestion_selected: 0,
                         };
@@ -2304,12 +2456,28 @@ impl PaseoAgentPane {
                     self.refresh_suggestions();
                 }
             }
-            Some(Chosen::RunInput(kind, value)) => {
+            Some(Chosen::RunInput(kind, value, context)) => {
                 if !value.is_empty() {
                     match kind {
                         InputKind::AddConnection => self.run_add_connection(value),
                         InputKind::SearchDirectory => {
                             self.begin_create(PendingCreate::Workspace(value))
+                        }
+                        InputKind::BranchOff => {
+                            if let Some(cwd) = context {
+                                self.begin_create(PendingCreate::WorktreeBranchOff {
+                                    cwd,
+                                    base_branch: value,
+                                });
+                            }
+                        }
+                        InputKind::CheckoutBranch => {
+                            if let Some(cwd) = context {
+                                self.begin_create(PendingCreate::WorktreeCheckout {
+                                    cwd,
+                                    ref_name: value,
+                                });
+                            }
                         }
                         InputKind::NewDirectory => {
                             self.begin_create(PendingCreate::NewDirectory(value))
@@ -2410,7 +2578,10 @@ impl PaseoAgentPane {
                     client.project_create_directory(&parent, &name).await
                 }
                 InputKind::CloneRepo => client.project_github_clone(&value, "https").await,
-                InputKind::SearchDirectory | InputKind::AddConnection => return,
+                InputKind::SearchDirectory
+                | InputKind::BranchOff
+                | InputKind::CheckoutBranch
+                | InputKind::AddConnection => return,
             };
             match cwd {
                 Ok(cwd) => {

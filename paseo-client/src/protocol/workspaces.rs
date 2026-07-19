@@ -74,6 +74,49 @@ pub fn directory_suggestions_request(request_id: &str, query: &str, limit: u32) 
     })
 }
 
+pub fn branch_suggestions_request(request_id: &str, cwd: &str, query: &str, limit: u32) -> Value {
+    json!({
+        "type": "branch_suggestions_request",
+        "cwd": cwd,
+        "query": query,
+        "limit": limit,
+        "requestId": request_id
+    })
+}
+
+pub fn workspace_create_directory_request(request_id: &str, path: &str) -> Value {
+    json!({
+        "type": "workspace.create.request",
+        "requestId": request_id,
+        "source": { "kind": "directory", "path": path }
+    })
+}
+
+pub fn workspace_create_worktree_request(
+    request_id: &str,
+    cwd: &str,
+    action: &str,
+    ref_name: Option<&str>,
+    base_branch: Option<&str>,
+    branch_name: Option<&str>,
+) -> Value {
+    let mut source = json!({ "kind": "worktree", "cwd": cwd, "action": action });
+    if let Some(ref_name) = ref_name {
+        source["refName"] = json!(ref_name);
+    }
+    if let Some(base_branch) = base_branch {
+        source["baseBranch"] = json!(base_branch);
+    }
+    if let Some(branch_name) = branch_name {
+        source["branchName"] = json!(branch_name);
+    }
+    json!({
+        "type": "workspace.create.request",
+        "requestId": request_id,
+        "source": source
+    })
+}
+
 pub fn project_github_clone_request(request_id: &str, repo: &str, protocol: &str) -> Value {
     json!({
         "type": "project.github.clone.request",

@@ -16,6 +16,8 @@ struct Options {
     spawn_editor: Option<String>,
     suggest: Option<String>,
     archive: Option<String>,
+    branches: Option<String>,
+    wscreate: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -44,6 +46,8 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         spawn_editor: None,
         suggest: None,
         archive: None,
+        branches: None,
+        wscreate: None,
     };
 
     if first == "--local" {
@@ -89,6 +93,12 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--archive" => {
                 options.archive = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--branches" => {
+                options.branches = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--wscreate" => {
+                options.wscreate = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -153,7 +163,16 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(agent_id) = &options.archive {
+    if let Some(path) = &options.wscreate {
+        let ws = client.workspace_create_directory(path).await?;
+        println!("workspace.create dir -> id={} cwd={}", ws.id, ws.cwd);
+    } else if let Some(cwd) = &options.branches {
+        let branches = client.branch_suggestions(cwd, "", 30).await?;
+        println!("branches in {cwd}: {}", branches.len());
+        for b in branches.iter().take(15) {
+            println!("  {b}");
+        }
+    } else if let Some(agent_id) = &options.archive {
         client.archive_agent(agent_id).await?;
         println!("archived {agent_id}");
     } else if let Some(query) = &options.suggest {

@@ -37,6 +37,12 @@ pub struct PaseoClient {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CreatedWorkspace {
+    pub id: String,
+    pub cwd: String,
+}
+
 pub struct TerminalHandle {
     terminal_id: String,
     slot: u8,
@@ -459,6 +465,86 @@ impl PaseoClient {
             })
             .unwrap_or_default();
         Ok(directories)
+    }
+
+    pub async fn branch_suggestions(
+        &self,
+        cwd: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        let id = new_id();
+        let payload = self
+            .request(crate::protocol::workspaces::branch_suggestions_request(
+                &id, cwd, query, limit,
+            ))
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_string()));
+        }
+        let branches = payload
+            .get("branches")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(branches)
+    }
+
+    async fn workspace_create(&self, request: Value) -> Result<CreatedWorkspace> {
+        let payload = self.request(request).await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_string()));
+        }
+        let workspace = payload.get("workspace").filter(|value| !value.is_null());
+        let workspace = workspace
+            .ok_or_else(|| PaseoError::Protocol("workspace.create returned no workspace".into()))?;
+        let id = workspace
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("workspace.create missing id".into()))?;
+        let cwd = workspace
+            .get("workspaceDirectory")
+            .and_then(Value::as_str)
+            .or_else(|| workspace.get("projectRootPath").and_then(Value::as_str))
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("workspace.create missing directory".into()))?;
+        Ok(CreatedWorkspace { id, cwd })
+    }
+
+    pub async fn workspace_create_directory(&self, path: &str) -> Result<CreatedWorkspace> {
+        let id = new_id();
+        self.workspace_create(
+            crate::protocol::workspaces::workspace_create_directory_request(&id, path),
+        )
+        .await
+    }
+
+    pub async fn workspace_create_worktree(
+        &self,
+        cwd: &str,
+        action: &str,
+        ref_name: Option<&str>,
+        base_branch: Option<&str>,
+        branch_name: Option<&str>,
+    ) -> Result<CreatedWorkspace> {
+        let id = new_id();
+        self.workspace_create(
+            crate::protocol::workspaces::workspace_create_worktree_request(
+                &id,
+                cwd,
+                action,
+                ref_name,
+                base_branch,
+                branch_name,
+            ),
+        )
+        .await
     }
 
     pub async fn project_github_clone(&self, repo: &str, protocol: &str) -> Result<String> {
