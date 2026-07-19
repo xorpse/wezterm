@@ -361,12 +361,29 @@ fn session_name(workspace_name: Option<&str>, agent: &AgentSnapshot) -> String {
         .unwrap_or_else(|| session_title(agent))
 }
 
-fn agent_row_label(agent: &AgentSnapshot, workspace_name: Option<&str>) -> String {
-    format!(
-        "{} {}",
-        status_glyph(agent),
-        session_name(workspace_name, agent)
-    )
+fn agent_row_label(
+    agent: &AgentSnapshot,
+    workspace_name: Option<&str>,
+    context: Option<&str>,
+) -> String {
+    let primary = session_name(workspace_name, agent);
+    match context.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(context) => format!("{} {}  ·  {}", status_glyph(agent), primary, context),
+        None => format!("{} {}", status_glyph(agent), primary),
+    }
+}
+
+fn workspace_context(ws: &Workspace) -> Option<String> {
+    if let Some(branch) = ws.branch() {
+        return Some(branch.to_string());
+    }
+    if ws.workspace_kind == "worktree" {
+        let slug = basename(ws.cwd());
+        if !slug.is_empty() {
+            return Some(slug.to_string());
+        }
+    }
+    None
 }
 
 fn basename(path: &str) -> &str {
@@ -509,10 +526,15 @@ fn build_picker_groups(
         agents: Vec<AgentItem>,
         workspaces: Vec<PickerEntry>,
     }
+    struct WsMeta {
+        project_key: String,
+        name: String,
+        context: Option<String>,
+    }
     let mut order: Vec<String> = Vec::new();
     let mut index: HashMap<String, Proj> = HashMap::new();
-    let mut cwd_project: HashMap<String, String> = HashMap::new();
-    let mut cwd_name: HashMap<String, String> = HashMap::new();
+    let mut ws_by_id: HashMap<String, WsMeta> = HashMap::new();
+    let mut cwd_to_wsid: HashMap<String, String> = HashMap::new();
     let other_key = "\u{0}other".to_string();
 
     for ws in &workspaces {
@@ -537,16 +559,30 @@ fn build_picker_groups(
                 workspaces: Vec::new(),
             }
         });
-        cwd_project.insert(ws.cwd().to_string(), key.clone());
         let ws_name = if ws.name.trim().is_empty() {
             basename(ws.cwd()).to_string()
         } else {
             ws.name.clone()
         };
-        cwd_name.insert(ws.cwd().to_string(), ws_name.clone());
+        let context = workspace_context(ws);
+        let new_label = match &context {
+            Some(context) => format!("new  {}  ·  {}", ws_name, context),
+            None => format!("new  {}  ({})", ws_name, short_kind(&ws.workspace_kind)),
+        };
+        ws_by_id.insert(
+            ws.id.clone(),
+            WsMeta {
+                project_key: key.clone(),
+                name: ws_name.clone(),
+                context,
+            },
+        );
+        cwd_to_wsid
+            .entry(ws.cwd().to_string())
+            .or_insert_with(|| ws.id.clone());
         if let Some(proj) = index.get_mut(&key) {
             proj.workspaces.push(PickerEntry {
-                label: format!("new  {}  ({})", ws_name, short_kind(&ws.workspace_kind)),
+                label: new_label,
                 action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
             });
         }
@@ -554,7 +590,12 @@ fn build_picker_groups(
 
     for entry in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
         let agent = entry.agent;
-        let key = cwd_project.get(&agent.cwd).cloned().unwrap_or_else(|| {
+        let ws_meta = agent
+            .workspace_id
+            .as_ref()
+            .and_then(|id| ws_by_id.get(id))
+            .or_else(|| cwd_to_wsid.get(&agent.cwd).and_then(|id| ws_by_id.get(id)));
+        let key = ws_meta.map(|w| w.project_key.clone()).unwrap_or_else(|| {
             index.entry(other_key.clone()).or_insert_with(|| {
                 order.push(other_key.clone());
                 Proj {
@@ -565,13 +606,14 @@ fn build_picker_groups(
             });
             other_key.clone()
         });
-        let name = cwd_name.get(&agent.cwd).map(String::as_str);
+        let name = ws_meta.map(|w| w.name.as_str());
+        let context = ws_meta.and_then(|w| w.context.as_deref());
         if let Some(proj) = index.get_mut(&key) {
             proj.agents.push(AgentItem {
                 rank: agent_rank(&agent),
                 sort_title: session_name(name, &agent).to_lowercase(),
                 entry: PickerEntry {
-                    label: agent_row_label(&agent, name),
+                    label: agent_row_label(&agent, name, context),
                     action: PickerAction::OpenAgent(agent.id.clone()),
                 },
             });

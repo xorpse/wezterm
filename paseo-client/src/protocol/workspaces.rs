@@ -1,6 +1,13 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitRuntime {
+    #[serde(default)]
+    pub current_branch: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -17,6 +24,8 @@ pub struct Workspace {
     pub workspace_kind: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub git_runtime: Option<WorkspaceGitRuntime>,
 }
 
 impl Workspace {
@@ -25,6 +34,14 @@ impl Workspace {
             .as_deref()
             .filter(|d| !d.is_empty())
             .unwrap_or(&self.project_root_path)
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        self.git_runtime
+            .as_ref()?
+            .current_branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
     }
 }
 
