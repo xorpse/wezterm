@@ -72,10 +72,19 @@ against real daemons (enki local + a relay/E2EE Mac daemon):
 - **Stage 6 — tab groups**: with `tab_bar_group_by_domain`, a vertical fancy tab
   bar inserts a labeled header before each run of tabs from a different mux
   domain, so each Paseo daemon's tabs cluster under their own header.
-- **Stage 7 — agent diff view**: pressing `d` in an agent pane toggles a
-  daemon-sourced uncommitted diff for the agent's workspace
-  (`subscribe_checkout_diff` + `checkout_diff_update`), rendered as
-  files/hunks/add-remove lines. `send_paste` now inserts into the composer.
+- **Stage 7 — unified git-review over the daemon**: the git-review
+  `ReviewPane` is now the single diff renderer for both local repos and
+  remote Paseo daemons. Its diff source is pluggable (`DiffSource::LocalGit`
+  vs `Paseo`); a `paseo_source` converter turns the daemon's
+  `subscribe_checkout_diff` stream into `git_review::GitDiffData`
+  (reconstructing per-line numbers from hunk offsets), so file tree,
+  collapse, navigation, comment anchoring, and mode cycling all work over
+  the daemon. Pressing `d` in an agent pane opens a ReviewPane split for the
+  agent's workspace; the standalone review command also detects a Paseo
+  source pane. `WorkingTree`→uncommitted, `Branch`/`MergeBase`→base+baseRef;
+  `send_paste` inserts into the composer. Daemon-bound gaps: staged-only
+  mode folds to uncommitted, and oversized files can't be lazily expanded
+  remotely (no working-tree per-file diff RPC).
 
 Remaining polish (not blocking): timeline pagination for very long histories,
 snapshot-grid restore, auto-reconnect with backoff, richer tool-card rendering.
