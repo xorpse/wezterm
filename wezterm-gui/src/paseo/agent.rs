@@ -256,6 +256,14 @@ enum PickerAction {
     CloneRepo,
     ChooseDomain(String),
     AddConnection,
+    SelectProvider(String),
+}
+
+#[derive(Clone)]
+enum PendingCreate {
+    Workspace(String),
+    NewDirectory(String),
+    CloneRepo(String),
 }
 
 struct PickerEntry {
@@ -291,10 +299,11 @@ enum PickerStage {
 }
 
 struct PickerState {
+    title: String,
     groups: Vec<PickerGroup>,
     selected: usize,
     stage: PickerStage,
-    provider: String,
+    pending: Option<PendingCreate>,
 }
 
 impl PickerState {
@@ -338,15 +347,15 @@ fn short_kind(kind: &str) -> &str {
     }
 }
 
-async fn resolve_provider(client: &PaseoClient, stored: String) -> Option<String> {
-    if !stored.is_empty() {
-        return Some(stored);
+fn provider_display(id: &str) -> String {
+    match id {
+        "claude-code" | "claude_code" | "claudecode" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "copilot" | "github-copilot" => "GitHub Copilot".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "pi" => "Pi".to_string(),
+        other => other.to_string(),
     }
-    client
-        .list_available_providers()
-        .await
-        .ok()
-        .and_then(|providers| providers.into_iter().next())
 }
 
 fn build_connection_groups() -> Vec<PickerGroup> {
@@ -632,7 +641,7 @@ impl AgentState {
             let count = rows.len();
             let mut transcript = Vec::new();
             transcript.push(AgentRow {
-                text: "Paseo — open an agent, or start one in a project".to_string(),
+                text: picker.title.clone(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
             });
             transcript.push(blank_row());
@@ -1189,18 +1198,12 @@ impl PaseoAgentPane {
             if source.agent_id.is_none() && source.provider.is_none() {
                 let agents = client.fetch_agents().await.unwrap_or_default();
                 let workspaces = client.fetch_workspaces().await.unwrap_or_default();
-                let available = client.list_available_providers().await.unwrap_or_default();
-                let hub_provider = agents
-                    .iter()
-                    .find(|e| e.agent.archived_at.is_none())
-                    .map(|e| e.agent.provider.clone())
-                    .filter(|p| !p.is_empty())
-                    .or_else(|| available.first().cloned())
-                    .unwrap_or_default();
-
                 let groups = build_picker_groups(agents, workspaces);
                 if let Some(pane) = weak.upgrade() {
-                    pane.enter_hub(groups, hub_provider);
+                    pane.enter_hub(
+                        "Paseo — open an agent, or start one in a project".to_string(),
+                        groups,
+                    );
                 }
                 return;
             }
@@ -1310,22 +1313,93 @@ impl PaseoAgentPane {
         self.mutate(|state| {
             state.title = "Paseo — connect".to_string();
         });
-        self.enter_hub(build_connection_groups(), String::new());
+        self.enter_hub(
+            "Paseo — connect to a daemon".to_string(),
+            build_connection_groups(),
+        );
     }
 
-    fn enter_hub(&self, groups: Vec<PickerGroup>, provider: String) {
+    fn enter_hub(&self, title: String, groups: Vec<PickerGroup>) {
+        self.enter_picker(title, groups, None, 0);
+    }
+
+    fn enter_picker(
+        &self,
+        title: String,
+        groups: Vec<PickerGroup>,
+        pending: Option<PendingCreate>,
+        selected: usize,
+    ) {
         self.mutate(|state| {
             state.status_message = None;
             state.follow = false;
             state.scroll = 0;
             state.picker = Some(PickerState {
+                title,
                 groups,
-                selected: 0,
+                selected,
                 stage: PickerStage::Browse,
-                provider,
+                pending,
             });
             state.rebuild_rows();
         });
+    }
+
+    fn begin_create(self: &Arc<Self>, pending: PendingCreate) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        self.mutate(|state| {
+            state.status_message = Some("⟳ checking available agents…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let providers = client.list_available_providers().await.unwrap_or_default();
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            match providers.len() {
+                0 => pane.set_status(
+                    "Error".into(),
+                    Some("no agent providers available on this daemon".into()),
+                ),
+                1 => pane.execute_create(pending, providers[0].clone()),
+                _ => {
+                    let entries = providers
+                        .into_iter()
+                        .map(|id| PickerEntry {
+                            label: provider_display(&id),
+                            action: PickerAction::SelectProvider(id),
+                        })
+                        .collect();
+                    let groups = vec![PickerGroup {
+                        label: "Providers".to_string(),
+                        collapsed: false,
+                        entries,
+                    }];
+                    pane.enter_picker(
+                        "Choose the agent to run".to_string(),
+                        groups,
+                        Some(pending),
+                        1,
+                    );
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn execute_create(self: &Arc<Self>, pending: PendingCreate, provider: String) {
+        match pending {
+            PendingCreate::Workspace(cwd) => self.create_agent_with(cwd, provider),
+            PendingCreate::NewDirectory(value) => {
+                self.run_project_creation(InputKind::NewDirectory, value, provider)
+            }
+            PendingCreate::CloneRepo(value) => {
+                self.run_project_creation(InputKind::CloneRepo, value, provider)
+            }
+        }
     }
 
     fn picker_move(&self, delta: isize) {
@@ -1402,14 +1476,7 @@ impl PaseoAgentPane {
         });
     }
 
-    fn create_agent_in(self: &Arc<Self>, cwd: String) {
-        let stored_provider = self
-            .state
-            .lock()
-            .picker
-            .as_ref()
-            .map(|p| p.provider.clone())
-            .unwrap_or_default();
+    fn create_agent_with(self: &Arc<Self>, cwd: String, provider: String) {
         let Some(client) = self.client() else {
             return;
         };
@@ -1417,21 +1484,14 @@ impl PaseoAgentPane {
             state.picker = None;
             state.follow = true;
             state.scroll = 0;
-            state.status_message = Some(format!("⟳ starting agent in {cwd}…"));
+            state.status_message = Some(format!(
+                "⟳ starting {} in {cwd}…",
+                provider_display(&provider)
+            ));
             state.rebuild_rows();
         });
         let weak = self.weak.lock().clone();
         promise::spawn::spawn(async move {
-            let provider = resolve_provider(&client, stored_provider).await;
-            let Some(provider) = provider else {
-                if let Some(pane) = weak.upgrade() {
-                    pane.set_status(
-                        "Agent (error)".into(),
-                        Some("no agent providers available on this daemon".into()),
-                    );
-                }
-                return;
-            };
             let workspace = client.open_project(&cwd).await.ok();
             match client
                 .create_agent(&provider, &cwd, workspace.as_deref(), None)
@@ -1486,6 +1546,7 @@ impl PaseoAgentPane {
             RunInput(InputKind, String),
             ToggleGroup(usize),
             ChooseDomain(String),
+            SelectProvider(String),
         }
         let chosen = {
             let state = self.state.lock();
@@ -1522,6 +1583,9 @@ impl PaseoAgentPane {
                                         InputKind::AddConnection,
                                         "Connect (relay URL or host:port):".to_string(),
                                     ),
+                                    PickerAction::SelectProvider(id) => {
+                                        Chosen::SelectProvider(id.clone())
+                                    }
                                 },
                             )
                         }
@@ -1532,7 +1596,7 @@ impl PaseoAgentPane {
         };
         match chosen {
             Some(Chosen::Open(id)) => self.open_agent_by_id(id),
-            Some(Chosen::NewIn(cwd)) => self.create_agent_in(cwd),
+            Some(Chosen::NewIn(cwd)) => self.begin_create(PendingCreate::Workspace(cwd)),
             Some(Chosen::ToggleGroup(gi)) => self.mutate(|state| {
                 if let Some(picker) = &mut state.picker {
                     if let Some(group) = picker.groups.get_mut(gi) {
@@ -1557,13 +1621,25 @@ impl PaseoAgentPane {
                 if !value.is_empty() {
                     match kind {
                         InputKind::AddConnection => self.run_add_connection(value),
-                        InputKind::NewDirectory | InputKind::CloneRepo => {
-                            self.run_project_creation(kind, value)
+                        InputKind::NewDirectory => {
+                            self.begin_create(PendingCreate::NewDirectory(value))
                         }
+                        InputKind::CloneRepo => self.begin_create(PendingCreate::CloneRepo(value)),
                     }
                 }
             }
             Some(Chosen::ChooseDomain(name)) => self.open_domain_picker(name),
+            Some(Chosen::SelectProvider(provider)) => {
+                let pending = self
+                    .state
+                    .lock()
+                    .picker
+                    .as_ref()
+                    .and_then(|p| p.pending.clone());
+                if let Some(pending) = pending {
+                    self.execute_create(pending, provider);
+                }
+            }
             None => {}
         }
     }
@@ -1611,14 +1687,7 @@ impl PaseoAgentPane {
         self.open_domain_picker(name);
     }
 
-    fn run_project_creation(self: &Arc<Self>, kind: InputKind, value: String) {
-        let stored_provider = self
-            .state
-            .lock()
-            .picker
-            .as_ref()
-            .map(|p| p.provider.clone())
-            .unwrap_or_default();
+    fn run_project_creation(self: &Arc<Self>, kind: InputKind, value: String, provider: String) {
         let Some(client) = self.client() else {
             return;
         };
@@ -1654,15 +1723,6 @@ impl PaseoAgentPane {
             };
             match cwd {
                 Ok(cwd) => {
-                    let Some(provider) = resolve_provider(&client, stored_provider).await else {
-                        if let Some(pane) = weak.upgrade() {
-                            pane.set_status(
-                                "Error".into(),
-                                Some("no agent providers available on this daemon".into()),
-                            );
-                        }
-                        return;
-                    };
                     let workspace = client.open_project(&cwd).await.ok();
                     match client
                         .create_agent(&provider, &cwd, workspace.as_deref(), None)
