@@ -16,6 +16,7 @@ use paseo_client::{
     PaseoClient, PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -241,6 +242,93 @@ fn truncate_lines(text: &str, max: usize) -> String {
 
 fn is_message(kind: &str) -> bool {
     matches!(kind, "assistant_message" | "reasoning" | "user_message")
+}
+
+struct QuestionOption {
+    label: String,
+    description: Option<String>,
+}
+
+struct Question {
+    prompt: String,
+    header: String,
+    options: Vec<QuestionOption>,
+}
+
+fn parse_questions(input: &Value) -> Vec<Question> {
+    let Some(items) = input.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let prompt = item.get("question")?.as_str()?.to_string();
+            let header = item.get("header")?.as_str()?.to_string();
+            let options = item
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|opt| {
+                            Some(QuestionOption {
+                                label: opt.get("label")?.as_str()?.to_string(),
+                                description: opt
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .filter(|d| !d.is_empty())
+                                    .map(String::from),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Question {
+                prompt,
+                header,
+                options,
+            })
+        })
+        .collect()
+}
+
+fn pending_is_question(request: &PermissionRequest) -> bool {
+    request.kind == "question"
+        && request
+            .input
+            .as_ref()
+            .map(|input| !parse_questions(input).is_empty())
+            .unwrap_or(false)
+}
+
+fn question_rows(request: &PermissionRequest, cols: usize) -> Vec<AgentRow> {
+    let mut rows = vec![blank_row()];
+    let questions = request
+        .input
+        .as_ref()
+        .map(parse_questions)
+        .unwrap_or_default();
+    for question in &questions {
+        push_wrapped(
+            &mut rows,
+            "⚠ ",
+            &question.prompt,
+            &attr_bold_fg(AnsiColor::Yellow),
+            cols,
+        );
+        for (i, option) in question.options.iter().enumerate().take(9) {
+            push_wrapped(
+                &mut rows,
+                "  ",
+                &format!("[{}] {}", i + 1, option.label),
+                &attr_fg(AnsiColor::Yellow),
+                cols,
+            );
+            if let Some(description) = &option.description {
+                push_wrapped(&mut rows, "      ", description, &attr_dim(), cols);
+            }
+        }
+    }
+    rows
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -838,60 +926,66 @@ impl AgentState {
                 item_to_rows(item, cols, &mut transcript);
             }
         }
+        let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
+        if let Some(request) = self.pending.as_ref().filter(|r| pending_is_question(r)) {
+            transcript.extend(question_rows(request, cols));
+        }
         self.transcript = transcript;
 
         let mut footer = Vec::new();
         if let Some(request) = &self.pending {
-            let is_question = request.kind == "question";
-            let prefix = if is_question {
-                "⚠ question: "
+            if question_pending {
+                footer.push(AgentRow {
+                    text: "⚠ question — [1-9]: answer · n/Esc: dismiss".to_string(),
+                    attrs: attr_fg(AnsiColor::Yellow),
+                });
             } else {
-                "⚠ permission: "
-            };
-            let title = request
-                .title
-                .clone()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| request.name.clone());
-            push_wrapped(
-                &mut footer,
-                prefix,
-                &title,
-                &attr_bold_fg(AnsiColor::Yellow),
-                cols,
-            );
-            if let Some(description) = request.description.clone().filter(|d| !d.trim().is_empty())
-            {
+                let title = request
+                    .title
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| request.name.clone());
+                push_wrapped(
+                    &mut footer,
+                    "⚠ permission: ",
+                    &title,
+                    &attr_bold_fg(AnsiColor::Yellow),
+                    cols,
+                );
+                if let Some(description) =
+                    request.description.clone().filter(|d| !d.trim().is_empty())
+                {
+                    push_wrapped(
+                        &mut footer,
+                        "  ",
+                        &truncate_to(
+                            description.replace('\n', " ").trim(),
+                            cols.saturating_sub(2),
+                        ),
+                        &attr_dim(),
+                        cols,
+                    );
+                }
+                let choices = if request.actions.is_empty() {
+                    "[y] allow   [n] deny".to_string()
+                } else {
+                    request
+                        .actions
+                        .iter()
+                        .take(9)
+                        .enumerate()
+                        .map(|(i, action)| format!("[{}] {}", i + 1, action.label))
+                        .collect::<Vec<_>>()
+                        .join("   ")
+                };
                 push_wrapped(
                     &mut footer,
                     "  ",
-                    &truncate_to(
-                        description.replace('\n', " ").trim(),
-                        cols.saturating_sub(2),
-                    ),
-                    &attr_dim(),
+                    &choices,
+                    &attr_fg(AnsiColor::Yellow),
                     cols,
                 );
             }
-            let choices = if request.actions.is_empty() {
-                "[y] allow   [n] deny".to_string()
-            } else {
-                request
-                    .actions
-                    .iter()
-                    .take(9)
-                    .enumerate()
-                    .map(|(i, action)| format!("[{}] {}", i + 1, action.label))
-                    .collect::<Vec<_>>()
-                    .join("   ")
-            };
-            push_wrapped(
-                &mut footer,
-                "  ",
-                &choices,
-                &attr_fg(AnsiColor::Yellow),
-                cols,
-            );
         }
         if !self.agent_status.is_empty() || self.model.is_some() {
             let model = self.model.clone().unwrap_or_else(|| "—".to_string());
@@ -1105,6 +1199,9 @@ impl PaseoAgentPane {
             state.available_modes = snapshot.available_modes.clone();
             state.thinking_option_id = snapshot.thinking_option_id.clone();
             state.requires_attention = snapshot.requires_attention;
+            if state.pending.is_none() {
+                state.pending = snapshot.pending_permissions.first().cloned();
+            }
             state.rebuild_rows();
         });
     }
@@ -1321,6 +1418,7 @@ impl PaseoAgentPane {
             let response = if allow {
                 PermissionResponse::Allow {
                     selected_action_id: action_id,
+                    updated_input: None,
                 }
             } else {
                 PermissionResponse::Deny {
@@ -1347,17 +1445,37 @@ impl PaseoAgentPane {
             let Some(request) = &state.pending else {
                 return;
             };
-            let Some(action) = request.actions.get(index) else {
-                return;
-            };
-            let response = if action.behavior == "deny" {
-                PermissionResponse::Deny {
-                    message: None,
-                    interrupt: false,
+            let response = if pending_is_question(request) {
+                let input = request.input.clone().unwrap_or_default();
+                let questions = parse_questions(&input);
+                let Some(question) = questions.first() else {
+                    return;
+                };
+                let Some(option) = question.options.get(index) else {
+                    return;
+                };
+                let mut answers = serde_json::Map::new();
+                answers.insert(question.header.clone(), Value::from(option.label.clone()));
+                let mut updated = input.as_object().cloned().unwrap_or_default();
+                updated.insert("answers".to_string(), Value::Object(answers));
+                PermissionResponse::Allow {
+                    selected_action_id: None,
+                    updated_input: Some(Value::Object(updated)),
                 }
             } else {
-                PermissionResponse::Allow {
-                    selected_action_id: Some(action.id.clone()),
+                let Some(action) = request.actions.get(index) else {
+                    return;
+                };
+                if action.behavior == "deny" {
+                    PermissionResponse::Deny {
+                        message: None,
+                        interrupt: false,
+                    }
+                } else {
+                    PermissionResponse::Allow {
+                        selected_action_id: Some(action.id.clone()),
+                        updated_input: None,
+                    }
                 }
             };
             (self.agent_id.lock().clone(), request.id.clone(), response)

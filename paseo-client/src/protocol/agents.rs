@@ -106,6 +106,8 @@ pub struct PermissionRequest {
     #[serde(default)]
     pub detail: Option<ToolCallDetail>,
     #[serde(default)]
+    pub input: Option<Value>,
+    #[serde(default)]
     pub actions: Vec<PermissionAction>,
 }
 
@@ -113,6 +115,7 @@ pub struct PermissionRequest {
 pub enum PermissionResponse {
     Allow {
         selected_action_id: Option<String>,
+        updated_input: Option<Value>,
     },
     Deny {
         message: Option<String>,
@@ -123,10 +126,16 @@ pub enum PermissionResponse {
 impl PermissionResponse {
     pub fn to_value(&self) -> Value {
         match self {
-            PermissionResponse::Allow { selected_action_id } => {
+            PermissionResponse::Allow {
+                selected_action_id,
+                updated_input,
+            } => {
                 let mut v = json!({ "behavior": "allow" });
                 if let Some(id) = selected_action_id {
                     v["selectedActionId"] = json!(id);
+                }
+                if let Some(input) = updated_input {
+                    v["updatedInput"] = input.clone();
                 }
                 v
             }
