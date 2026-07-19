@@ -285,6 +285,38 @@ impl PaseoClient {
         }
     }
 
+    pub async fn list_available_providers(&self) -> Result<Vec<String>> {
+        let id = new_id();
+        let payload = self
+            .request(serde_json::json!({
+                "type": "list_available_providers_request",
+                "requestId": id
+            }))
+            .await?;
+        let providers = payload
+            .get("providers")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("available")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|entry| {
+                        entry
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(providers)
+    }
+
     pub async fn cancel_agent(&self, agent_id: &str) -> Result<()> {
         let id = new_id();
         self.request(agents::cancel_agent_request(&id, agent_id))

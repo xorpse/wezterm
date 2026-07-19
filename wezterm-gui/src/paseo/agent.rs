@@ -254,6 +254,8 @@ enum PickerAction {
     NewAgentInWorkspace(String),
     NewDirectory,
     CloneRepo,
+    ChooseDomain(String),
+    AddConnection,
 }
 
 struct PickerEntry {
@@ -276,6 +278,7 @@ enum PickerRow {
 enum InputKind {
     NewDirectory,
     CloneRepo,
+    AddConnection,
 }
 
 enum PickerStage {
@@ -332,6 +335,66 @@ fn short_kind(kind: &str) -> &str {
         "worktree" => "worktree",
         "local_checkout" => "checkout",
         other => other,
+    }
+}
+
+async fn resolve_provider(client: &PaseoClient, stored: String) -> Option<String> {
+    if !stored.is_empty() {
+        return Some(stored);
+    }
+    client
+        .list_available_providers()
+        .await
+        .ok()
+        .and_then(|providers| providers.into_iter().next())
+}
+
+fn build_connection_groups() -> Vec<PickerGroup> {
+    let mux = Mux::get();
+    let mut entries = Vec::new();
+    for domain in mux.iter_domains() {
+        if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_some() {
+            let name = domain.domain_name().to_string();
+            entries.push(PickerEntry {
+                label: format!("connect  {name}"),
+                action: PickerAction::ChooseDomain(name),
+            });
+        }
+    }
+    entries.push(PickerEntry {
+        label: "add connection  (relay URL or host:port)".to_string(),
+        action: PickerAction::AddConnection,
+    });
+    vec![PickerGroup {
+        label: "Connections".to_string(),
+        collapsed: false,
+        entries,
+    }]
+}
+
+fn parse_connect_target(input: &str) -> Option<(String, paseo_mux::ConnectTarget)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if input.starts_with("http://") || input.starts_with("https://") {
+        Some((
+            "paseo:relay".to_string(),
+            paseo_mux::ConnectTarget::Relay {
+                offer_url: input.to_string(),
+            },
+        ))
+    } else if input.contains(':') {
+        Some((
+            format!("paseo:{input}"),
+            paseo_mux::ConnectTarget::Local {
+                host_port: input.to_string(),
+                use_tls: false,
+                password: None,
+            },
+        ))
+    } else {
+        None
     }
 }
 
@@ -1126,12 +1189,14 @@ impl PaseoAgentPane {
             if source.agent_id.is_none() && source.provider.is_none() {
                 let agents = client.fetch_agents().await.unwrap_or_default();
                 let workspaces = client.fetch_workspaces().await.unwrap_or_default();
+                let available = client.list_available_providers().await.unwrap_or_default();
                 let hub_provider = agents
                     .iter()
                     .find(|e| e.agent.archived_at.is_none())
                     .map(|e| e.agent.provider.clone())
                     .filter(|p| !p.is_empty())
-                    .unwrap_or_else(|| "codex".to_string());
+                    .or_else(|| available.first().cloned())
+                    .unwrap_or_default();
 
                 let groups = build_picker_groups(agents, workspaces);
                 if let Some(pane) = weak.upgrade() {
@@ -1241,6 +1306,13 @@ impl PaseoAgentPane {
         .detach();
     }
 
+    fn start_chooser(self: &Arc<Self>) {
+        self.mutate(|state| {
+            state.title = "Paseo — connect".to_string();
+        });
+        self.enter_hub(build_connection_groups(), String::new());
+    }
+
     fn enter_hub(&self, groups: Vec<PickerGroup>, provider: String) {
         self.mutate(|state| {
             state.status_message = None;
@@ -1331,13 +1403,13 @@ impl PaseoAgentPane {
     }
 
     fn create_agent_in(self: &Arc<Self>, cwd: String) {
-        let provider = self
+        let stored_provider = self
             .state
             .lock()
             .picker
             .as_ref()
             .map(|p| p.provider.clone())
-            .unwrap_or_else(|| "codex".to_string());
+            .unwrap_or_default();
         let Some(client) = self.client() else {
             return;
         };
@@ -1345,11 +1417,21 @@ impl PaseoAgentPane {
             state.picker = None;
             state.follow = true;
             state.scroll = 0;
-            state.status_message = Some(format!("⟳ starting {provider} in {cwd}…"));
+            state.status_message = Some(format!("⟳ starting agent in {cwd}…"));
             state.rebuild_rows();
         });
         let weak = self.weak.lock().clone();
         promise::spawn::spawn(async move {
+            let provider = resolve_provider(&client, stored_provider).await;
+            let Some(provider) = provider else {
+                if let Some(pane) = weak.upgrade() {
+                    pane.set_status(
+                        "Agent (error)".into(),
+                        Some("no agent providers available on this daemon".into()),
+                    );
+                }
+                return;
+            };
             let workspace = client.open_project(&cwd).await.ok();
             match client
                 .create_agent(&provider, &cwd, workspace.as_deref(), None)
@@ -1403,6 +1485,7 @@ impl PaseoAgentPane {
             StartInput(InputKind, String),
             RunInput(InputKind, String),
             ToggleGroup(usize),
+            ChooseDomain(String),
         }
         let chosen = {
             let state = self.state.lock();
@@ -1431,6 +1514,13 @@ impl PaseoAgentPane {
                                     PickerAction::CloneRepo => Chosen::StartInput(
                                         InputKind::CloneRepo,
                                         "Clone GitHub repo (owner/name):".to_string(),
+                                    ),
+                                    PickerAction::ChooseDomain(name) => {
+                                        Chosen::ChooseDomain(name.clone())
+                                    }
+                                    PickerAction::AddConnection => Chosen::StartInput(
+                                        InputKind::AddConnection,
+                                        "Connect (relay URL or host:port):".to_string(),
                                     ),
                                 },
                             )
@@ -1465,14 +1555,70 @@ impl PaseoAgentPane {
             }),
             Some(Chosen::RunInput(kind, value)) => {
                 if !value.is_empty() {
-                    self.run_project_creation(kind, value);
+                    match kind {
+                        InputKind::AddConnection => self.run_add_connection(value),
+                        InputKind::NewDirectory | InputKind::CloneRepo => {
+                            self.run_project_creation(kind, value)
+                        }
+                    }
                 }
             }
+            Some(Chosen::ChooseDomain(name)) => self.open_domain_picker(name),
             None => {}
         }
     }
 
+    fn open_domain_picker(self: &Arc<Self>, domain: String) {
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let args = KeyAssignment::OpenPaseoAgentPane(PaseoAgentArgs {
+                    domain: domain.clone(),
+                    chooser: false,
+                    agent_id: None,
+                    provider: None,
+                    cwd: None,
+                    prompt: None,
+                    new_tab: true,
+                    direction: config::keyassignment::PaneDirection::Right,
+                    size: config::keyassignment::SplitSize::default(),
+                });
+                if let Some(pane) = Mux::get()
+                    .get_active_tab_for_window(term_window.mux_window_id)
+                    .and_then(|tab| tab.get_active_pane())
+                {
+                    let _ = term_window.perform_key_assignment(&pane, &args);
+                }
+            })));
+        self.close();
+    }
+
+    fn run_add_connection(self: &Arc<Self>, value: String) {
+        let Some((name, target)) = parse_connect_target(&value) else {
+            self.set_status(
+                "Paseo — connect".into(),
+                Some("enter a relay URL (https://…) or host:port".into()),
+            );
+            return;
+        };
+        let mux = Mux::get();
+        let name = if mux.get_domain_by_name(&name).is_some() {
+            name
+        } else {
+            let domain: Arc<dyn mux::domain::Domain> = paseo_mux::PaseoDomain::new(&name, target);
+            mux.add_domain(&domain);
+            name
+        };
+        self.open_domain_picker(name);
+    }
+
     fn run_project_creation(self: &Arc<Self>, kind: InputKind, value: String) {
+        let stored_provider = self
+            .state
+            .lock()
+            .picker
+            .as_ref()
+            .map(|p| p.provider.clone())
+            .unwrap_or_default();
         let Some(client) = self.client() else {
             return;
         };
@@ -1504,12 +1650,22 @@ impl PaseoAgentPane {
                     client.project_create_directory(&parent, &name).await
                 }
                 InputKind::CloneRepo => client.project_github_clone(&value, "https").await,
+                InputKind::AddConnection => return,
             };
             match cwd {
                 Ok(cwd) => {
+                    let Some(provider) = resolve_provider(&client, stored_provider).await else {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.set_status(
+                                "Error".into(),
+                                Some("no agent providers available on this daemon".into()),
+                            );
+                        }
+                        return;
+                    };
                     let workspace = client.open_project(&cwd).await.ok();
                     match client
-                        .create_agent("codex", &cwd, workspace.as_deref(), None)
+                        .create_agent(&provider, &cwd, workspace.as_deref(), None)
                         .await
                     {
                         Ok(snapshot) => {
@@ -1896,9 +2052,15 @@ pub fn open_paseo_agent_pane(
         .clone()
         .ok_or_else(|| anyhow!("no window handle"))?;
 
-    let domain = mux
-        .get_domain_by_name(&args.domain)
-        .ok_or_else(|| anyhow!("paseo domain {} not found", args.domain))?;
+    let domain = if args.domain.is_empty() {
+        mux.iter_domains()
+            .into_iter()
+            .find(|d| d.downcast_ref::<paseo_mux::PaseoDomain>().is_some())
+            .ok_or_else(|| anyhow!("no paseo domains configured; add one to paseo_daemons"))?
+    } else {
+        mux.get_domain_by_name(&args.domain)
+            .ok_or_else(|| anyhow!("paseo domain {} not found", args.domain))?
+    };
     if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_none() {
         anyhow::bail!("domain {} is not a paseo domain", args.domain);
     }
@@ -2000,12 +2162,16 @@ pub fn open_paseo_agent_pane(
         }
     };
 
-    pane.start(AgentSource {
-        agent_id: args.agent_id.clone(),
-        provider: args.provider.clone(),
-        cwd: args.cwd.clone(),
-        prompt: args.prompt.clone(),
-    });
+    if args.chooser {
+        pane.start_chooser();
+    } else {
+        pane.start(AgentSource {
+            agent_id: args.agent_id.clone(),
+            provider: args.provider.clone(),
+            cwd: args.cwd.clone(),
+            prompt: args.prompt.clone(),
+        });
+    }
 
     Ok(created_tab)
 }

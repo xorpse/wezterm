@@ -656,7 +656,10 @@ impl_lua_conversion_dynamic!(KeyAssignment);
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct PaseoAgentArgs {
+    #[dynamic(default)]
     pub domain: String,
+    #[dynamic(default)]
+    pub chooser: bool,
     #[dynamic(default)]
     pub agent_id: Option<String>,
     #[dynamic(default)]
