@@ -62,6 +62,18 @@ pub fn project_create_directory_request(request_id: &str, parent_path: &str, nam
     })
 }
 
+pub fn directory_suggestions_request(request_id: &str, query: &str, limit: u32) -> Value {
+    json!({
+        "type": "directory_suggestions_request",
+        "query": query,
+        "includeDirectories": true,
+        "includeFiles": false,
+        "matchMode": "fuzzy",
+        "limit": limit,
+        "requestId": request_id
+    })
+}
+
 pub fn project_github_clone_request(request_id: &str, repo: &str, protocol: &str) -> Value {
     json!({
         "type": "project.github.clone.request",

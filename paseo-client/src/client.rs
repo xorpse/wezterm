@@ -424,6 +424,29 @@ impl PaseoClient {
             .ok_or_else(|| PaseoError::Protocol("create_directory missing directoryPath".into()))
     }
 
+    pub async fn directory_suggestions(&self, query: &str, limit: u32) -> Result<Vec<String>> {
+        let id = new_id();
+        let payload = self
+            .request(crate::protocol::workspaces::directory_suggestions_request(
+                &id, query, limit,
+            ))
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_string()));
+        }
+        let directories = payload
+            .get("directories")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(directories)
+    }
+
     pub async fn project_github_clone(&self, repo: &str, protocol: &str) -> Result<String> {
         let id = new_id();
         let payload = self

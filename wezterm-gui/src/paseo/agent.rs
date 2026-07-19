@@ -356,6 +356,7 @@ enum Mode {
 enum PickerAction {
     OpenAgent(String),
     NewAgentInWorkspace(String),
+    SearchDirectory,
     NewDirectory,
     CloneRepo,
     ChooseDomain(String),
@@ -386,11 +387,18 @@ enum PickerRow {
     Entry(usize, usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum InputKind {
+    SearchDirectory,
     NewDirectory,
     CloneRepo,
     AddConnection,
+}
+
+impl InputKind {
+    fn autocompletes(self) -> bool {
+        matches!(self, InputKind::SearchDirectory)
+    }
 }
 
 enum PickerStage {
@@ -399,6 +407,8 @@ enum PickerStage {
         kind: InputKind,
         label: String,
         buffer: String,
+        suggestions: Vec<String>,
+        suggestion_selected: usize,
     },
 }
 
@@ -601,6 +611,10 @@ fn build_picker_groups(
         label: "Create".to_string(),
         collapsed: false,
         entries: vec![
+            PickerEntry {
+                label: "search for a directory + agent".to_string(),
+                action: PickerAction::SearchDirectory,
+            },
             PickerEntry {
                 label: "new directory + agent".to_string(),
                 action: PickerAction::NewDirectory,
@@ -848,7 +862,14 @@ impl AgentState {
         let cols = self.size.cols;
 
         if let Some(picker) = &self.picker {
-            if let PickerStage::Input { label, buffer, .. } = &picker.stage {
+            if let PickerStage::Input {
+                kind,
+                label,
+                buffer,
+                suggestions,
+                suggestion_selected,
+            } = &picker.stage
+            {
                 let mut transcript = Vec::new();
                 push_wrapped(
                     &mut transcript,
@@ -857,11 +878,35 @@ impl AgentState {
                     &attr_bold_fg(AnsiColor::Teal),
                     cols,
                 );
+                for (i, suggestion) in suggestions.iter().enumerate() {
+                    let selected = i == *suggestion_selected;
+                    let marker = if selected { "❯ " } else { "  " };
+                    let attrs = if selected {
+                        attr_bold_fg(AnsiColor::Teal)
+                    } else {
+                        attr_default()
+                    };
+                    transcript.push(AgentRow {
+                        text: truncate_to(&format!("{marker}{suggestion}"), cols),
+                        attrs,
+                    });
+                }
+                let hint = if kind.autocompletes() {
+                    "type to search · ↑/↓ pick · Enter select · Esc back"
+                } else {
+                    "Enter to confirm · Esc back"
+                };
                 self.transcript = transcript;
-                self.footer = vec![AgentRow {
-                    text: format!("❯ {buffer}"),
-                    attrs: attr_default(),
-                }];
+                self.footer = vec![
+                    AgentRow {
+                        text: format!("❯ {buffer}"),
+                        attrs: attr_default(),
+                    },
+                    AgentRow {
+                        text: hint.to_string(),
+                        attrs: attr_dim(),
+                    },
+                ];
                 self.clamp_scroll();
                 return;
             }
@@ -1791,12 +1836,24 @@ impl PaseoAgentPane {
     fn picker_move(&self, delta: isize) {
         self.mutate(|state| {
             if let Some(picker) = &mut state.picker {
-                let len = picker.visible_rows().len() as isize;
-                if len == 0 {
-                    return;
+                if let PickerStage::Input {
+                    suggestions,
+                    suggestion_selected,
+                    ..
+                } = &mut picker.stage
+                {
+                    let len = suggestions.len() as isize;
+                    if len > 0 {
+                        *suggestion_selected =
+                            (*suggestion_selected as isize + delta).rem_euclid(len) as usize;
+                    }
+                } else {
+                    let len = picker.visible_rows().len() as isize;
+                    if len > 0 {
+                        picker.selected =
+                            (picker.selected as isize + delta).rem_euclid(len) as usize;
+                    }
                 }
-                let next = (picker.selected as isize + delta).rem_euclid(len);
-                picker.selected = next as usize;
             }
             state.rebuild_rows();
         });
@@ -1901,26 +1958,103 @@ impl PaseoAgentPane {
     }
 
     fn picker_input_char(&self, c: char) {
+        let mut autocompletes = false;
         self.mutate(|state| {
             if let Some(PickerState {
-                stage: PickerStage::Input { buffer, .. },
+                stage:
+                    PickerStage::Input {
+                        kind,
+                        buffer,
+                        suggestion_selected,
+                        ..
+                    },
                 ..
             }) = &mut state.picker
             {
                 buffer.push(c);
+                *suggestion_selected = 0;
+                autocompletes = kind.autocompletes();
             }
             state.rebuild_rows();
         });
+        if autocompletes {
+            self.refresh_suggestions();
+        }
     }
 
     fn picker_input_backspace(&self) {
+        let mut autocompletes = false;
         self.mutate(|state| {
             if let Some(PickerState {
-                stage: PickerStage::Input { buffer, .. },
+                stage:
+                    PickerStage::Input {
+                        kind,
+                        buffer,
+                        suggestion_selected,
+                        ..
+                    },
                 ..
             }) = &mut state.picker
             {
                 buffer.pop();
+                *suggestion_selected = 0;
+                autocompletes = kind.autocompletes();
+            }
+            state.rebuild_rows();
+        });
+        if autocompletes {
+            self.refresh_suggestions();
+        }
+    }
+
+    fn refresh_suggestions(&self) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        let query = {
+            let state = self.state.lock();
+            match &state.picker {
+                Some(PickerState {
+                    stage: PickerStage::Input { kind, buffer, .. },
+                    ..
+                }) if kind.autocompletes() => buffer.clone(),
+                _ => return,
+            }
+        };
+        if !query.starts_with('/') && !query.starts_with('~') {
+            self.apply_suggestions(query, Vec::new());
+            return;
+        }
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let directories = client
+                .directory_suggestions(&query, 20)
+                .await
+                .unwrap_or_default();
+            if let Some(pane) = weak.upgrade() {
+                pane.apply_suggestions(query, directories);
+            }
+        })
+        .detach();
+    }
+
+    fn apply_suggestions(&self, query: String, directories: Vec<String>) {
+        self.mutate(|state| {
+            if let Some(PickerState {
+                stage:
+                    PickerStage::Input {
+                        buffer,
+                        suggestions,
+                        suggestion_selected,
+                        ..
+                    },
+                ..
+            }) = &mut state.picker
+            {
+                if *buffer == query {
+                    *suggestions = directories;
+                    *suggestion_selected = 0;
+                }
             }
             state.rebuild_rows();
         });
@@ -2013,8 +2147,18 @@ impl PaseoAgentPane {
                 return;
             };
             match &picker.stage {
-                PickerStage::Input { kind, buffer, .. } => {
-                    Some(Chosen::RunInput(*kind, buffer.trim().to_string()))
+                PickerStage::Input {
+                    kind,
+                    buffer,
+                    suggestions,
+                    suggestion_selected,
+                    ..
+                } => {
+                    let value = suggestions
+                        .get(*suggestion_selected)
+                        .cloned()
+                        .unwrap_or_else(|| buffer.trim().to_string());
+                    Some(Chosen::RunInput(*kind, value))
                 }
                 PickerStage::Browse => {
                     let rows = picker.visible_rows();
@@ -2027,6 +2171,10 @@ impl PaseoAgentPane {
                                     PickerAction::NewAgentInWorkspace(cwd) => {
                                         Chosen::NewIn(cwd.clone())
                                     }
+                                    PickerAction::SearchDirectory => Chosen::StartInput(
+                                        InputKind::SearchDirectory,
+                                        "Search for a directory on the daemon:".to_string(),
+                                    ),
                                     PickerAction::NewDirectory => Chosen::StartInput(
                                         InputKind::NewDirectory,
                                         "New directory (full path on the daemon):".to_string(),
@@ -2066,20 +2214,35 @@ impl PaseoAgentPane {
                 }
                 state.rebuild_rows();
             }),
-            Some(Chosen::StartInput(kind, label)) => self.mutate(|state| {
-                if let Some(picker) = &mut state.picker {
-                    picker.stage = PickerStage::Input {
-                        kind,
-                        label,
-                        buffer: String::new(),
-                    };
+            Some(Chosen::StartInput(kind, label)) => {
+                let buffer = if kind == InputKind::SearchDirectory {
+                    "~/".to_string()
+                } else {
+                    String::new()
+                };
+                self.mutate(|state| {
+                    if let Some(picker) = &mut state.picker {
+                        picker.stage = PickerStage::Input {
+                            kind,
+                            label,
+                            buffer,
+                            suggestions: Vec::new(),
+                            suggestion_selected: 0,
+                        };
+                    }
+                    state.rebuild_rows();
+                });
+                if kind.autocompletes() {
+                    self.refresh_suggestions();
                 }
-                state.rebuild_rows();
-            }),
+            }
             Some(Chosen::RunInput(kind, value)) => {
                 if !value.is_empty() {
                     match kind {
                         InputKind::AddConnection => self.run_add_connection(value),
+                        InputKind::SearchDirectory => {
+                            self.begin_create(PendingCreate::Workspace(value))
+                        }
                         InputKind::NewDirectory => {
                             self.begin_create(PendingCreate::NewDirectory(value))
                         }
@@ -2179,7 +2342,7 @@ impl PaseoAgentPane {
                     client.project_create_directory(&parent, &name).await
                 }
                 InputKind::CloneRepo => client.project_github_clone(&value, "https").await,
-                InputKind::AddConnection => return,
+                InputKind::SearchDirectory | InputKind::AddConnection => return,
             };
             match cwd {
                 Ok(cwd) => {

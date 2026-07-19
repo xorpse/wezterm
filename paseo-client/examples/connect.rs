@@ -14,6 +14,7 @@ struct Options {
     inspect: Option<String>,
     diff: Option<String>,
     spawn_editor: Option<String>,
+    suggest: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -40,6 +41,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         inspect: None,
         diff: None,
         spawn_editor: None,
+        suggest: None,
     };
 
     if first == "--local" {
@@ -79,6 +81,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--spawn-editor" => {
                 options.spawn_editor = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--suggest" => {
+                options.suggest = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -143,7 +148,13 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(cwd) = &options.spawn_editor {
+    if let Some(query) = &options.suggest {
+        let dirs = client.directory_suggestions(query, 20).await?;
+        println!("suggestions for {query:?}: {}", dirs.len());
+        for d in &dirs {
+            println!("  {d}");
+        }
+    } else if let Some(cwd) = &options.spawn_editor {
         spawn_editor_probe(&client, cwd).await?;
     } else if let Some(cwd) = &options.diff {
         probe_diff(&client, cwd).await?;
