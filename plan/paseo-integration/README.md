@@ -64,6 +64,18 @@ against real daemons (enki local + a relay/E2EE Mac daemon):
   launcher attach, `OpenPaseoAgentPane` (open existing / create new). Agent
   panes **auto-connect** (no attach-first). Panes prune on terminal exit /
   disconnect.
+- **Stage 5 — hub picker & projects**: the in-pane picker is a hub that lists
+  open agents and known workspaces and offers create actions — new agent in a
+  workspace, new directory + agent, clone GitHub repo + agent — backed by
+  `fetch_workspaces` / `project.add` / `project.create_directory` /
+  `project.github.clone` client RPCs.
+- **Stage 6 — tab groups**: with `tab_bar_group_by_domain`, a vertical fancy tab
+  bar inserts a labeled header before each run of tabs from a different mux
+  domain, so each Paseo daemon's tabs cluster under their own header.
+- **Stage 7 — agent diff view**: pressing `d` in an agent pane toggles a
+  daemon-sourced uncommitted diff for the agent's workspace
+  (`subscribe_checkout_diff` + `checkout_diff_update`), rendered as
+  files/hunks/add-remove lines. `send_paste` now inserts into the composer.
 
 Remaining polish (not blocking): timeline pagination for very long histories,
 snapshot-grid restore, auto-reconnect with backoff, richer tool-card rendering.
