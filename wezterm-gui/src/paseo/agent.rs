@@ -1165,17 +1165,26 @@ impl AgentState {
                 attrs: attr_dim(),
             });
         }
-        let composer = match self.mode {
-            Mode::Compose => AgentRow {
-                text: format!("❯ {}", self.composer),
-                attrs: attr_default(),
-            },
-            Mode::Scroll => AgentRow {
-                text: "❯ (i: type · j/k · Ctrl-d/u · g/G · d: review · q/Esc: close)".to_string(),
+        match self.mode {
+            Mode::Compose => {
+                footer.push(AgentRow {
+                    text: "Enter: send  ·  Shift-Enter: newline  ·  Esc: cancel".to_string(),
+                    attrs: attr_dim(),
+                });
+                for (i, line) in self.composer.split('\n').enumerate() {
+                    let prefix = if i == 0 { "❯ " } else { "  " };
+                    footer.push(AgentRow {
+                        text: format!("{prefix}{line}"),
+                        attrs: attr_default(),
+                    });
+                }
+            }
+            Mode::Scroll => footer.push(AgentRow {
+                text: "❯ (i: type · j/k · Ctrl-d/u · g/G · d: review · t: terminal · q/Esc: close)"
+                    .to_string(),
                 attrs: attr_dim(),
-            },
-        };
-        footer.push(composer);
+            }),
+        }
         self.footer = footer;
 
         self.clamp_scroll();
@@ -3039,8 +3048,13 @@ impl Pane for PaseoAgentPane {
     fn get_cursor_position(&self) -> StableCursorPosition {
         let state = self.state.lock();
         if state.mode == Mode::Compose {
+            let last_line_len = state
+                .composer
+                .rsplit('\n')
+                .next()
+                .map_or(0, |line| line.chars().count());
             return StableCursorPosition {
-                x: 2 + state.composer.chars().count(),
+                x: 2 + last_line_len,
                 y: state.composer_screen_row() as StableRowIndex,
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: CursorVisibility::Visible,
@@ -3233,6 +3247,15 @@ impl Pane for PaseoAgentPane {
         let mode = self.state.lock().mode;
         match mode {
             Mode::Compose => match key {
+                KeyCode::Char('\r') | KeyCode::Enter
+                    if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT) =>
+                {
+                    self.mutate(|state| {
+                        state.composer.push('\n');
+                        state.rebuild_rows();
+                    });
+                    self.scroll_to_bottom();
+                }
                 KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(),
                 KeyCode::Backspace => self.mutate(|state| {
                     state.composer.pop();
