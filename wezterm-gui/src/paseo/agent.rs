@@ -419,11 +419,18 @@ pub struct PaseoAgentPane {
     pane_id: PaneId,
     domain_id: DomainId,
     agent_id: Mutex<Option<String>>,
-    client: PaseoClient,
+    domain: Arc<dyn mux::domain::Domain>,
+    client: Mutex<Option<PaseoClient>>,
     writer: Mutex<Vec<u8>>,
     window: Window,
     weak: Mutex<Weak<PaseoAgentPane>>,
     state: Mutex<AgentState>,
+}
+
+impl PaseoAgentPane {
+    fn client(&self) -> Option<PaseoClient> {
+        self.client.lock().clone()
+    }
 }
 
 impl PaseoAgentPane {
@@ -534,7 +541,9 @@ impl PaseoAgentPane {
         let Some(agent_id) = self.agent_id() else {
             return;
         };
-        let client = self.client.clone();
+        let Some(client) = self.client() else {
+            return;
+        };
         let weak = self.weak.lock().clone();
         promise::spawn::spawn(async move {
             action(client.clone(), agent_id.clone()).await;
@@ -625,8 +634,8 @@ impl PaseoAgentPane {
         {
             let state = self.state.lock();
             let total = state.total_rows();
-            log::info!(
-                "paseo scroll {:?}: rows={} size.rows={} total={} physical_top={} scrollback_top=0",
+            log::error!(
+                "PASEO_SCROLL {:?}: rows={} size.rows={} total={} physical_top={} scrollback_top=0",
                 assignment,
                 state.rows.len(),
                 state.size.rows,
@@ -653,8 +662,7 @@ impl PaseoAgentPane {
             std::mem::take(&mut state.composer).trim().to_string()
         };
         if !text.is_empty() {
-            if let Some(agent_id) = self.agent_id.lock().clone() {
-                let client = self.client.clone();
+            if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
                 promise::spawn::spawn(async move {
                     let _ = client.send_agent_message(&agent_id, &text).await;
                 })
@@ -678,8 +686,7 @@ impl PaseoAgentPane {
                 .map(|a| a.id.clone());
             (self.agent_id.lock().clone(), request.id.clone(), action_id)
         };
-        if let Some(agent_id) = agent_id {
-            let client = self.client.clone();
+        if let (Some(agent_id), Some(client)) = (agent_id, self.client()) {
             let response = if allow {
                 PermissionResponse::Allow {
                     selected_action_id: action_id,
@@ -705,8 +712,24 @@ impl PaseoAgentPane {
 
     pub fn start(self: &Arc<Self>, source: AgentSource) {
         let weak = Arc::downgrade(self);
-        let client = self.client.clone();
+        let domain = self.domain.clone();
         promise::spawn::spawn(async move {
+            let client = match ensure_domain_client(&domain).await {
+                Ok(client) => client,
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status(
+                            "Agent (error)".to_string(),
+                            Some(format!("connect failed: {err}")),
+                        );
+                    }
+                    return;
+                }
+            };
+            if let Some(pane) = weak.upgrade() {
+                *pane.client.lock() = Some(client.clone());
+            }
+
             let snapshot = match resolve_or_create(&client, source).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
@@ -790,6 +813,15 @@ pub struct AgentSource {
     pub provider: Option<String>,
     pub cwd: Option<String>,
     pub prompt: Option<String>,
+}
+
+async fn ensure_domain_client(
+    domain: &Arc<dyn mux::domain::Domain>,
+) -> anyhow::Result<PaseoClient> {
+    let paseo = domain
+        .downcast_ref::<paseo_mux::PaseoDomain>()
+        .ok_or_else(|| anyhow!("not a paseo domain"))?;
+    paseo.ensure_client().await
 }
 
 async fn resolve_or_create(
@@ -1071,18 +1103,16 @@ pub fn open_paseo_agent_pane(
     let domain = mux
         .get_domain_by_name(&args.domain)
         .ok_or_else(|| anyhow!("paseo domain {} not found", args.domain))?;
-    let paseo_domain = domain
-        .downcast_ref::<paseo_mux::PaseoDomain>()
-        .ok_or_else(|| anyhow!("domain {} is not a paseo domain", args.domain))?;
-    let client = paseo_domain
-        .client()
-        .ok_or_else(|| anyhow!("attach the {} domain before opening an agent", args.domain))?;
+    if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_none() {
+        anyhow::bail!("domain {} is not a paseo domain", args.domain);
+    }
 
     let pane = Arc::new(PaseoAgentPane {
         pane_id: alloc_pane_id(),
         domain_id: source.domain_id(),
         agent_id: Mutex::new(None),
-        client,
+        domain: domain.clone(),
+        client: Mutex::new(None),
         writer: Mutex::new(Vec::new()),
         window,
         weak: Mutex::new(Weak::new()),
