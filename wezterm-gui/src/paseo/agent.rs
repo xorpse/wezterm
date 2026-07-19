@@ -868,6 +868,7 @@ struct AgentState {
     workspace_name: Option<String>,
     mode: Mode,
     composer: String,
+    composer_cursor: usize,
     provider: String,
     agent_status: String,
     requires_attention: bool,
@@ -888,6 +889,83 @@ struct AgentState {
 }
 
 impl AgentState {
+    fn composer_char_len(&self) -> usize {
+        self.composer.chars().count()
+    }
+
+    fn composer_byte_offset(&self, char_idx: usize) -> usize {
+        self.composer
+            .char_indices()
+            .nth(char_idx)
+            .map_or(self.composer.len(), |(byte, _)| byte)
+    }
+
+    fn composer_insert(&mut self, c: char) {
+        let cursor = self.composer_cursor.min(self.composer_char_len());
+        let offset = self.composer_byte_offset(cursor);
+        self.composer.insert(offset, c);
+        self.composer_cursor = cursor + 1;
+    }
+
+    fn composer_backspace(&mut self) {
+        let cursor = self.composer_cursor.min(self.composer_char_len());
+        if cursor == 0 {
+            return;
+        }
+        let start = self.composer_byte_offset(cursor - 1);
+        let end = self.composer_byte_offset(cursor);
+        self.composer.replace_range(start..end, "");
+        self.composer_cursor = cursor - 1;
+    }
+
+    fn composer_line_col(&self) -> (usize, usize) {
+        let cursor = self.composer_cursor.min(self.composer_char_len());
+        let mut line = 0;
+        let mut col = 0;
+        for ch in self.composer.chars().take(cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn composer_set_line_col(&mut self, line: usize, col: usize) {
+        let lines: Vec<&str> = self.composer.split('\n').collect();
+        let line = line.min(lines.len().saturating_sub(1));
+        let target_col = col.min(lines[line].chars().count());
+        let mut idx = 0;
+        for l in &lines[..line] {
+            idx += l.chars().count() + 1;
+        }
+        self.composer_cursor = idx + target_col;
+    }
+
+    fn composer_move_horizontal(&mut self, delta: isize) {
+        let len = self.composer_char_len();
+        let next = (self.composer_cursor.min(len) as isize + delta).clamp(0, len as isize);
+        self.composer_cursor = next as usize;
+    }
+
+    fn composer_move_vertical(&mut self, delta: isize) {
+        let (line, col) = self.composer_line_col();
+        let next = (line as isize + delta).max(0) as usize;
+        self.composer_set_line_col(next, col);
+    }
+
+    fn composer_home(&mut self) {
+        let (line, _) = self.composer_line_col();
+        self.composer_set_line_col(line, 0);
+    }
+
+    fn composer_end(&mut self) {
+        let (line, _) = self.composer_line_col();
+        self.composer_set_line_col(line, usize::MAX);
+    }
+
     fn mode_label(&self) -> String {
         let id = self.current_mode_id.clone().unwrap_or_default();
         self.available_modes
@@ -1168,7 +1246,8 @@ impl AgentState {
         match self.mode {
             Mode::Compose => {
                 footer.push(AgentRow {
-                    text: "Enter: send  ·  Shift-Enter: newline  ·  Esc: cancel".to_string(),
+                    text: "Enter: send  ·  Shift-Enter: newline  ·  ←→↑↓: move  ·  Esc: cancel"
+                        .to_string(),
                     attrs: attr_dim(),
                 });
                 for (i, line) in self.composer.split('\n').enumerate() {
@@ -1204,10 +1283,6 @@ impl AgentState {
         } else {
             self.scroll = self.scroll.min(self.max_scroll());
         }
-    }
-
-    fn composer_screen_row(&self) -> usize {
-        self.size.rows.saturating_sub(1)
     }
 
     fn row_line(&self, screen_row: usize) -> Line {
@@ -1581,6 +1656,7 @@ impl PaseoAgentPane {
     fn submit_composer(&self) {
         let text = {
             let mut state = self.state.lock();
+            state.composer_cursor = 0;
             std::mem::take(&mut state.composer).trim().to_string()
         };
         if text.is_empty() {
@@ -3048,14 +3124,12 @@ impl Pane for PaseoAgentPane {
     fn get_cursor_position(&self) -> StableCursorPosition {
         let state = self.state.lock();
         if state.mode == Mode::Compose {
-            let last_line_len = state
-                .composer
-                .rsplit('\n')
-                .next()
-                .map_or(0, |line| line.chars().count());
+            let num_lines = state.composer.split('\n').count().max(1);
+            let (line, col) = state.composer_line_col();
+            let first_row = state.size.rows.saturating_sub(num_lines);
             return StableCursorPosition {
-                x: 2 + last_line_len,
-                y: state.composer_screen_row() as StableRowIndex,
+                x: 2 + col,
+                y: (first_row + line) as StableRowIndex,
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: CursorVisibility::Visible,
             };
@@ -3136,11 +3210,7 @@ impl Pane for PaseoAgentPane {
             if state.picker.is_none() {
                 state.mode = Mode::Compose;
                 for c in text.chars() {
-                    if c == '\r' {
-                        state.composer.push('\n');
-                    } else {
-                        state.composer.push(c);
-                    }
+                    state.composer_insert(if c == '\r' { '\n' } else { c });
                 }
                 state.rebuild_rows();
             }
@@ -3251,23 +3321,47 @@ impl Pane for PaseoAgentPane {
                     if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT) =>
                 {
                     self.mutate(|state| {
-                        state.composer.push('\n');
+                        state.composer_insert('\n');
                         state.rebuild_rows();
                     });
                     self.scroll_to_bottom();
                 }
                 KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(),
                 KeyCode::Backspace => self.mutate(|state| {
-                    state.composer.pop();
+                    state.composer_backspace();
                     state.rebuild_rows();
                 }),
                 KeyCode::Escape => self.mutate(|state| {
                     state.mode = Mode::Scroll;
                     state.rebuild_rows();
                 }),
+                KeyCode::LeftArrow => self.mutate(|state| {
+                    state.composer_move_horizontal(-1);
+                    state.rebuild_rows();
+                }),
+                KeyCode::RightArrow => self.mutate(|state| {
+                    state.composer_move_horizontal(1);
+                    state.rebuild_rows();
+                }),
+                KeyCode::UpArrow => self.mutate(|state| {
+                    state.composer_move_vertical(-1);
+                    state.rebuild_rows();
+                }),
+                KeyCode::DownArrow => self.mutate(|state| {
+                    state.composer_move_vertical(1);
+                    state.rebuild_rows();
+                }),
+                KeyCode::Home => self.mutate(|state| {
+                    state.composer_home();
+                    state.rebuild_rows();
+                }),
+                KeyCode::End => self.mutate(|state| {
+                    state.composer_end();
+                    state.rebuild_rows();
+                }),
                 KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CTRL) => self
                     .mutate(|state| {
-                        state.composer.push(c);
+                        state.composer_insert(c);
                         state.rebuild_rows();
                     }),
                 _ => {}
@@ -3276,6 +3370,7 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('i') | KeyCode::Char('\r') | KeyCode::Enter => {
                     self.mutate(|state| {
                         state.mode = Mode::Compose;
+                        state.composer_cursor = state.composer_char_len();
                         state.rebuild_rows();
                     });
                     self.scroll_to_bottom();
@@ -3442,6 +3537,7 @@ pub fn open_paseo_agent_pane(
             workspace_name: None,
             mode: Mode::Scroll,
             composer: String::new(),
+            composer_cursor: 0,
             provider: String::new(),
             agent_status: String::new(),
             requires_attention: false,
