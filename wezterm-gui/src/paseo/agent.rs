@@ -16,7 +16,7 @@ use paseo_client::{
     PaseoClient, PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use termwiz::cell::{CellAttributes, Intensity};
@@ -394,14 +394,6 @@ fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn short_kind(kind: &str) -> &str {
-    match kind {
-        "worktree" => "worktree",
-        "local_checkout" => "checkout",
-        other => other,
-    }
-}
-
 fn provider_display(id: &str) -> String {
     match id {
         "claude-code" | "claude_code" | "claudecode" => "Claude Code".to_string(),
@@ -516,25 +508,33 @@ fn build_picker_groups(
         ],
     }];
 
-    struct AgentItem {
+    struct Unit {
         rank: (u8, u8),
-        sort_title: String,
-        entry: PickerEntry,
+        sort_key: String,
+        entries: Vec<PickerEntry>,
     }
     struct Proj {
         display: String,
-        agents: Vec<AgentItem>,
-        workspaces: Vec<PickerEntry>,
+        units: Vec<Unit>,
     }
-    struct WsMeta {
-        project_key: String,
-        name: String,
-        context: Option<String>,
+
+    let ws_ids: HashSet<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+    let mut agents_by_ws: HashMap<String, Vec<AgentSnapshot>> = HashMap::new();
+    let mut orphans: Vec<AgentSnapshot> = Vec::new();
+    for entry in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
+        let agent = entry.agent;
+        match agent
+            .workspace_id
+            .as_ref()
+            .filter(|id| ws_ids.contains(id.as_str()))
+        {
+            Some(id) => agents_by_ws.entry(id.clone()).or_default().push(agent),
+            None => orphans.push(agent),
+        }
     }
+
     let mut order: Vec<String> = Vec::new();
     let mut index: HashMap<String, Proj> = HashMap::new();
-    let mut ws_by_id: HashMap<String, WsMeta> = HashMap::new();
-    let mut cwd_to_wsid: HashMap<String, String> = HashMap::new();
     let other_key = "\u{0}other".to_string();
 
     for ws in &workspaces {
@@ -555,83 +555,99 @@ fn build_picker_groups(
             order.push(key.clone());
             Proj {
                 display,
-                agents: Vec::new(),
-                workspaces: Vec::new(),
+                units: Vec::new(),
             }
         });
-        let ws_name = if ws.name.trim().is_empty() {
+        let name = if ws.name.trim().is_empty() {
             basename(ws.cwd()).to_string()
         } else {
             ws.name.clone()
         };
         let context = workspace_context(ws);
-        let new_label = match &context {
-            Some(context) => format!("new  {}  ·  {}", ws_name, context),
-            None => format!("new  {}  ({})", ws_name, short_kind(&ws.workspace_kind)),
+
+        let unit = match agents_by_ws.remove(&ws.id).filter(|v| !v.is_empty()) {
+            Some(mut ws_agents) => {
+                ws_agents.sort_by(|a, b| {
+                    agent_rank(a)
+                        .cmp(&agent_rank(b))
+                        .then_with(|| b.updated_at.cmp(&a.updated_at))
+                });
+                let primary = &ws_agents[0];
+                let extra = ws_agents.len() - 1;
+                let base = agent_row_label(primary, Some(&name), context.as_deref());
+                let main_label = if extra > 0 {
+                    format!("{base}   (+{extra})")
+                } else {
+                    base
+                };
+                let mut entries = vec![PickerEntry {
+                    label: main_label,
+                    action: PickerAction::OpenAgent(primary.id.clone()),
+                }];
+                for agent in &ws_agents[1..] {
+                    entries.push(PickerEntry {
+                        label: format!("  {} {}", status_glyph(agent), session_title(agent)),
+                        action: PickerAction::OpenAgent(agent.id.clone()),
+                    });
+                }
+                Unit {
+                    rank: agent_rank(primary),
+                    sort_key: name.to_lowercase(),
+                    entries,
+                }
+            }
+            None => {
+                let label = match &context {
+                    Some(context) => format!("⊕ {}  ·  {}", name, context),
+                    None => format!("⊕ {}", name),
+                };
+                Unit {
+                    rank: (9, 9),
+                    sort_key: name.to_lowercase(),
+                    entries: vec![PickerEntry {
+                        label,
+                        action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
+                    }],
+                }
+            }
         };
-        ws_by_id.insert(
-            ws.id.clone(),
-            WsMeta {
-                project_key: key.clone(),
-                name: ws_name.clone(),
-                context,
-            },
-        );
-        cwd_to_wsid
-            .entry(ws.cwd().to_string())
-            .or_insert_with(|| ws.id.clone());
         if let Some(proj) = index.get_mut(&key) {
-            proj.workspaces.push(PickerEntry {
-                label: new_label,
-                action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
-            });
+            proj.units.push(unit);
         }
     }
 
-    for entry in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
-        let agent = entry.agent;
-        let ws_meta = agent
-            .workspace_id
-            .as_ref()
-            .and_then(|id| ws_by_id.get(id))
-            .or_else(|| cwd_to_wsid.get(&agent.cwd).and_then(|id| ws_by_id.get(id)));
-        let key = ws_meta.map(|w| w.project_key.clone()).unwrap_or_else(|| {
-            index.entry(other_key.clone()).or_insert_with(|| {
-                order.push(other_key.clone());
-                Proj {
-                    display: "Other".to_string(),
-                    agents: Vec::new(),
-                    workspaces: Vec::new(),
-                }
-            });
-            other_key.clone()
+    for agent in orphans {
+        index.entry(other_key.clone()).or_insert_with(|| {
+            order.push(other_key.clone());
+            Proj {
+                display: "Other".to_string(),
+                units: Vec::new(),
+            }
         });
-        let name = ws_meta.map(|w| w.name.as_str());
-        let context = ws_meta.and_then(|w| w.context.as_deref());
-        if let Some(proj) = index.get_mut(&key) {
-            proj.agents.push(AgentItem {
+        if let Some(proj) = index.get_mut(&other_key) {
+            proj.units.push(Unit {
                 rank: agent_rank(&agent),
-                sort_title: session_name(name, &agent).to_lowercase(),
-                entry: PickerEntry {
-                    label: agent_row_label(&agent, name, context),
+                sort_key: session_title(&agent).to_lowercase(),
+                entries: vec![PickerEntry {
+                    label: agent_row_label(&agent, None, None),
                     action: PickerAction::OpenAgent(agent.id.clone()),
-                },
+                }],
             });
         }
     }
 
     for proj in index.values_mut() {
-        proj.agents.sort_by(|a, b| {
+        proj.units.sort_by(|a, b| {
             a.rank
                 .cmp(&b.rank)
-                .then_with(|| a.sort_title.cmp(&b.sort_title))
+                .then_with(|| a.sort_key.cmp(&b.sort_key))
         });
     }
 
     let project_rank = |key: &str| -> (u8, u8) {
         index
             .get(key)
-            .and_then(|p| p.agents.first().map(|a| a.rank))
+            .and_then(|p| p.units.first().map(|u| u.rank))
             .unwrap_or((9, 9))
     };
 
@@ -653,8 +669,8 @@ fn build_picker_groups(
 
     for key in order {
         if let Some(proj) = index.remove(&key) {
-            let mut entries: Vec<PickerEntry> = proj.agents.into_iter().map(|a| a.entry).collect();
-            entries.extend(proj.workspaces);
+            let entries: Vec<PickerEntry> =
+                proj.units.into_iter().flat_map(|u| u.entries).collect();
             groups.push(PickerGroup {
                 label: proj.display,
                 collapsed: true,
