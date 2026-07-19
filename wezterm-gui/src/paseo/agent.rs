@@ -1,6 +1,6 @@
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use anyhow::anyhow;
-use config::keyassignment::{KeyAssignment, PaseoAgentArgs, SpawnCommand, SpawnTabDomain};
+use config::keyassignment::{KeyAssignment, PaseoAgentArgs};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -19,10 +19,9 @@ use rangeset::RangeSet;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use termwiz::cell::{CellAttributes, Intensity};
-use termwiz::color::AnsiColor;
+use termwiz::cell::{Cell, CellAttributes, Intensity, Underline};
+use termwiz::color::{AnsiColor, ColorAttribute, SrgbaTuple};
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
 use url::Url;
 use wezterm_term::color::ColorPalette;
@@ -84,15 +83,119 @@ impl AgentRow {
     }
 }
 
-struct NullWriter;
+fn apply_sgr(attrs: &mut CellAttributes, params: &str) {
+    let codes: Vec<u16> = if params.is_empty() {
+        vec![0]
+    } else {
+        params.split(';').map(|p| p.parse().unwrap_or(0)).collect()
+    };
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => *attrs = CellAttributes::default(),
+            1 => {
+                attrs.set_intensity(Intensity::Bold);
+            }
+            2 => {
+                attrs.set_intensity(Intensity::Half);
+            }
+            3 => {
+                attrs.set_italic(true);
+            }
+            4 => {
+                attrs.set_underline(Underline::Single);
+            }
+            7 => {
+                attrs.set_reverse(true);
+            }
+            22 => {
+                attrs.set_intensity(Intensity::Normal);
+            }
+            23 => {
+                attrs.set_italic(false);
+            }
+            24 => {
+                attrs.set_underline(Underline::None);
+            }
+            27 => {
+                attrs.set_reverse(false);
+            }
+            30..=37 => {
+                attrs.set_foreground(ColorAttribute::PaletteIndex((codes[i] - 30) as u8));
+            }
+            39 => {
+                attrs.set_foreground(ColorAttribute::Default);
+            }
+            40..=47 => {
+                attrs.set_background(ColorAttribute::PaletteIndex((codes[i] - 40) as u8));
+            }
+            49 => {
+                attrs.set_background(ColorAttribute::Default);
+            }
+            90..=97 => {
+                attrs.set_foreground(ColorAttribute::PaletteIndex((codes[i] - 90 + 8) as u8));
+            }
+            100..=107 => {
+                attrs.set_background(ColorAttribute::PaletteIndex((codes[i] - 100 + 8) as u8));
+            }
+            38 | 48 => {
+                let fg = codes[i] == 38;
+                let color = if codes.get(i + 1) == Some(&5) {
+                    let c =
+                        ColorAttribute::PaletteIndex(codes.get(i + 2).copied().unwrap_or(0) as u8);
+                    i += 2;
+                    c
+                } else if codes.get(i + 1) == Some(&2) {
+                    let r = codes.get(i + 2).copied().unwrap_or(0) as u8;
+                    let g = codes.get(i + 3).copied().unwrap_or(0) as u8;
+                    let b = codes.get(i + 4).copied().unwrap_or(0) as u8;
+                    i += 4;
+                    ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple::from((r, g, b)))
+                } else {
+                    ColorAttribute::Default
+                };
+                if fg {
+                    attrs.set_foreground(color);
+                } else {
+                    attrs.set_background(color);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
 
-impl std::io::Write for NullWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(buf.len())
+fn ansi_line_to_line(s: &str, seqno: SequenceNo) -> Line {
+    let mut attrs = CellAttributes::default();
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = None;
+                for pc in chars.by_ref() {
+                    if pc.is_ascii_digit() || pc == ';' {
+                        params.push(pc);
+                    } else {
+                        final_byte = Some(pc);
+                        break;
+                    }
+                }
+                if final_byte == Some('m') {
+                    apply_sgr(&mut attrs, &params);
+                }
+            }
+            continue;
+        }
+        if c == '\r' {
+            continue;
+        }
+        cells.push(Cell::new(c, attrs.clone()));
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    Line::from_cells(cells, seqno)
 }
 
 fn markdown_to_lines(md: &str, cols: usize) -> Vec<AgentRow> {
@@ -107,23 +210,18 @@ fn markdown_to_lines(md: &str, cols: usize) -> Vec<AgentRow> {
     let width = cols.max(20);
     let events = markdown::parse(trimmed);
     let ansi = markdown_terminal::render_with(&events, &markdown_terminal::Theme::default(), width);
-    let rows = (ansi.matches('\n').count() + 2).clamp(1, 4000);
-    let size = TerminalSize {
-        rows,
-        cols: width,
-        pixel_width: 0,
-        pixel_height: 0,
-        dpi: 0,
-    };
-    let config = std::sync::Arc::new(config::TermConfig::new());
-    let mut terminal =
-        wezterm_term::Terminal::new(size, config, "paseo-md", "1.0", Box::new(NullWriter));
-    terminal.advance_bytes(ansi.as_bytes());
-    let mut lines = terminal.screen().lines_in_phys_range(0..rows);
-    while lines.last().is_some_and(|line| line.is_whitespace()) {
-        lines.pop();
+    let mut result: Vec<AgentRow> = ansi
+        .split('\n')
+        .map(|raw| AgentRow::rendered(ansi_line_to_line(raw, 0)))
+        .collect();
+    while result.len() > 1
+        && result
+            .last()
+            .and_then(|r| r.line.as_ref())
+            .is_some_and(|line| line.is_whitespace())
+    {
+        result.pop();
     }
-    let result: Vec<AgentRow> = lines.into_iter().map(AgentRow::rendered).collect();
     MD_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.len() > 256 {
@@ -1609,27 +1707,23 @@ impl PaseoAgentPane {
     }
 
     fn open_terminal(&self) {
-        let cwd = self.state.lock().cwd.clone();
+        let (cwd, size) = {
+            let state = self.state.lock();
+            (state.cwd.clone(), state.size)
+        };
         if cwd.is_empty() {
             return;
         }
-        self.window
-            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let pane = match term_window.get_active_pane_or_overlay() {
-                    Some(pane) => pane,
-                    None => return,
-                };
-                let command = SpawnCommand {
-                    label: None,
-                    args: None,
-                    cwd: Some(PathBuf::from(&cwd)),
-                    set_environment_variables: HashMap::new(),
-                    domain: SpawnTabDomain::CurrentPaneDomain,
-                    position: None,
-                };
-                let _ = term_window
-                    .perform_key_assignment(&pane, &KeyAssignment::SpawnCommandInNewTab(command));
-            })));
+        let Some((_, window_id, _)) = Mux::get().resolve_pane_id(self.pane_id) else {
+            return;
+        };
+        let domain = self.domain.clone();
+        promise::spawn::spawn(async move {
+            if let Err(err) = domain.spawn(size, None, Some(cwd), window_id).await {
+                log::error!("paseo: failed to open terminal: {err:#}");
+            }
+        })
+        .detach();
     }
 
     fn cycle_mode(&self) {
