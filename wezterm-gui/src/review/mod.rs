@@ -1622,11 +1622,17 @@ fn source_cwd(source: &Arc<dyn Pane>) -> Option<String> {
     if url.scheme() != "file" {
         return None;
     }
-    Some(
-        percent_decode_str(url.path())
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+    let path = percent_decode_str(url.path())
+        .decode_utf8_lossy()
+        .into_owned();
+    Some(trim_trailing_slash(path))
+}
+
+fn trim_trailing_slash(mut path: String) -> String {
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    path
 }
 
 fn resolve_source_location(source: &Arc<dyn Pane>) -> (DiffSource, String) {
