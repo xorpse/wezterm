@@ -258,7 +258,9 @@ async fn watch_stream(
     };
     println!("watching stream for agent {agent_id} (~15s)");
     let mut events = client.events();
-    let _ = client.set_timeline_subscription(&[agent_id.clone()]).await;
+    let _ = client
+        .set_timeline_subscription(std::slice::from_ref(&agent_id))
+        .await;
 
     let collect = async {
         while let Ok(event) = events.recv().await {

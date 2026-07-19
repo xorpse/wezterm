@@ -883,7 +883,9 @@ impl PaseoAgentPane {
                 }
             }
 
-            let _ = client.set_timeline_subscription(&[agent_id.clone()]).await;
+            let _ = client
+                .set_timeline_subscription(std::slice::from_ref(&agent_id))
+                .await;
 
             match client.fetch_agent_timeline(&agent_id, "tail", 200).await {
                 Ok(items) => {

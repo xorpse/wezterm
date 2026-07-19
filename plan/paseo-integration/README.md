@@ -45,6 +45,29 @@ Paseo exposes two fundamentally different things over one `/ws` WebSocket:
 | [05-protocol-reference.md](05-protocol-reference.md) | ref | Exact wire reference cited by every stage (offer, handshake, envelopes, RPCs, binary frames, forward-compat) |
 | [06-testing-and-verification.md](06-testing-and-verification.md) | ref | Per-stage test strategy, the E2EE parity test, end-to-end manual verification |
 
+## Status (implemented)
+
+All stages are implemented on `feature/paseo-integration` and validated live
+against real daemons (enki local + a relay/E2EE Mac daemon):
+
+- **Stage 1 — `paseo-client`**: relay+E2EE and local transports, RPCs, terminal
+  binary frames, agent timeline/stream, controls, create_agent. E2EE parity
+  verified live.
+- **Stage 2 — `paseo-mux`**: `PaseoTerminalPane` (real terminal panes) +
+  `PaseoDomain` (attach, and **spawn** — create terminals from WezTerm).
+- **Stage 3 — `PaseoAgentPane`**: structured transcript (messages, reasoning,
+  tool cards with targets, diffs); **fixed-layout custom scroll with a pinned
+  composer/status footer** (mouse + keyboard); compose/send; inline permission
+  approve/deny; agent controls (stop, mode/model/effort) with live
+  `agent_update` sync; **in-pane agent picker**; tab status/attention glyph.
+- **Stage 4 — config/discovery**: `PaseoDaemon` config, domain registration,
+  launcher attach, `OpenPaseoAgentPane` (open existing / create new). Agent
+  panes **auto-connect** (no attach-first). Panes prune on terminal exit /
+  disconnect.
+
+Remaining polish (not blocking): timeline pagination for very long histories,
+snapshot-grid restore, auto-reconnect with backoff, richer tool-card rendering.
+
 ## Recommended build order
 
 1. **Stage 1 first, in full**, including the CLI example gate. It de-risks the
