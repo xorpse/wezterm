@@ -15,6 +15,7 @@ struct Options {
     diff: Option<String>,
     spawn_editor: Option<String>,
     suggest: Option<String>,
+    archive: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -42,6 +43,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         diff: None,
         spawn_editor: None,
         suggest: None,
+        archive: None,
     };
 
     if first == "--local" {
@@ -84,6 +86,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--suggest" => {
                 options.suggest = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--archive" => {
+                options.archive = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -148,7 +153,10 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(query) = &options.suggest {
+    if let Some(agent_id) = &options.archive {
+        client.archive_agent(agent_id).await?;
+        println!("archived {agent_id}");
+    } else if let Some(query) = &options.suggest {
         let dirs = client.directory_suggestions(query, 20).await?;
         println!("suggestions for {query:?}: {}", dirs.len());
         for d in &dirs {

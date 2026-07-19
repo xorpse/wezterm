@@ -336,6 +336,20 @@ impl PaseoClient {
         Ok(())
     }
 
+    pub async fn archive_agent(&self, agent_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::archive_agent_request(&id, agent_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_agent(&self, agent_id: &str) -> Result<()> {
+        let id = new_id();
+        self.request(agents::delete_agent_request(&id, agent_id))
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_agent_mode(&self, agent_id: &str, mode_id: &str) -> Result<()> {
         let id = new_id();
         self.request(agents::set_agent_mode_request(&id, agent_id, mode_id))

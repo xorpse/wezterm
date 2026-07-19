@@ -426,6 +426,7 @@ struct PickerState {
     selected: usize,
     stage: PickerStage,
     pending: Option<PendingCreate>,
+    pending_delete: bool,
 }
 
 impl PickerState {
@@ -962,13 +963,20 @@ impl AgentState {
                 });
             }
             self.transcript = transcript;
-            self.footer = vec![AgentRow {
-                text: format!(
-                    "❯ {}/{}  ·  Enter · j/k · o:fold · r:refresh · g/G · q: close",
-                    (selected + 1).min(count.max(1)),
-                    count
-                ),
-                attrs: attr_dim(),
+            self.footer = vec![if picker.pending_delete {
+                AgentRow {
+                    text: "d again: archive agent  ·  any other key: cancel".to_string(),
+                    attrs: attr_fg(AnsiColor::Yellow),
+                }
+            } else {
+                AgentRow {
+                    text: format!(
+                        "❯ {}/{}  ·  Enter · j/k · dd:archive · o:fold · r:refresh · q: close",
+                        (selected + 1).min(count.max(1)),
+                        count
+                    ),
+                    attrs: attr_dim(),
+                }
             }];
 
             let view = self.view_rows().max(1);
@@ -1773,6 +1781,7 @@ impl PaseoAgentPane {
                 selected,
                 stage: PickerStage::Browse,
                 pending,
+                pending_delete: false,
             });
             state.rebuild_rows();
         });
@@ -1834,6 +1843,61 @@ impl PaseoAgentPane {
             PendingCreate::CloneRepo(value) => {
                 self.run_project_creation(InputKind::CloneRepo, value, provider)
             }
+        }
+    }
+
+    fn take_pending_delete(&self) -> bool {
+        let mut state = self.state.lock();
+        match &mut state.picker {
+            Some(picker) => std::mem::take(&mut picker.pending_delete),
+            None => false,
+        }
+    }
+
+    fn arm_pending_delete(&self) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                picker.pending_delete = true;
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn selected_agent_id(&self) -> Option<String> {
+        let state = self.state.lock();
+        let picker = state.picker.as_ref()?;
+        if !matches!(picker.stage, PickerStage::Browse) {
+            return None;
+        }
+        let rows = picker.visible_rows();
+        match rows.get(picker.selected)? {
+            PickerRow::Entry(gi, ei) => match &picker.groups.get(*gi)?.entries.get(*ei)?.action {
+                PickerAction::OpenAgent(id) => Some(id.clone()),
+                _ => None,
+            },
+            PickerRow::Header(_) => None,
+        }
+    }
+
+    fn picker_delete_key(self: &Arc<Self>) {
+        if self.take_pending_delete() {
+            let Some(agent_id) = self.selected_agent_id() else {
+                self.mutate(|state| state.rebuild_rows());
+                return;
+            };
+            let Some(client) = self.client() else {
+                return;
+            };
+            let weak = self.weak.lock().clone();
+            promise::spawn::spawn(async move {
+                let _ = client.archive_agent(&agent_id).await;
+                if let Some(pane) = weak.upgrade() {
+                    pane.picker_refresh();
+                }
+            })
+            .detach();
+        } else if self.selected_agent_id().is_some() {
+            self.arm_pending_delete();
         }
     }
 
@@ -2609,10 +2673,18 @@ impl Pane for PaseoAgentPane {
                 }
             } else {
                 let ctrl = mods.contains(KeyModifiers::CTRL);
+                if !(matches!(key, KeyCode::Char('d')) && !ctrl) {
+                    self.take_pending_delete();
+                }
                 match key {
                     KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
                     KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
                     KeyCode::Char('d') if ctrl => self.picker_page(1),
+                    KeyCode::Char('d') => {
+                        if let Some(pane) = self.arc() {
+                            pane.picker_delete_key();
+                        }
+                    }
                     KeyCode::Char('u') if ctrl => self.picker_page(-1),
                     KeyCode::PageDown => self.picker_page(1),
                     KeyCode::PageUp => self.picker_page(-1),

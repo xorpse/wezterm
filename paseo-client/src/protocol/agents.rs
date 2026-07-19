@@ -211,6 +211,14 @@ pub fn cancel_agent_request(request_id: &str, agent_id: &str) -> Value {
     json!({ "type": "cancel_agent_request", "agentId": agent_id, "requestId": request_id })
 }
 
+pub fn archive_agent_request(request_id: &str, agent_id: &str) -> Value {
+    json!({ "type": "archive_agent_request", "agentId": agent_id, "requestId": request_id })
+}
+
+pub fn delete_agent_request(request_id: &str, agent_id: &str) -> Value {
+    json!({ "type": "delete_agent_request", "agentId": agent_id, "requestId": request_id })
+}
+
 pub fn set_agent_mode_request(request_id: &str, agent_id: &str, mode_id: &str) -> Value {
     json!({
         "type": "set_agent_mode_request",
