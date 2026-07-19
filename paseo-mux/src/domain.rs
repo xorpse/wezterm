@@ -65,6 +65,7 @@ impl PaseoDomain {
         }
         let client = self.connect().await?;
         *self.client.lock() = Some(client.clone());
+        *self.state.lock() = DomainState::Attached;
         {
             let client = client.clone();
             promise::spawn::spawn(async move {
