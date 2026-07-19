@@ -335,6 +335,16 @@ fn short_kind(kind: &str) -> &str {
     }
 }
 
+fn agent_rank(agent: &AgentSnapshot) -> (u8, u8) {
+    let attention = if agent.requires_attention { 0 } else { 1 };
+    let activity = match agent.status.as_str() {
+        "running" | "working" | "thinking" | "streaming" | "in_progress" | "busy" | "active" => 0,
+        "waiting" | "paused" | "blocked" | "input_required" => 1,
+        _ => 2,
+    };
+    (attention, activity)
+}
+
 fn build_picker_groups(
     agents: Vec<AgentListEntry>,
     workspaces: Vec<Workspace>,
@@ -354,9 +364,14 @@ fn build_picker_groups(
         ],
     }];
 
+    struct AgentItem {
+        rank: (u8, u8),
+        sort_title: String,
+        entry: PickerEntry,
+    }
     struct Proj {
         display: String,
-        agents: Vec<PickerEntry>,
+        agents: Vec<AgentItem>,
         workspaces: Vec<PickerEntry>,
     }
     let mut order: Vec<String> = Vec::new();
@@ -413,17 +428,36 @@ fn build_picker_groups(
             other_key.clone()
         });
         if let Some(proj) = index.get_mut(&key) {
-            proj.agents.push(PickerEntry {
-                label: format!("open  {}", picker_label(&agent)),
-                action: PickerAction::OpenAgent(agent.id.clone()),
+            proj.agents.push(AgentItem {
+                rank: agent_rank(&agent),
+                sort_title: agent.title.clone().unwrap_or_default().to_lowercase(),
+                entry: PickerEntry {
+                    label: format!("open  {}", picker_label(&agent)),
+                    action: PickerAction::OpenAgent(agent.id.clone()),
+                },
             });
         }
     }
 
+    for proj in index.values_mut() {
+        proj.agents.sort_by(|a, b| {
+            a.rank
+                .cmp(&b.rank)
+                .then_with(|| a.sort_title.cmp(&b.sort_title))
+        });
+    }
+
+    let project_rank = |key: &str| -> (u8, u8) {
+        index
+            .get(key)
+            .and_then(|p| p.agents.first().map(|a| a.rank))
+            .unwrap_or((9, 9))
+    };
+
     order.sort_by(|x, y| match (*x == other_key, *y == other_key) {
         (true, false) => std::cmp::Ordering::Greater,
         (false, true) => std::cmp::Ordering::Less,
-        _ => {
+        _ => project_rank(x).cmp(&project_rank(y)).then_with(|| {
             let dx = index
                 .get(x)
                 .map(|p| p.display.to_lowercase())
@@ -433,17 +467,16 @@ fn build_picker_groups(
                 .map(|p| p.display.to_lowercase())
                 .unwrap_or_default();
             dx.cmp(&dy)
-        }
+        }),
     });
 
     for key in order {
         if let Some(proj) = index.remove(&key) {
-            let has_agents = !proj.agents.is_empty();
-            let mut entries = proj.agents;
+            let mut entries: Vec<PickerEntry> = proj.agents.into_iter().map(|a| a.entry).collect();
             entries.extend(proj.workspaces);
             groups.push(PickerGroup {
                 label: proj.display,
-                collapsed: !has_agents,
+                collapsed: true,
                 entries,
             });
         }
@@ -580,7 +613,7 @@ impl AgentState {
             self.transcript = transcript;
             self.footer = vec![AgentRow {
                 text: format!(
-                    "❯ {}/{}  ·  Enter: open / expand · j/k: move · q: close",
+                    "❯ {}/{}  ·  Enter: open/expand · j/k · PgUp/PgDn · g/G · q: close",
                     (selected + 1).min(count.max(1)),
                     count
                 ),
@@ -1237,6 +1270,31 @@ impl PaseoAgentPane {
         });
     }
 
+    fn picker_page(&self, dir: isize) {
+        self.mutate(|state| {
+            let page = state.size.rows.saturating_sub(1).max(1) as isize;
+            if let Some(picker) = &mut state.picker {
+                let len = picker.visible_rows().len() as isize;
+                if len == 0 {
+                    return;
+                }
+                let next = (picker.selected as isize + dir * page).clamp(0, len - 1);
+                picker.selected = next as usize;
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_to(&self, end: bool) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                let len = picker.visible_rows().len();
+                picker.selected = if end { len.saturating_sub(1) } else { 0 };
+            }
+            state.rebuild_rows();
+        });
+    }
+
     fn picker_input_char(&self, c: char) {
         self.mutate(|state| {
             if let Some(PickerState {
@@ -1710,6 +1768,10 @@ impl Pane for PaseoAgentPane {
                 match key {
                     KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
                     KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
+                    KeyCode::PageDown => self.picker_page(1),
+                    KeyCode::PageUp => self.picker_page(-1),
+                    KeyCode::Char('g') | KeyCode::Home => self.picker_to(false),
+                    KeyCode::Char('G') | KeyCode::End => self.picker_to(true),
                     KeyCode::Char('\r') | KeyCode::Enter => {
                         if let Some(pane) = self.arc() {
                             pane.picker_select();
@@ -1771,8 +1833,17 @@ impl Pane for PaseoAgentPane {
 
     fn mouse_event(&self, event: wezterm_term::MouseEvent) -> anyhow::Result<()> {
         use wezterm_term::{MouseButton, MouseEventKind};
+        let in_picker = {
+            let state = self.state.lock();
+            matches!(
+                &state.picker,
+                Some(p) if matches!(p.stage, PickerStage::Browse)
+            )
+        };
         if event.kind == MouseEventKind::Press {
             match event.button {
+                MouseButton::WheelUp(n) if in_picker => self.picker_move(-(n.max(1) as isize)),
+                MouseButton::WheelDown(n) if in_picker => self.picker_move(n.max(1) as isize),
                 MouseButton::WheelUp(n) => self.scroll_lines(-(n.max(1) as isize)),
                 MouseButton::WheelDown(n) => self.scroll_lines(n.max(1) as isize),
                 _ => {}
