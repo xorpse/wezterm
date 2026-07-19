@@ -237,11 +237,32 @@ enum Mode {
     Compose,
 }
 
+struct PickerEntry {
+    id: String,
+    label: String,
+}
+
+struct PickerState {
+    entries: Vec<PickerEntry>,
+    selected: usize,
+}
+
+fn picker_label(agent: &AgentSnapshot) -> String {
+    let title = agent.title.clone().unwrap_or_default();
+    let title = if title.is_empty() {
+        short_id(&agent.id)
+    } else {
+        title.replace('\n', " ").chars().take(60).collect()
+    };
+    format!("[{}] {} ({})", agent.status, title, agent.provider)
+}
+
 struct AgentState {
     title: String,
     status_message: Option<String>,
     items: Vec<TimelineItem>,
     pending: Option<PermissionRequest>,
+    picker: Option<PickerState>,
     mode: Mode,
     composer: String,
     provider: String,
@@ -293,6 +314,33 @@ impl AgentState {
 impl AgentState {
     fn rebuild_rows(&mut self) {
         let cols = self.size.cols;
+
+        if let Some(picker) = &self.picker {
+            let mut transcript = Vec::new();
+            transcript.push(AgentRow {
+                text: "Select an agent:".to_string(),
+                attrs: attr_bold_fg(AnsiColor::Teal),
+            });
+            transcript.push(blank_row());
+            if picker.entries.is_empty() {
+                push_wrapped(&mut transcript, "  ", "no agents", &attr_dim(), cols);
+            }
+            for (i, entry) in picker.entries.iter().enumerate() {
+                let (prefix, attrs) = if i == picker.selected {
+                    ("▸ ", attr_bold_fg(AnsiColor::Teal))
+                } else {
+                    ("  ", attr_default())
+                };
+                push_wrapped(&mut transcript, prefix, &entry.label, &attrs, cols);
+            }
+            self.transcript = transcript;
+            self.footer = vec![AgentRow {
+                text: "❯ (Enter: open · j/k: move · q: close)".to_string(),
+                attrs: attr_dim(),
+            }];
+            self.clamp_scroll();
+            return;
+        }
 
         let mut transcript = Vec::new();
         if self.items.is_empty() {
@@ -767,25 +815,62 @@ impl PaseoAgentPane {
                 *pane.client.lock() = Some(client.clone());
             }
 
-            let snapshot = match resolve_or_create(&client, source).await {
-                Ok(snapshot) => snapshot,
+            if source.agent_id.is_none() && source.provider.is_none() {
+                match client.fetch_agents().await {
+                    Ok(agents) => {
+                        let entries: Vec<PickerEntry> = agents
+                            .into_iter()
+                            .filter(|e| e.agent.archived_at.is_none())
+                            .map(|e| PickerEntry {
+                                id: e.agent.id.clone(),
+                                label: picker_label(&e.agent),
+                            })
+                            .collect();
+                        if let Some(pane) = weak.upgrade() {
+                            pane.enter_picker(entries);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.set_status("Agent (error)".to_string(), Some(format!("{err}")));
+                        }
+                    }
+                }
+                return;
+            }
+
+            match resolve_or_create(&client, source).await {
+                Ok(snapshot) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.load_agent(snapshot);
+                    }
+                }
                 Err(err) => {
                     if let Some(pane) = weak.upgrade() {
                         pane.set_status("Agent (error)".to_string(), Some(format!("{err}")));
                     }
-                    return;
                 }
-            };
-            let agent_id = snapshot.id.clone();
-            let provider = snapshot.provider.clone();
-            let cwd = snapshot.cwd.clone();
-
-            if let Some(pane) = weak.upgrade() {
-                *pane.agent_id.lock() = Some(agent_id.clone());
-                pane.set_status(format!("Agent {}", short_id(&agent_id)), None);
-                pane.set_snapshot(&snapshot);
             }
+        })
+        .detach();
+    }
 
+    fn load_agent(self: &Arc<Self>, snapshot: AgentSnapshot) {
+        let agent_id = snapshot.id.clone();
+        let provider = snapshot.provider.clone();
+        let cwd = snapshot.cwd.clone();
+        *self.agent_id.lock() = Some(agent_id.clone());
+        self.mutate(|state| {
+            state.picker = None;
+            state.title = format!("Agent {}", short_id(&agent_id));
+        });
+        self.set_snapshot(&snapshot);
+
+        let weak = Arc::downgrade(self);
+        let Some(client) = self.client() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
             if !provider.is_empty() {
                 if let Ok(models) = client.list_provider_models(&provider, Some(&cwd)).await {
                     if let Some(pane) = weak.upgrade() {
@@ -839,6 +924,70 @@ impl PaseoAgentPane {
 
             if let Some(pane) = weak.upgrade() {
                 pane.state.lock().dead = true;
+            }
+        })
+        .detach();
+    }
+
+    fn enter_picker(&self, entries: Vec<PickerEntry>) {
+        self.mutate(|state| {
+            state.status_message = None;
+            state.picker = Some(PickerState {
+                entries,
+                selected: 0,
+            });
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_move(&self, delta: isize) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                if picker.entries.is_empty() {
+                    return;
+                }
+                let len = picker.entries.len() as isize;
+                let next = (picker.selected as isize + delta).rem_euclid(len);
+                picker.selected = next as usize;
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_select(&self) {
+        let chosen = {
+            let state = self.state.lock();
+            state
+                .picker
+                .as_ref()
+                .and_then(|p| p.entries.get(p.selected).map(|e| e.id.clone()))
+        };
+        let Some(agent_id) = chosen else {
+            return;
+        };
+        let Some(client) = self.client() else {
+            return;
+        };
+        self.mutate(|state| {
+            state.status_message = Some("⟳ loading agent…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            match client.fetch_agent(&agent_id).await {
+                Ok(snapshot) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.load_agent(snapshot);
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status(
+                            "Agent (error)".to_string(),
+                            Some(format!("load failed: {err}")),
+                        );
+                    }
+                }
             }
         })
         .detach();
@@ -1024,6 +1173,16 @@ impl Pane for PaseoAgentPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        if self.state.lock().picker.is_some() {
+            match key {
+                KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
+                KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
+                KeyCode::Char('\r') | KeyCode::Enter => self.picker_select(),
+                KeyCode::Char('q') | KeyCode::Escape => self.close(),
+                _ => {}
+            }
+            return Ok(());
+        }
         let mode = self.state.lock().mode;
         match mode {
             Mode::Compose => match key {
@@ -1164,6 +1323,7 @@ pub fn open_paseo_agent_pane(
             status_message: Some("⟳ loading agent…".to_string()),
             items: Vec::new(),
             pending: None,
+            picker: None,
             mode: Mode::Scroll,
             composer: String::new(),
             provider: String::new(),
