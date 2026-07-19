@@ -103,7 +103,15 @@ impl PaseoTerminalPane {
             }
             if let Some(pane) = weak.upgrade() {
                 pane.dead.store(true, Ordering::Relaxed);
-                Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
+                let pane_id = pane.pane_id;
+                Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane_id));
+                let mux = Mux::get();
+                match config::configuration().exit_behavior {
+                    config::ExitBehavior::Hold => mux.prune_dead_windows(),
+                    config::ExitBehavior::Close | config::ExitBehavior::CloseOnCleanExit => {
+                        mux.remove_pane(pane_id)
+                    }
+                }
             }
         })
         .detach();
