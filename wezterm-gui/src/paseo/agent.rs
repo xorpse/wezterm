@@ -922,6 +922,13 @@ impl PaseoAgentPane {
                     DaemonEvent::AgentUpsert(snapshot) if snapshot.id == agent_id => {
                         pane.set_snapshot(&snapshot);
                     }
+                    DaemonEvent::Disconnected => {
+                        pane.mutate(|state| {
+                            state.agent_status = "disconnected".to_string();
+                            state.rebuild_rows();
+                        });
+                        break;
+                    }
                     _ => {}
                 }
             }

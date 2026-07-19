@@ -32,4 +32,5 @@ pub enum DaemonEvent {
         terminals: Vec<TerminalInfo>,
     },
     TerminalExit(String),
+    Disconnected,
 }

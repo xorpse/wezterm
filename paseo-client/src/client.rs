@@ -27,6 +27,7 @@ struct Inner {
     events_tx: async_broadcast::Sender<DaemonEvent>,
     _events_keep: async_broadcast::InactiveReceiver<DaemonEvent>,
     terminals: Mutex<HashMap<u8, flume::Sender<TerminalStreamEvent>>>,
+    terminal_slots: Mutex<HashMap<String, u8>>,
     server_info: ServerInfo,
 }
 
@@ -88,6 +89,7 @@ impl PaseoClient {
             events_tx,
             _events_keep: events_rx.deactivate(),
             terminals: Mutex::new(HashMap::new()),
+            terminal_slots: Mutex::new(HashMap::new()),
             server_info,
         });
 
@@ -103,13 +105,17 @@ impl PaseoClient {
     }
 
     pub async fn run(&self) -> Result<()> {
-        loop {
+        let result = loop {
             match self.inner.transport.recv().await {
                 Ok(Some(frame)) => self.dispatch(frame),
-                Ok(None) => return Ok(()),
-                Err(err) => return Err(err),
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
             }
-        }
+        };
+        self.inner.terminals.lock().clear();
+        self.inner.terminal_slots.lock().clear();
+        self.emit(DaemonEvent::Disconnected);
+        result
     }
 
     async fn request(&self, message: Value) -> Result<Value> {
@@ -362,6 +368,10 @@ impl PaseoClient {
 
         let (tx, rx) = flume::unbounded();
         self.inner.terminals.lock().insert(slot, tx);
+        self.inner
+            .terminal_slots
+            .lock()
+            .insert(terminal_id.to_string(), slot);
 
         Ok(TerminalHandle {
             terminal_id: terminal_id.to_string(),
@@ -468,6 +478,9 @@ impl PaseoClient {
             }
             "terminal_stream_exit" => {
                 if let Some(terminal_id) = payload.get("terminalId").and_then(Value::as_str) {
+                    if let Some(slot) = self.inner.terminal_slots.lock().remove(terminal_id) {
+                        self.inner.terminals.lock().remove(&slot);
+                    }
                     self.emit(DaemonEvent::TerminalExit(terminal_id.to_string()));
                 }
             }
