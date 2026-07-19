@@ -111,6 +111,8 @@ wezterm-toast-notification.workspace = true
 wgpu.workspace = true
 window-funcs.workspace = true
 window.workspace = true
+codewandler-markdown = "0.2.1"
+codewandler-markdown-terminal = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 shared_library.workspace = true

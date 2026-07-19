@@ -928,6 +928,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-markdown"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b160a00d412708b2a1f18753cdfafe8ff33dad4be25577d2458286e99716a3d"
+dependencies = [
+ "codewandler-markdown-html",
+ "codewandler-markdown-stream",
+ "codewandler-markdown-terminal",
+]
+
+[[package]]
+name = "codewandler-markdown-html"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5bbbd30ac2fdd2c00c2d2bb20ef953e205513c2612ce166b69b0444dc733c8"
+dependencies = [
+ "codewandler-markdown-stream",
+]
+
+[[package]]
+name = "codewandler-markdown-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fedfd95e3176f60e03c841c0b78ac924e6cc26b9e02272314d30b7e2dc337d7f"
+
+[[package]]
+name = "codewandler-markdown-terminal"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a637ca654633a100f6e56fd9e41cc63b723cf149bc7c6b756bbca4befbf6d94"
+dependencies = [
+ "codewandler-markdown-stream",
+ "unicode-width",
+]
+
+[[package]]
 name = "color-funcs"
 version = "0.1.0"
 dependencies = [
@@ -7291,6 +7327,8 @@ dependencies = [
  "chrono",
  "clap",
  "codec",
+ "codewandler-markdown",
+ "codewandler-markdown-terminal",
  "colorgrad",
  "config",
  "dhat",

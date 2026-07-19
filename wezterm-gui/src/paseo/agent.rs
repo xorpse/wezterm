@@ -62,15 +62,83 @@ fn attr_bold_fg(color: AnsiColor) -> CellAttributes {
     a
 }
 
+#[derive(Clone)]
 struct AgentRow {
     text: String,
     attrs: CellAttributes,
+    line: Option<Line>,
+}
+
+thread_local! {
+    static MD_CACHE: std::cell::RefCell<HashMap<(String, usize), Vec<AgentRow>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+impl AgentRow {
+    fn rendered(line: Line) -> Self {
+        AgentRow {
+            text: String::new(),
+            attrs: attr_default(),
+            line: Some(line),
+        }
+    }
+}
+
+struct NullWriter;
+
+impl std::io::Write for NullWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn markdown_to_lines(md: &str, cols: usize) -> Vec<AgentRow> {
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let key = (trimmed.to_string(), cols);
+    if let Some(cached) = MD_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let width = cols.max(20);
+    let events = markdown::parse(trimmed);
+    let ansi = markdown_terminal::render_with(&events, &markdown_terminal::Theme::default(), width);
+    let rows = (ansi.matches('\n').count() + 2).clamp(1, 4000);
+    let size = TerminalSize {
+        rows,
+        cols: width,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
+    };
+    let config = std::sync::Arc::new(config::TermConfig::new());
+    let mut terminal =
+        wezterm_term::Terminal::new(size, config, "paseo-md", "1.0", Box::new(NullWriter));
+    terminal.advance_bytes(ansi.as_bytes());
+    let mut lines = terminal.screen().lines_in_phys_range(0..rows);
+    while lines.last().is_some_and(|line| line.is_whitespace()) {
+        lines.pop();
+    }
+    let result: Vec<AgentRow> = lines.into_iter().map(AgentRow::rendered).collect();
+    MD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        cache.insert(key, result.clone());
+    });
+    result
 }
 
 fn blank_row() -> AgentRow {
     AgentRow {
         text: String::new(),
         attrs: attr_default(),
+        line: None,
     }
 }
 
@@ -99,6 +167,7 @@ fn push_wrapped(
             rows.push(AgentRow {
                 text: prefix.to_string(),
                 attrs: attrs.clone(),
+                line: None,
             });
             continue;
         }
@@ -112,6 +181,7 @@ fn push_wrapped(
             rows.push(AgentRow {
                 text: format!("{p}{chunk}"),
                 attrs: attrs.clone(),
+                line: None,
             });
             first = false;
             idx = end;
@@ -125,7 +195,7 @@ fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
     let trimmed = text.trim();
     match item.kind.as_str() {
         "user_message" => push_wrapped(&mut rows, "▸ ", trimmed, &attr_fg(AnsiColor::Teal), cols),
-        "assistant_message" => push_wrapped(&mut rows, "", trimmed, &attr_default(), cols),
+        "assistant_message" => rows.extend(markdown_to_lines(trimmed, cols)),
         "reasoning" => push_wrapped(&mut rows, "  ", trimmed, &attr_dim(), cols),
         "error" => push_wrapped(
             &mut rows,
@@ -160,6 +230,7 @@ fn tool_call_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
     rows.push(AgentRow {
         text: format!("{glyph} {name}"),
         attrs: attr_bold_fg(AnsiColor::Blue),
+        line: None,
     });
     if let Some(detail) = &item.detail {
         tool_detail_rows(detail, cols, rows);
@@ -1020,6 +1091,7 @@ impl AgentState {
                     transcript.push(AgentRow {
                         text: truncate_to(&picker.crumbs.join("  ›  "), cols),
                         attrs: attr_dim(),
+                        line: None,
                     });
                     transcript.push(blank_row());
                 }
@@ -1034,6 +1106,7 @@ impl AgentState {
                     transcript.push(AgentRow {
                         text: truncate_to(&format!("{marker}{suggestion}"), cols),
                         attrs,
+                        line: None,
                     });
                 }
                 let hint = if kind.autocompletes() {
@@ -1046,10 +1119,12 @@ impl AgentState {
                     AgentRow {
                         text: format!("❯ {buffer}"),
                         attrs: attr_default(),
+                        line: None,
                     },
                     AgentRow {
                         text: hint.to_string(),
                         attrs: attr_dim(),
+                        line: None,
                     },
                 ];
                 self.clamp_scroll();
@@ -1063,11 +1138,13 @@ impl AgentState {
             transcript.push(AgentRow {
                 text: picker.title.clone(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
+                line: None,
             });
             if !picker.crumbs.is_empty() {
                 transcript.push(AgentRow {
                     text: truncate_to(&picker.crumbs.join("  ›  "), cols),
                     attrs: attr_dim(),
+                    line: None,
                 });
             }
             transcript.push(blank_row());
@@ -1106,6 +1183,7 @@ impl AgentState {
                 transcript.push(AgentRow {
                     text: format!("{prefix}{}", truncate_to(&label, budget)),
                     attrs,
+                    line: None,
                 });
             }
             self.transcript = transcript;
@@ -1113,6 +1191,7 @@ impl AgentState {
                 AgentRow {
                     text: "d again: archive agent  ·  any other key: cancel".to_string(),
                     attrs: attr_fg(AnsiColor::Yellow),
+                    line: None,
                 }
             } else {
                 let tail = if picker.crumbs.is_empty() {
@@ -1127,6 +1206,7 @@ impl AgentState {
                         count
                     ),
                     attrs: attr_dim(),
+                    line: None,
                 }
             }];
 
@@ -1163,6 +1243,7 @@ impl AgentState {
                     text: "⚠ question — [1-9]: pick · i: type your own · n/Esc: dismiss"
                         .to_string(),
                     attrs: attr_fg(AnsiColor::Yellow),
+                    line: None,
                 });
             } else {
                 let title = request
@@ -1225,6 +1306,7 @@ impl AgentState {
                 footer.push(AgentRow {
                     text: truncate_to(&location, cols),
                     attrs: attr_dim(),
+                    line: None,
                 });
             }
             footer.push(AgentRow {
@@ -1237,10 +1319,12 @@ impl AgentState {
                     self.effort_label()
                 ),
                 attrs: attr_fg(AnsiColor::Teal),
+                line: None,
             });
             footer.push(AgentRow {
                 text: "d:diff  t:terminal  ·  m:mode  M:model  e:effort  x:stop".to_string(),
                 attrs: attr_dim(),
+                line: None,
             });
         }
         match self.mode {
@@ -1249,12 +1333,14 @@ impl AgentState {
                     text: "Enter: send  ·  Shift-Enter: newline  ·  ←→↑↓: move  ·  Esc: cancel"
                         .to_string(),
                     attrs: attr_dim(),
+                    line: None,
                 });
                 for (i, line) in self.composer.split('\n').enumerate() {
                     let prefix = if i == 0 { "❯ " } else { "  " };
                     footer.push(AgentRow {
                         text: format!("{prefix}{line}"),
                         attrs: attr_default(),
+                        line: None,
                     });
                 }
             }
@@ -1262,6 +1348,7 @@ impl AgentState {
                 text: "❯ (i: type · j/k · Ctrl-d/u · g/G · d: review · t: terminal · q/Esc: close)"
                     .to_string(),
                 attrs: attr_dim(),
+                line: None,
             }),
         }
         self.footer = footer;
@@ -1294,6 +1381,9 @@ impl AgentState {
             self.footer.get(screen_row - view_rows)
         };
         match row {
+            Some(AgentRow {
+                line: Some(line), ..
+            }) => line.clone(),
             Some(row) => make_line(&row.text, &row.attrs, self.seqno, cols),
             None => make_line("", &CellAttributes::default(), self.seqno, cols),
         }
