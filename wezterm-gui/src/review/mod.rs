@@ -701,9 +701,8 @@ impl ReviewPane {
     }
 
     fn open_editor(&self) {
-        let (is_remote, repo_root, path_str, line) = {
+        let (repo_root, path_str, line) = {
             let s = self.state.lock();
-            let is_remote = matches!(s.source, DiffSource::Paseo { .. });
             let row = match s.rows.get(s.cursor) {
                 Some(r) => r,
                 None => return,
@@ -717,7 +716,6 @@ impl ReviewPane {
             };
             let path = std::path::Path::new(&s.repo_root).join(&anchor.file);
             (
-                is_remote,
                 PathBuf::from(&s.repo_root),
                 path.to_string_lossy().to_string(),
                 anchor.line,
@@ -729,17 +727,7 @@ impl ReviewPane {
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "nvim".to_string());
 
-        let args = if is_remote {
-            vec![
-                "sh".to_string(),
-                "-lc".to_string(),
-                format!("exec \"${{EDITOR:-{editor}}}\" \"+{line}\" \"$1\""),
-                "sh".to_string(),
-                path_str,
-            ]
-        } else {
-            vec![editor, format!("+{line}"), path_str]
-        };
+        let args = vec![editor, format!("+{line}"), path_str];
 
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
