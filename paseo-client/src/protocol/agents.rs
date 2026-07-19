@@ -149,6 +149,15 @@ pub fn fetch_agents_request(request_id: &str) -> Value {
     })
 }
 
+pub fn subscribe_agents_request(request_id: &str, subscription_id: &str) -> Value {
+    json!({
+        "type": "fetch_agents_request",
+        "requestId": request_id,
+        "page": { "limit": 200 },
+        "subscribe": { "subscriptionId": subscription_id }
+    })
+}
+
 pub fn fetch_agent_request(request_id: &str, agent_id: &str) -> Value {
     json!({
         "type": "fetch_agent_request",

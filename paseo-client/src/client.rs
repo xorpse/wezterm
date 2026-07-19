@@ -167,6 +167,13 @@ impl PaseoClient {
         Ok(items)
     }
 
+    pub async fn subscribe_agents(&self) -> Result<()> {
+        let id = new_id();
+        self.request(agents::subscribe_agents_request(&id, "wezterm-paseo"))
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_timeline_subscription(&self, agent_ids: &[String]) -> Result<()> {
         let id = new_id();
         self.request(agents::set_timeline_subscription_request(&id, agent_ids))

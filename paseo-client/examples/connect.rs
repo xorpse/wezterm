@@ -196,20 +196,23 @@ async fn inspect_agent(
             .find(|m| m.id != current)
             .map(|m| m.id.clone())
             .unwrap();
-        println!("setting mode {current:?} -> {next}");
+        println!("subscribing to agent updates, then setting mode {current:?} -> {next}");
+        let mut events = client.events();
+        client.subscribe_agents().await?;
         client.set_agent_mode(&agent_id, &next).await?;
-        println!("set_agent_mode returned ok");
-        smol::Timer::after(Duration::from_millis(800)).await;
-        let after = client.fetch_agent(&agent_id).await?;
-        println!(
-            "  re-fetched: mode={:?} (expected {next}) — {}",
-            after.current_mode_id,
-            if after.current_mode_id.as_deref() == Some(next.as_str()) {
-                "APPLIED"
-            } else {
-                "NOT applied (deferred or rejected)"
+        let collect = async {
+            while let Ok(event) = events.recv().await {
+                if let paseo_client::DaemonEvent::AgentUpsert(s) = event {
+                    if s.id == agent_id {
+                        println!("  agent_update PUSH received: mode={:?}", s.current_mode_id);
+                    }
+                }
             }
-        );
+        };
+        let timer = async {
+            smol::Timer::after(Duration::from_secs(4)).await;
+        };
+        smol::future::or(collect, timer).await;
     }
     Ok(())
 }

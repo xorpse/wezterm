@@ -815,6 +815,8 @@ impl PaseoAgentPane {
                 *pane.client.lock() = Some(client.clone());
             }
 
+            let _ = client.subscribe_agents().await;
+
             if source.agent_id.is_none() && source.provider.is_none() {
                 match client.fetch_agents().await {
                     Ok(agents) => {
