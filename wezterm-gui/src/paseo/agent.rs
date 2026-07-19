@@ -298,8 +298,16 @@ enum PickerStage {
     },
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PickerKind {
+    Hub,
+    Connections,
+    Providers,
+}
+
 struct PickerState {
     title: String,
+    kind: PickerKind,
     groups: Vec<PickerGroup>,
     selected: usize,
     stage: PickerStage,
@@ -705,7 +713,7 @@ impl AgentState {
             self.transcript = transcript;
             self.footer = vec![AgentRow {
                 text: format!(
-                    "❯ {}/{}  ·  Enter: open/expand · j/k · PgUp/PgDn · g/G · q: close",
+                    "❯ {}/{}  ·  Enter · j/k · o:fold · r:refresh · g/G · q: close",
                     (selected + 1).min(count.max(1)),
                     count
                 ),
@@ -779,8 +787,7 @@ impl AgentState {
                 attrs: attr_default(),
             },
             Mode::Scroll => AgentRow {
-                text: "❯ (i: type · j/k: scroll · g/G: top/bottom · d: review · q: close)"
-                    .to_string(),
+                text: "❯ (i: type · j/k · Ctrl-d/u · g/G · d: review · q/Esc: close)".to_string(),
                 attrs: attr_dim(),
             },
         };
@@ -1337,6 +1344,7 @@ impl PaseoAgentPane {
         let selected = first_entry_row(&groups);
         self.enter_picker(
             "Paseo — connect to a daemon".to_string(),
+            PickerKind::Connections,
             groups,
             None,
             selected,
@@ -1344,12 +1352,13 @@ impl PaseoAgentPane {
     }
 
     fn enter_hub(&self, title: String, groups: Vec<PickerGroup>) {
-        self.enter_picker(title, groups, None, 0);
+        self.enter_picker(title, PickerKind::Hub, groups, None, 0);
     }
 
     fn enter_picker(
         &self,
         title: String,
+        kind: PickerKind,
         groups: Vec<PickerGroup>,
         pending: Option<PendingCreate>,
         selected: usize,
@@ -1360,6 +1369,7 @@ impl PaseoAgentPane {
             state.scroll = 0;
             state.picker = Some(PickerState {
                 title,
+                kind,
                 groups,
                 selected,
                 stage: PickerStage::Browse,
@@ -1405,6 +1415,7 @@ impl PaseoAgentPane {
                     let selected = first_entry_row(&groups);
                     pane.enter_picker(
                         "Choose the agent to run".to_string(),
+                        PickerKind::Providers,
                         groups,
                         Some(pending),
                         selected,
@@ -1464,6 +1475,79 @@ impl PaseoAgentPane {
             }
             state.rebuild_rows();
         });
+    }
+
+    fn picker_fold(&self) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                let group_idx = match picker.visible_rows().get(picker.selected) {
+                    Some(PickerRow::Header(gi)) | Some(PickerRow::Entry(gi, _)) => Some(*gi),
+                    None => None,
+                };
+                if let Some(gi) = group_idx {
+                    if let Some(group) = picker.groups.get_mut(gi) {
+                        group.collapsed = !group.collapsed;
+                    }
+                    let max = picker.visible_rows().len().saturating_sub(1);
+                    picker.selected = picker.selected.min(max);
+                }
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn set_picker_groups(&self, groups: Vec<PickerGroup>) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                picker.groups = groups;
+                let max = picker.visible_rows().len().saturating_sub(1);
+                picker.selected = picker.selected.min(max);
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_refresh(self: &Arc<Self>) {
+        let kind = self.state.lock().picker.as_ref().map(|p| p.kind);
+        match kind {
+            Some(PickerKind::Hub) => self.refresh_hub(),
+            Some(PickerKind::Connections) => self.set_picker_groups(build_connection_groups()),
+            _ => {}
+        }
+    }
+
+    fn refresh_hub(self: &Arc<Self>) {
+        let expanded: Vec<String> = self
+            .state
+            .lock()
+            .picker
+            .as_ref()
+            .map(|p| {
+                p.groups
+                    .iter()
+                    .filter(|g| !g.collapsed)
+                    .map(|g| g.label.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(client) = self.client() else {
+            return;
+        };
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let agents = client.fetch_agents().await.unwrap_or_default();
+            let workspaces = client.fetch_workspaces().await.unwrap_or_default();
+            let mut groups = build_picker_groups(agents, workspaces);
+            for group in &mut groups {
+                if expanded.iter().any(|label| label == &group.label) {
+                    group.collapsed = false;
+                }
+            }
+            if let Some(pane) = weak.upgrade() {
+                pane.set_picker_groups(groups);
+            }
+        })
+        .detach();
     }
 
     fn picker_input_char(&self, c: char) {
@@ -2007,13 +2091,22 @@ impl Pane for PaseoAgentPane {
                     _ => {}
                 }
             } else {
+                let ctrl = mods.contains(KeyModifiers::CTRL);
                 match key {
                     KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
                     KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
+                    KeyCode::Char('d') if ctrl => self.picker_page(1),
+                    KeyCode::Char('u') if ctrl => self.picker_page(-1),
                     KeyCode::PageDown => self.picker_page(1),
                     KeyCode::PageUp => self.picker_page(-1),
                     KeyCode::Char('g') | KeyCode::Home => self.picker_to(false),
                     KeyCode::Char('G') | KeyCode::End => self.picker_to(true),
+                    KeyCode::Char('o') | KeyCode::Char('\t') | KeyCode::Tab => self.picker_fold(),
+                    KeyCode::Char('r') => {
+                        if let Some(pane) = self.arc() {
+                            pane.picker_refresh();
+                        }
+                    }
                     KeyCode::Char('\r') | KeyCode::Enter => {
                         if let Some(pane) = self.arc() {
                             pane.picker_select();
@@ -2052,8 +2145,10 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll_to_bottom();
                 }
+                KeyCode::Char('d') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(1),
+                KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
                 KeyCode::Char('d') => self.open_review(),
-                KeyCode::Char('q') => self.close(),
+                KeyCode::Char('q') | KeyCode::Escape => self.close(),
                 KeyCode::Char('y') => self.respond_permission(true),
                 KeyCode::Char('n') => self.respond_permission(false),
                 KeyCode::Char('x') => self.stop(),
