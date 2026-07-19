@@ -192,6 +192,7 @@ impl PaseoClient {
         &self,
         cwd: &str,
         mode: &str,
+        base_ref: Option<&str>,
     ) -> Result<crate::protocol::diff::CheckoutDiff> {
         let id = new_id();
         let subscription_id = new_id();
@@ -201,9 +202,21 @@ impl PaseoClient {
                 &subscription_id,
                 cwd,
                 mode,
+                base_ref,
             ))
             .await?;
         Ok(diff::parse_checkout_diff(&payload))
+    }
+
+    pub async fn checkout_status(
+        &self,
+        cwd: &str,
+    ) -> Result<crate::protocol::diff::CheckoutStatus> {
+        let id = new_id();
+        let payload = self
+            .request(diff::checkout_status_request(&id, cwd))
+            .await?;
+        Ok(diff::parse_checkout_status(&payload))
     }
 
     pub async fn unsubscribe_checkout_diff(&self, subscription_id: &str) -> Result<()> {

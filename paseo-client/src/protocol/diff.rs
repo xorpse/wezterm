@@ -64,19 +64,45 @@ pub struct CheckoutError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutStatus {
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub current_branch: Option<String>,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub is_dirty: Option<bool>,
+}
+
 pub fn subscribe_checkout_diff_request(
     request_id: &str,
     subscription_id: &str,
     cwd: &str,
     mode: &str,
+    base_ref: Option<&str>,
 ) -> Value {
+    let mut compare = json!({ "mode": mode });
+    if let Some(base_ref) = base_ref {
+        compare["baseRef"] = Value::from(base_ref);
+    }
     json!({
         "type": "subscribe_checkout_diff_request",
         "subscriptionId": subscription_id,
         "cwd": cwd,
-        "compare": { "mode": mode },
+        "compare": compare,
         "requestId": request_id
     })
+}
+
+pub fn checkout_status_request(request_id: &str, cwd: &str) -> Value {
+    json!({ "type": "checkout_status_request", "cwd": cwd, "requestId": request_id })
+}
+
+pub fn parse_checkout_status(payload: &Value) -> CheckoutStatus {
+    serde_json::from_value(payload.clone()).unwrap_or_default()
 }
 
 pub fn unsubscribe_checkout_diff_request(subscription_id: &str) -> Value {

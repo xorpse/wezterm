@@ -15,7 +15,7 @@ pub use offer::{parse_offer_url, ConnectionOffer};
 pub use protocol::agents::{
     AgentListEntry, AgentMode, ModelDefinition, PermissionRequest, PermissionResponse, SelectOption,
 };
-pub use protocol::diff::{CheckoutDiff, DiffFile, DiffHunk, DiffLine};
+pub use protocol::diff::{CheckoutDiff, CheckoutStatus, DiffFile, DiffHunk, DiffLine};
 pub use protocol::stream::AgentStreamEvent;
 pub use protocol::terminals::CreateTerminalOpts;
 pub use protocol::timeline::{TimelineItem, ToolCallDetail};

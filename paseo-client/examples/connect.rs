@@ -393,8 +393,15 @@ async fn create_probe(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
 }
 
 async fn probe_diff(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
+    let status = client.checkout_status(cwd).await?;
+    println!(
+        "checkout_status: repoRoot={:?} branch={:?} baseRef={:?} dirty={:?}",
+        status.repo_root, status.current_branch, status.base_ref, status.is_dirty
+    );
     println!("subscribing to uncommitted diff for {cwd}");
-    let diff = client.subscribe_checkout_diff(cwd, "uncommitted").await?;
+    let diff = client
+        .subscribe_checkout_diff(cwd, "uncommitted", None)
+        .await?;
     println!(
         "subscription {} — {} file(s)",
         diff.subscription_id,

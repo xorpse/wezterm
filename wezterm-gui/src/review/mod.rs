@@ -8,6 +8,9 @@ use git_review::{
     compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, DiffLimits,
     DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
+use paseo_client::PaseoClient;
+
+mod paseo_source;
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -207,10 +210,22 @@ enum FileLoad {
     Failed(String),
 }
 
+#[derive(Clone)]
+enum DiffSource {
+    LocalGit(Host),
+    Paseo { client: PaseoClient, cwd: String },
+}
+
+impl DiffSource {
+    fn is_local(&self) -> bool {
+        matches!(self, DiffSource::LocalGit(host) if host.is_local())
+    }
+}
+
 struct ReviewState {
     status: LoadStatus,
     mode: DiffMode,
-    host: Host,
+    source: DiffSource,
     repo_root: String,
     branch: Option<String>,
     data: Option<GitDiffData>,
@@ -688,7 +703,7 @@ impl ReviewPane {
     fn open_editor(&self) {
         let (repo_root, path_str, line) = {
             let s = self.state.lock();
-            if !s.host.is_local() {
+            if !s.source.is_local() {
                 return;
             }
             let row = match s.rows.get(s.cursor) {
@@ -936,7 +951,7 @@ impl ReviewPane {
     }
 
     fn spawn_compute(pane: Arc<ReviewPane>, reset_view: bool) {
-        let (host, start, mode, seq, is_initial) = {
+        let (source, start, mode, seq, is_initial) = {
             let mut s = pane.state.lock();
             s.compute_started = Some(Instant::now());
             let is_initial = s.data.is_none();
@@ -944,7 +959,7 @@ impl ReviewPane {
                 s.status = LoadStatus::Loading;
             }
             (
-                s.host.clone(),
+                s.source.clone(),
                 s.repo_root.clone(),
                 s.mode.clone(),
                 s.compute_seq,
@@ -956,55 +971,76 @@ impl ReviewPane {
             Self::spawn_loading_ticker(pane.clone(), seq);
         }
 
-        std::thread::spawn(move || {
-            let result = (|| {
-                let root = find_repo_root(&host, &start)?;
-                let branch = current_branch(&host, &root);
-                let data = compute_diff(&host, &root, &mode, &DiffLimits::default())?;
-                Ok::<_, anyhow::Error>((root, branch, data))
-            })();
+        match source {
+            DiffSource::LocalGit(host) => {
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let root = find_repo_root(&host, &start)?;
+                        let branch = current_branch(&host, &root);
+                        let data = compute_diff(&host, &root, &mode, &DiffLimits::default())?;
+                        Ok::<_, anyhow::Error>((root, branch, data))
+                    })();
+                    let message = match (&result, &host) {
+                        (Err(_), Host::Ssh(remote)) => Some(format!(
+                            "Review requires a local git repository; this pane's working directory is on {remote}."
+                        )),
+                        _ => None,
+                    };
+                    Self::apply_compute_result(&pane, seq, reset_view, mode, result, message);
+                });
+            }
+            DiffSource::Paseo { client, cwd } => {
+                promise::spawn::spawn(async move {
+                    let result = paseo_source::fetch(client, cwd, mode.clone()).await;
+                    Self::apply_compute_result(&pane, seq, reset_view, mode, result, None);
+                })
+                .detach();
+            }
+        }
+    }
 
-            {
-                let mut state = pane.state.lock();
-                if state.compute_seq != seq {
-                    return;
-                }
-                match result {
-                    Ok((root, branch, data)) => {
-                        state.repo_root = root;
-                        state.branch = branch;
-                        state.cache.insert(mode.clone(), data.clone());
-                        if reset_view {
-                            state.collapsed =
-                                data.files.iter().map(|f| f.file_path.clone()).collect();
-                            state.cursor = 0;
-                            state.scroll = 0;
-                            state.file_loads.clear();
-                        }
-                        state.data = Some(data);
-                        state.status = LoadStatus::Ready;
-                        if !reset_view {
-                            state.reanchor_annotations();
-                        }
-                        state.rebuild_rows();
-                    }
-                    Err(err) => {
-                        let msg = match &host {
-                            Host::Ssh(remote) => format!(
-                                "Review requires a local git repository; this pane's working directory is on {remote}."
-                            ),
-                            Host::Local => format!("error: {err:#}"),
-                        };
-                        state.rows = vec![RenderRow::plain(msg.clone(), RowKind::Info)];
-                        state.status = LoadStatus::Error(msg);
+    fn apply_compute_result(
+        pane: &Arc<ReviewPane>,
+        seq: u64,
+        reset_view: bool,
+        mode: DiffMode,
+        result: anyhow::Result<(String, Option<String>, GitDiffData)>,
+        error_override: Option<String>,
+    ) {
+        {
+            let mut state = pane.state.lock();
+            if state.compute_seq != seq {
+                return;
+            }
+            match result {
+                Ok((root, branch, data)) => {
+                    state.repo_root = root;
+                    state.branch = branch;
+                    state.cache.insert(mode.clone(), data.clone());
+                    if reset_view {
+                        state.collapsed = data.files.iter().map(|f| f.file_path.clone()).collect();
                         state.cursor = 0;
                         state.scroll = 0;
+                        state.file_loads.clear();
                     }
+                    state.data = Some(data);
+                    state.status = LoadStatus::Ready;
+                    if !reset_view {
+                        state.reanchor_annotations();
+                    }
+                    state.rebuild_rows();
                 }
-                state.seqno += 1;
+                Err(err) => {
+                    let msg = error_override.unwrap_or_else(|| format!("error: {err:#}"));
+                    state.rows = vec![RenderRow::plain(msg.clone(), RowKind::Info)];
+                    state.status = LoadStatus::Error(msg);
+                    state.cursor = 0;
+                    state.scroll = 0;
+                }
             }
-            pane.window.invalidate();
-        });
+            state.seqno += 1;
+        }
+        pane.window.invalidate();
     }
 
     fn spawn_loading_ticker(pane: Arc<ReviewPane>, seq: u64) {
@@ -1032,16 +1068,34 @@ impl ReviewPane {
     }
 
     fn spawn_file_load(pane: Arc<ReviewPane>, path: String, status: GitFileStatus) {
+        let (source, repo, mode, seq) = {
+            let s = pane.state.lock();
+            (
+                s.source.clone(),
+                s.repo_root.clone(),
+                s.mode.clone(),
+                s.compute_seq,
+            )
+        };
+
+        let host = match source {
+            DiffSource::LocalGit(host) => host,
+            DiffSource::Paseo { .. } => {
+                let mut s = pane.state.lock();
+                if s.compute_seq == seq {
+                    s.file_loads.insert(
+                        path.clone(),
+                        FileLoad::Failed("file too large to display over the daemon".to_string()),
+                    );
+                    s.seqno += 1;
+                    s.rebuild_rows();
+                }
+                pane.window.invalidate();
+                return;
+            }
+        };
+
         std::thread::spawn(move || {
-            let (host, repo, mode, seq) = {
-                let s = pane.state.lock();
-                (
-                    s.host.clone(),
-                    s.repo_root.clone(),
-                    s.mode.clone(),
-                    s.compute_seq,
-                )
-            };
             let result = compute_file_diff(
                 &host,
                 &repo,
@@ -1480,7 +1534,7 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
         .clone()
         .ok_or_else(|| anyhow!("no window handle"))?;
 
-    let (host, start_path) = resolve_source_location(&source);
+    let (diff_source, start_path) = resolve_source_location(&source);
 
     let review = Arc::new(ReviewPane {
         pane_id: alloc_pane_id(),
@@ -1491,7 +1545,7 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
         state: Mutex::new(ReviewState {
             status: LoadStatus::Loading,
             mode: config_mode_to_diff(&args.mode),
-            host,
+            source: diff_source,
             repo_root: start_path,
             branch: None,
             data: None,
@@ -1550,7 +1604,35 @@ fn is_local_host(host: &str) -> bool {
     }
 }
 
-fn resolve_source_location(source: &Arc<dyn Pane>) -> (Host, String) {
+fn source_cwd(source: &Arc<dyn Pane>) -> Option<String> {
+    let url = source.get_current_working_dir(CachePolicy::FetchImmediate)?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    Some(
+        percent_decode_str(url.path())
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
+fn resolve_source_location(source: &Arc<dyn Pane>) -> (DiffSource, String) {
+    if let Some(domain) = Mux::get().get_domain(source.domain_id()) {
+        if let Some(paseo) = domain.downcast_ref::<paseo_mux::PaseoDomain>() {
+            if let Some(client) = paseo.client() {
+                if let Some(cwd) = source_cwd(source).filter(|c| !c.is_empty()) {
+                    return (
+                        DiffSource::Paseo {
+                            client,
+                            cwd: cwd.clone(),
+                        },
+                        cwd,
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(url) = source.get_current_working_dir(CachePolicy::FetchImmediate) {
         if url.scheme() == "file" {
             let host = url.host_str().unwrap_or("");
@@ -1558,16 +1640,16 @@ fn resolve_source_location(source: &Arc<dyn Pane>) -> (Host, String) {
                 .decode_utf8_lossy()
                 .into_owned();
             if is_local_host(host) {
-                return (Host::Local, path);
+                return (DiffSource::LocalGit(Host::Local), path);
             }
-            return (Host::Ssh(host.to_string()), path);
+            return (DiffSource::LocalGit(Host::Ssh(host.to_string())), path);
         }
     }
     let fallback = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    (Host::Local, fallback)
+    (DiffSource::LocalGit(Host::Local), fallback)
 }
 
 impl Pane for ReviewPane {
@@ -1901,7 +1983,7 @@ impl Pane for ReviewPane {
 
     fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
         let state = self.state.lock();
-        if !state.host.is_local() {
+        if !state.source.is_local() {
             return None;
         }
         Url::from_directory_path(&state.repo_root).ok()
