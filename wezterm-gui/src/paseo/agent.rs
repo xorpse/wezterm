@@ -267,6 +267,7 @@ struct AgentState {
     composer: String,
     provider: String,
     agent_status: String,
+    requires_attention: bool,
     model: Option<String>,
     current_mode_id: Option<String>,
     available_modes: Vec<AgentMode>,
@@ -580,6 +581,7 @@ impl PaseoAgentPane {
             state.current_mode_id = snapshot.current_mode_id.clone();
             state.available_modes = snapshot.available_modes.clone();
             state.thinking_option_id = snapshot.thinking_option_id.clone();
+            state.requires_attention = snapshot.requires_attention;
             state.rebuild_rows();
         });
     }
@@ -1144,7 +1146,17 @@ impl Pane for PaseoAgentPane {
     }
 
     fn get_title(&self) -> String {
-        self.state.lock().title.clone()
+        let state = self.state.lock();
+        let glyph = if state.pending.is_some() || state.requires_attention {
+            "⚠ "
+        } else {
+            match state.agent_status.as_str() {
+                "running" => "● ",
+                "error" => "✗ ",
+                _ => "",
+            }
+        };
+        format!("{glyph}{}", state.title)
     }
 
     fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
@@ -1330,6 +1342,7 @@ pub fn open_paseo_agent_pane(
             composer: String::new(),
             provider: String::new(),
             agent_status: String::new(),
+            requires_attention: false,
             model: None,
             current_mode_id: None,
             available_modes: Vec::new(),
