@@ -8,7 +8,7 @@ use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::PaseoClient;
 use portable_pty::CommandBuilder;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
 
@@ -31,6 +31,7 @@ pub struct PaseoDomain {
     client: Mutex<Option<PaseoClient>>,
     state: Mutex<DomainState>,
     attached_terminals: Mutex<HashSet<String>>,
+    projects: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl PaseoDomain {
@@ -42,6 +43,7 @@ impl PaseoDomain {
             client: Mutex::new(None),
             state: Mutex::new(DomainState::Detached),
             attached_terminals: Mutex::new(HashSet::new()),
+            projects: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -51,6 +53,10 @@ impl PaseoDomain {
 
     pub fn client(&self) -> Option<PaseoClient> {
         self.client.lock().clone()
+    }
+
+    pub fn project_for_cwd(&self, cwd: &str) -> Option<String> {
+        self.projects.lock().get(cwd).cloned()
     }
 
     pub async fn ensure_client(&self) -> anyhow::Result<PaseoClient> {
@@ -63,6 +69,21 @@ impl PaseoDomain {
             let client = client.clone();
             promise::spawn::spawn(async move {
                 let _ = client.run().await;
+            })
+            .detach();
+        }
+        {
+            let client = client.clone();
+            let projects = self.projects.clone();
+            promise::spawn::spawn(async move {
+                if let Ok(workspaces) = client.fetch_workspaces().await {
+                    let mut map = projects.lock();
+                    for ws in workspaces {
+                        if !ws.project_display_name.is_empty() {
+                            map.insert(ws.cwd().to_string(), ws.project_display_name.clone());
+                        }
+                    }
+                }
             })
             .detach();
         }

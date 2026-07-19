@@ -294,10 +294,10 @@ impl crate::TermWindow {
                     &metrics,
                     &self.config,
                 ),
-                TabBarItem::GroupHeader { .. } => {
+                TabBarItem::GroupHeader { .. } | TabBarItem::ProjectHeader { .. } => {
                     let inactive = colors.inactive_tab();
                     element
-                        .item_type(UIItemType::TabBar(TabBarItem::None))
+                        .item_type(UIItemType::TabBar(item.item))
                         .line_height(Some(1.4))
                         .vertical_align(VerticalAlign::Middle)
                         .margin(BoxDimension {

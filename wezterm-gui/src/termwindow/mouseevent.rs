@@ -563,10 +563,20 @@ impl super::TermWindow {
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
-                TabBarItem::None
-                | TabBarItem::LeftStatus
-                | TabBarItem::RightStatus
-                | TabBarItem::GroupHeader { .. } => {
+                TabBarItem::GroupHeader { domain_id } => {
+                    crate::tabbar::toggle_tab_group(domain_id, None);
+                    self.invalidate_fancy_tab_bar();
+                    self.update_title();
+                }
+                TabBarItem::ProjectHeader {
+                    domain_id,
+                    project_hash,
+                } => {
+                    crate::tabbar::toggle_tab_group(domain_id, Some(project_hash));
+                    self.invalidate_fancy_tab_bar();
+                    self.update_title();
+                }
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -620,6 +630,7 @@ impl super::TermWindow {
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
                 | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
@@ -633,13 +644,15 @@ impl super::TermWindow {
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
                 | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
-                | TabBarItem::GroupHeader { .. } => {
+                | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. } => {
                     context.set_window_drag_position(event.screen_coords);
                 }
                 TabBarItem::WindowButton(window::IntegratedTitleButton::Maximize) => {

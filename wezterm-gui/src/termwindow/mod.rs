@@ -208,6 +208,19 @@ pub struct PaneState {
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
 }
 
+fn paseo_tab_project(pane: &Arc<dyn Pane>) -> Option<String> {
+    let domain = Mux::get().get_domain(pane.domain_id())?;
+    let paseo = domain.downcast_ref::<paseo_mux::PaseoDomain>()?;
+    let url = pane.get_current_working_dir(CachePolicy::FetchImmediate)?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = percent_encoding::percent_decode_str(url.path())
+        .decode_utf8_lossy()
+        .into_owned();
+    paseo.project_for_cwd(&path)
+}
+
 /// Data used when synchronously formatting pane and window titles
 #[derive(Debug, Clone)]
 pub struct TabInformation {
@@ -219,6 +232,7 @@ pub struct TabInformation {
     pub window_id: MuxWindowId,
     pub tab_title: String,
     pub domain_id: Option<mux::domain::DomainId>,
+    pub project: Option<String>,
 }
 
 impl UserData for TabInformation {
@@ -3513,6 +3527,11 @@ impl TermWindow {
             .enumerate()
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
+                let active_pane = tab.get_active_pane();
+                let domain_id = active_pane.as_ref().map(|p| p.domain_id());
+                let project = active_pane
+                    .as_ref()
+                    .and_then(|pane| paseo_tab_project(pane));
 
                 TabInformation {
                     tab_index: idx,
@@ -3528,7 +3547,8 @@ impl TermWindow {
                         .iter()
                         .find(|p| p.is_active)
                         .map(Self::pos_pane_to_pane_info),
-                    domain_id: tab.get_active_pane().map(|p| p.domain_id()),
+                    domain_id,
+                    project,
                 }
             })
             .collect()
