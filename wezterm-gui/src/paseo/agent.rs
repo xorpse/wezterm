@@ -1039,6 +1039,8 @@ struct AgentState {
     mode: Mode,
     composer: String,
     composer_cursor: usize,
+    slash_selected: usize,
+    slash_dismissed: bool,
     provider: String,
     agent_status: String,
     requires_attention: bool,
@@ -1095,6 +1097,30 @@ impl AgentState {
         out
     }
 
+    fn slash_query(&self) -> Option<&str> {
+        if self.mode != Mode::Compose || self.slash_dismissed {
+            return None;
+        }
+        let composer = &self.composer;
+        if !composer.starts_with('/') || composer.chars().any(|c| c.is_whitespace()) {
+            return None;
+        }
+        Some(&composer[1..])
+    }
+
+    fn filtered_slash(&self) -> Vec<usize> {
+        let Some(query) = self.slash_query() else {
+            return Vec::new();
+        };
+        let q = query.to_lowercase();
+        self.slash_commands
+            .iter()
+            .enumerate()
+            .filter(|(_, cmd)| cmd.name.to_lowercase().starts_with(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn composer_char_len(&self) -> usize {
         self.composer.chars().count()
     }
@@ -1111,6 +1137,8 @@ impl AgentState {
         let offset = self.composer_byte_offset(cursor);
         self.composer.insert(offset, c);
         self.composer_cursor = cursor + 1;
+        self.slash_dismissed = false;
+        self.slash_selected = 0;
     }
 
     fn composer_backspace(&mut self) {
@@ -1489,12 +1517,43 @@ impl AgentState {
         }
         match self.mode {
             Mode::Compose => {
-                footer.push(AgentRow {
-                    text: "Enter: send  ·  Shift-Enter: newline  ·  ←→↑↓: move  ·  Esc: cancel"
-                        .to_string(),
-                    attrs: attr_dim(),
-                    line: None,
-                });
+                let filtered = self.filtered_slash();
+                if !filtered.is_empty() {
+                    let selected = self.slash_selected.min(filtered.len() - 1);
+                    for (row, &cmd_idx) in filtered.iter().enumerate().take(8) {
+                        let cmd = &self.slash_commands[cmd_idx];
+                        let marker = if row == selected { "❯ " } else { "  " };
+                        let hint = if cmd.argument_hint.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", cmd.argument_hint)
+                        };
+                        footer.push(AgentRow {
+                            text: truncate_to(
+                                &format!("{marker}/{}{hint}   {}", cmd.name, cmd.description),
+                                cols,
+                            ),
+                            attrs: if row == selected {
+                                attr_bold_fg(AnsiColor::Teal)
+                            } else {
+                                attr_dim()
+                            },
+                            line: None,
+                        });
+                    }
+                    footer.push(AgentRow {
+                        text: "↑/↓ select  ·  Tab/Enter insert  ·  Esc dismiss".to_string(),
+                        attrs: attr_dim(),
+                        line: None,
+                    });
+                } else {
+                    footer.push(AgentRow {
+                        text: "Enter: send  ·  Shift-Enter: newline  ·  ←→↑↓: move  ·  Esc: cancel"
+                            .to_string(),
+                        attrs: attr_dim(),
+                        line: None,
+                    });
+                }
                 for (i, line) in self.composer.split('\n').enumerate() {
                     let prefix = if i == 0 { "❯ " } else { "  " };
                     footer.push(AgentRow {
@@ -1787,6 +1846,38 @@ impl PaseoAgentPane {
             }
         })
         .detach();
+    }
+
+    fn slash_active(&self) -> bool {
+        !self.state.lock().filtered_slash().is_empty()
+    }
+
+    fn slash_move(&self, delta: isize) {
+        self.mutate(|state| {
+            let len = state.filtered_slash().len();
+            if len > 0 {
+                state.slash_selected =
+                    (state.slash_selected as isize + delta).rem_euclid(len as isize) as usize;
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn slash_accept(&self) {
+        self.mutate(|state| {
+            let filtered = state.filtered_slash();
+            if filtered.is_empty() {
+                return;
+            }
+            let sel = state.slash_selected.min(filtered.len() - 1);
+            if let Some(cmd) = state.slash_commands.get(filtered[sel]) {
+                state.composer = format!("/{} ", cmd.name);
+                state.composer_cursor = state.composer_char_len();
+                state.slash_dismissed = true;
+                state.slash_selected = 0;
+            }
+            state.rebuild_rows();
+        });
     }
 
     fn toggle_feature(&self, index: usize) {
@@ -2153,6 +2244,12 @@ impl PaseoAgentPane {
                     if let Some(pane) = weak.upgrade() {
                         pane.set_models(models);
                     }
+                }
+            }
+
+            if let Ok(commands) = client.list_commands(&agent_id).await {
+                if let Some(pane) = weak.upgrade() {
+                    pane.mutate(|state| state.slash_commands = commands);
                 }
             }
 
@@ -3602,6 +3699,14 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll_to_bottom();
                 }
+                KeyCode::Char('\t') | KeyCode::Tab if self.slash_active() => self.slash_accept(),
+                KeyCode::Char('\r') | KeyCode::Enter if self.slash_active() => self.slash_accept(),
+                KeyCode::UpArrow if self.slash_active() => self.slash_move(-1),
+                KeyCode::DownArrow if self.slash_active() => self.slash_move(1),
+                KeyCode::Escape if self.slash_active() => self.mutate(|state| {
+                    state.slash_dismissed = true;
+                    state.rebuild_rows();
+                }),
                 KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(),
                 KeyCode::Backspace => self.mutate(|state| {
                     state.composer_backspace();
@@ -3826,6 +3931,8 @@ pub fn open_paseo_agent_pane(
             mode: Mode::Scroll,
             composer: String::new(),
             composer_cursor: 0,
+            slash_selected: 0,
+            slash_dismissed: false,
             provider: String::new(),
             agent_status: String::new(),
             requires_attention: false,
