@@ -90,6 +90,7 @@ impl crate::TermWindow {
             .into(),
         };
 
+        let is_vertical = self.resolved_tab_bar_placement().is_vertical();
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
 
@@ -254,7 +255,11 @@ impl crate::TermWindow {
                         let bg = bg_color
                             .unwrap_or_else(|| inactive_tab.bg_color.into())
                             .to_linear();
-                        let edge = colors.inactive_tab_edge().to_linear();
+                        let edge = if is_vertical {
+                            bg
+                        } else {
+                            colors.inactive_tab_edge().to_linear()
+                        };
                         ElementColors {
                             border: BorderColor {
                                 left: bg,
@@ -387,6 +392,7 @@ impl crate::TermWindow {
             use config::TabBarPlacement;
             let collapsed = self.tab_bar_collapsed;
             let strip_width = self.vertical_tab_bar_width();
+            let tab_gutter = metrics.cell_size.width as f32 * 0.4;
             let border = self.get_os_border();
 
             let mut col: Vec<Element> = vec![];
@@ -409,6 +415,48 @@ impl crate::TermWindow {
                 }
             }
 
+            let query = self.tab_search_query.trim().to_lowercase();
+            let filtering = self.config.tab_bar_search && !query.is_empty();
+            let mut match_count = 0usize;
+
+            if self.config.tab_bar_search && !collapsed {
+                let is_placeholder = self.tab_search_query.is_empty() && !self.tab_search_active;
+                let shown = if is_placeholder {
+                    " \u{f002}  \u{2026}".to_string()
+                } else if self.tab_search_active {
+                    format!(" \u{f002}  {}\u{258f}", self.tab_search_query)
+                } else {
+                    format!(" \u{f002}  {}", self.tab_search_query)
+                };
+                let base_fg = colors.inactive_tab().fg_color.to_linear();
+                let text_color = if is_placeholder {
+                    base_fg.mul_alpha(0.5)
+                } else {
+                    base_fg
+                };
+                let inner = Element::new(&font, ElementContent::Text(shown))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: text_color.into(),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.25),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)));
+                col.push(
+                    Element::new(&font, ElementContent::Children(vec![inner]))
+                        .display(DisplayType::Block)
+                        .item_type(UIItemType::TabSearch)
+                        .min_width(Some(Dimension::Pixels((strip_width - tab_gutter).max(0.))))
+                        .max_width(Some(Dimension::Pixels((strip_width - tab_gutter).max(0.))))
+                        .colors(bar_colors.clone()),
+                );
+            }
+
             for item in items {
                 if collapsed {
                     break;
@@ -418,6 +466,20 @@ impl crate::TermWindow {
                     TabBarItem::WindowButton(_) | TabBarItem::NewTabButton
                 ) {
                     continue;
+                }
+                if filtering {
+                    if let TabBarItem::Tab { tab_idx, .. } = item.item {
+                        let title_hit = item.title.as_str().to_lowercase().contains(&query);
+                        let content_hit = title_hit
+                            || self
+                                .tab_search_content(tab_idx)
+                                .map(|c| c.to_lowercase().contains(&query))
+                                .unwrap_or(false);
+                        if !content_hit {
+                            continue;
+                        }
+                        match_count += 1;
+                    }
                 }
                 let row = match item.item {
                     TabBarItem::Tab { tab_idx, active } => {
@@ -459,12 +521,39 @@ impl crate::TermWindow {
                     }
                     _ => Element::new(&font, ElementContent::Children(vec![item_to_elem(item)])),
                 };
+                let (inset, gutter) = if matches!(item.item, TabBarItem::Tab { .. }) {
+                    (metrics.cell_size.width as f32 + 2.0, tab_gutter)
+                } else {
+                    (0.0, 0.0)
+                };
                 col.push(
                     row.display(DisplayType::Block)
                         .float(Float::None)
                         .item_type(UIItemType::TabBar(item.item.clone()))
+                        .min_width(Some(Dimension::Pixels((strip_width - inset - gutter).max(0.))))
+                        .max_width(Some(Dimension::Pixels((strip_width - gutter).max(0.)))),
+                );
+            }
+
+            if filtering && match_count == 0 {
+                let inner = Element::new(&font, ElementContent::Text("No tabs match".to_string()))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: colors.inactive_tab().fg_color.to_linear().mul_alpha(0.6).into(),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.5),
+                        bottom: Dimension::Cells(0.5),
+                    });
+                col.push(
+                    Element::new(&font, ElementContent::Children(vec![inner]))
+                        .display(DisplayType::Block)
                         .min_width(Some(Dimension::Pixels(strip_width)))
-                        .max_width(Some(Dimension::Pixels(strip_width))),
+                        .max_width(Some(Dimension::Pixels(strip_width)))
+                        .colors(bar_colors.clone()),
                 );
             }
 

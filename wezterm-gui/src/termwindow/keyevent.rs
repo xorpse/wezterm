@@ -664,6 +664,13 @@ impl super::TermWindow {
                     self.key_table_state.did_process_key();
                 }
 
+                if self.tab_search_active {
+                    if window_key.key_is_down {
+                        self.tab_search_key(key, modifiers, context);
+                    }
+                    return;
+                }
+
                 if let Some(modal) = self.get_modal() {
                     if window_key.key_is_down {
                         modal.key_down(key, modifiers, self).ok();
@@ -741,6 +748,41 @@ impl super::TermWindow {
             }
             Key::None => {}
         }
+    }
+
+    fn tab_search_key(
+        &mut self,
+        key: ::termwiz::input::KeyCode,
+        mods: Modifiers,
+        context: &dyn WindowOps,
+    ) {
+        use ::termwiz::input::KeyCode as KC;
+        match (key, mods) {
+            (KC::Escape, _) => {
+                self.tab_search_query.clear();
+                self.tab_search_active = false;
+                self.clear_tab_search_cache();
+            }
+            (KC::Char('u'), m) if m.contains(Modifiers::CTRL) => {
+                self.tab_search_query.clear();
+            }
+            (KC::Backspace, _) => {
+                self.tab_search_query.pop();
+            }
+            (KC::Enter, _) => {
+                self.tab_search_active = false;
+            }
+            (KC::Char(c), m)
+                if !m.contains(Modifiers::CTRL)
+                    && !m.contains(Modifiers::ALT)
+                    && !m.contains(Modifiers::SUPER) =>
+            {
+                self.tab_search_query.push(c);
+            }
+            _ => return,
+        }
+        self.invalidate_fancy_tab_bar();
+        context.invalidate();
     }
 
     pub fn win_key_code_to_termwiz_key_code(&self, key: &::window::KeyCode) -> Key {

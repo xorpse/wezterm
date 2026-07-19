@@ -2035,6 +2035,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        ActivateTabSearch => CommandDef {
+            brief: "Search tabs".into(),
+            doc: "Focuses the vertical tab bar search field to filter tabs".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_magnify"),
+        },
     })
 }
 
@@ -2079,6 +2087,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        ActivateTabSearch,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,

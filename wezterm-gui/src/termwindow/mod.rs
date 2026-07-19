@@ -161,6 +161,7 @@ pub enum UIItemType {
     Split(PositionedSplit),
     TabBarResize,
     TabBarCollapse,
+    TabSearch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +414,14 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     tab_bar_collapsed: bool,
     tab_bar_revealed: bool,
+    tab_search_active: bool,
+    tab_search_query: String,
+    tab_search_cache: RefCell<HashMap<usize, Option<String>>>,
+    hovered_tab: Option<usize>,
+    hovered_tab_rect: Option<(f32, f32, f32, f32)>,
+    hovered_card_rect: Option<(f32, f32, f32, f32)>,
+    hovered_card: Option<(usize, box_model::ComputedElement)>,
+    hovered_tab_since: Option<Instant>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -763,6 +772,14 @@ impl TermWindow {
             tab_bar_width_override: Self::load_tab_bar_width(),
             tab_bar_collapsed: false,
             tab_bar_revealed: false,
+            tab_search_active: false,
+            tab_search_query: String::new(),
+            tab_search_cache: RefCell::new(HashMap::new()),
+            hovered_tab: None,
+            hovered_tab_rect: None,
+            hovered_card_rect: None,
+            hovered_card: None,
+            hovered_tab_since: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2252,6 +2269,29 @@ impl TermWindow {
         Ok(())
     }
 
+    fn matching_tab_indices(&self) -> Vec<usize> {
+        let query = self.tab_search_query.trim().to_lowercase();
+        if query.is_empty() || !self.config.tab_bar_search {
+            return vec![];
+        }
+        self.tab_bar
+            .items()
+            .iter()
+            .filter_map(|entry| {
+                if let TabBarItem::Tab { tab_idx, .. } = entry.item {
+                    let hit = entry.title.as_str().to_lowercase().contains(&query)
+                        || self
+                            .tab_search_content(tab_idx)
+                            .map(|c| c.to_lowercase().contains(&query))
+                            .unwrap_or(false);
+                    hit.then_some(tab_idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
         let mux = Mux::get();
         let window = mux
@@ -2260,10 +2300,30 @@ impl TermWindow {
 
         let max = window.len();
         ensure!(max > 0, "no more tabs");
+        let active = window.get_active_idx() as isize;
+        drop(window);
+
+        let filtered = self.matching_tab_indices();
+        if !filtered.is_empty() {
+            let n = filtered.len() as isize;
+            let target = match filtered.iter().position(|&i| i as isize == active) {
+                Some(pos) => {
+                    let mut p = pos as isize + delta;
+                    if wrap {
+                        p = ((p % n) + n) % n;
+                    } else {
+                        p = p.clamp(0, n - 1);
+                    }
+                    filtered[p as usize]
+                }
+                None if delta >= 0 => filtered[0],
+                None => filtered[(n - 1) as usize],
+            };
+            return self.activate_tab(target as isize);
+        }
 
         // This logic is coupled with the CliSubCommand::ActivateTab
         // logic in wezterm/src/main.rs. If you update this, update that!
-        let active = window.get_active_idx() as isize;
         let tab = active + delta;
         let tab = if wrap {
             let tab = if tab < 0 { max as isize + tab } else { tab };
@@ -2277,7 +2337,6 @@ impl TermWindow {
                 tab
             }
         };
-        drop(window);
         self.activate_tab(tab)
     }
 
@@ -3218,6 +3277,16 @@ impl TermWindow {
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
+            }
+            ActivateTabSearch => {
+                if self.config.tab_bar_search && self.resolved_tab_bar_placement().is_vertical() {
+                    self.tab_search_active = true;
+                    self.clear_tab_search_cache();
+                    self.invalidate_fancy_tab_bar();
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
