@@ -358,27 +358,47 @@ fn provider_display(id: &str) -> String {
     }
 }
 
+fn first_entry_row(groups: &[PickerGroup]) -> usize {
+    let mut row = 0;
+    for group in groups {
+        row += 1;
+        if !group.collapsed {
+            if !group.entries.is_empty() {
+                return row;
+            }
+            row += group.entries.len();
+        }
+    }
+    0
+}
+
 fn build_connection_groups() -> Vec<PickerGroup> {
     let mux = Mux::get();
-    let mut entries = Vec::new();
+    let mut daemons = Vec::new();
     for domain in mux.iter_domains() {
         if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_some() {
             let name = domain.domain_name().to_string();
-            entries.push(PickerEntry {
+            daemons.push(PickerEntry {
                 label: format!("connect  {name}"),
                 action: PickerAction::ChooseDomain(name),
             });
         }
     }
-    entries.push(PickerEntry {
-        label: "add connection  (relay URL or host:port)".to_string(),
-        action: PickerAction::AddConnection,
-    });
-    vec![PickerGroup {
-        label: "Connections".to_string(),
-        collapsed: false,
-        entries,
-    }]
+    vec![
+        PickerGroup {
+            label: "Connections".to_string(),
+            collapsed: false,
+            entries: daemons,
+        },
+        PickerGroup {
+            label: "New".to_string(),
+            collapsed: false,
+            entries: vec![PickerEntry {
+                label: "add connection  (relay URL or host:port)".to_string(),
+                action: PickerAction::AddConnection,
+            }],
+        },
+    ]
 }
 
 fn parse_connect_target(input: &str) -> Option<(String, paseo_mux::ConnectTarget)> {
@@ -1313,9 +1333,13 @@ impl PaseoAgentPane {
         self.mutate(|state| {
             state.title = "Paseo — connect".to_string();
         });
-        self.enter_hub(
+        let groups = build_connection_groups();
+        let selected = first_entry_row(&groups);
+        self.enter_picker(
             "Paseo — connect to a daemon".to_string(),
-            build_connection_groups(),
+            groups,
+            None,
+            selected,
         );
     }
 
@@ -1378,11 +1402,12 @@ impl PaseoAgentPane {
                         collapsed: false,
                         entries,
                     }];
+                    let selected = first_entry_row(&groups);
                     pane.enter_picker(
                         "Choose the agent to run".to_string(),
                         groups,
                         Some(pending),
-                        1,
+                        selected,
                     );
                 }
             }
@@ -1645,6 +1670,7 @@ impl PaseoAgentPane {
     }
 
     fn open_domain_picker(self: &Arc<Self>, domain: String) {
+        let chooser_id = self.pane_id;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let args = KeyAssignment::OpenPaseoAgentPane(PaseoAgentArgs {
@@ -1664,8 +1690,8 @@ impl PaseoAgentPane {
                 {
                     let _ = term_window.perform_key_assignment(&pane, &args);
                 }
+                Mux::get().remove_pane(chooser_id);
             })));
-        self.close();
     }
 
     fn run_add_connection(self: &Arc<Self>, value: String) {
