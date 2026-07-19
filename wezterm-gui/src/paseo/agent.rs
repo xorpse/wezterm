@@ -376,6 +376,41 @@ enum PendingCreate {
     CloneRepo(String),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum WorktreeAction {
+    BranchOff,
+    Checkout,
+}
+
+#[derive(Clone)]
+enum WizardStep {
+    Directory,
+    Method {
+        cwd: String,
+    },
+    Branch {
+        cwd: String,
+        action: WorktreeAction,
+    },
+    Provider {
+        pending: PendingCreate,
+        providers: Vec<String>,
+    },
+}
+
+#[derive(Clone)]
+struct WizardFrame {
+    step: WizardStep,
+    crumbs: Vec<String>,
+}
+
+fn crumb_basename(path: &str) -> String {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 struct PickerEntry {
     label: String,
     action: PickerAction,
@@ -443,6 +478,7 @@ struct PickerState {
     stage: PickerStage,
     pending: Option<PendingCreate>,
     pending_delete: bool,
+    crumbs: Vec<String>,
 }
 
 impl PickerState {
@@ -847,6 +883,7 @@ struct AgentState {
     size: TerminalSize,
     seqno: SequenceNo,
     dead: bool,
+    create_stack: Vec<WizardFrame>,
 }
 
 impl AgentState {
@@ -900,6 +937,13 @@ impl AgentState {
                     &attr_bold_fg(AnsiColor::Teal),
                     cols,
                 );
+                if !picker.crumbs.is_empty() {
+                    transcript.push(AgentRow {
+                        text: truncate_to(&picker.crumbs.join("  ›  "), cols),
+                        attrs: attr_dim(),
+                    });
+                    transcript.push(blank_row());
+                }
                 for (i, suggestion) in suggestions.iter().enumerate() {
                     let selected = i == *suggestion_selected;
                     let marker = if selected { "❯ " } else { "  " };
@@ -941,6 +985,12 @@ impl AgentState {
                 text: picker.title.clone(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
             });
+            if !picker.crumbs.is_empty() {
+                transcript.push(AgentRow {
+                    text: truncate_to(&picker.crumbs.join("  ›  "), cols),
+                    attrs: attr_dim(),
+                });
+            }
             transcript.push(blank_row());
             if picker.groups.is_empty() {
                 push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
@@ -986,9 +1036,14 @@ impl AgentState {
                     attrs: attr_fg(AnsiColor::Yellow),
                 }
             } else {
+                let tail = if picker.crumbs.is_empty() {
+                    "dd:archive · o:fold · r:refresh · q: close"
+                } else {
+                    "Enter select · Esc back"
+                };
                 AgentRow {
                     text: format!(
-                        "❯ {}/{}  ·  Enter · j/k · dd:archive · o:fold · r:refresh · q: close",
+                        "❯ {}/{}  ·  j/k · {tail}",
                         (selected + 1).min(count.max(1)),
                         count
                     ),
@@ -1787,6 +1842,18 @@ impl PaseoAgentPane {
         pending: Option<PendingCreate>,
         selected: usize,
     ) {
+        self.enter_picker_crumbs(title, kind, groups, pending, selected, Vec::new());
+    }
+
+    fn enter_picker_crumbs(
+        &self,
+        title: String,
+        kind: PickerKind,
+        groups: Vec<PickerGroup>,
+        pending: Option<PendingCreate>,
+        selected: usize,
+        crumbs: Vec<String>,
+    ) {
         self.mutate(|state| {
             state.status_message = None;
             state.follow = false;
@@ -1799,6 +1866,7 @@ impl PaseoAgentPane {
                 stage: PickerStage::Browse,
                 pending,
                 pending_delete: false,
+                crumbs,
             });
             state.rebuild_rows();
         });
@@ -1869,7 +1937,95 @@ impl PaseoAgentPane {
         }
     }
 
-    fn begin_worktree_choice(self: &Arc<Self>, cwd: String) {
+    fn wizard_active(&self) -> bool {
+        !self.state.lock().create_stack.is_empty()
+    }
+
+    fn wizard_top_crumbs(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .create_stack
+            .last()
+            .map(|frame| frame.crumbs.clone())
+            .unwrap_or_default()
+    }
+
+    fn wizard_reset(&self) {
+        self.state.lock().create_stack.clear();
+    }
+
+    fn wizard_start(self: &Arc<Self>, step: WizardStep, crumbs: Vec<String>) {
+        self.wizard_reset();
+        self.wizard_push(step, crumbs);
+    }
+
+    fn wizard_push(self: &Arc<Self>, step: WizardStep, crumbs: Vec<String>) {
+        self.state
+            .lock()
+            .create_stack
+            .push(WizardFrame { step, crumbs });
+        self.wizard_render();
+    }
+
+    fn wizard_back(self: &Arc<Self>) {
+        let empty = {
+            let mut state = self.state.lock();
+            state.create_stack.pop();
+            state.create_stack.is_empty()
+        };
+        if empty {
+            self.open_hub();
+        } else {
+            self.wizard_render();
+        }
+    }
+
+    fn wizard_render(self: &Arc<Self>) {
+        let frame = self.state.lock().create_stack.last().cloned();
+        let Some(frame) = frame else {
+            return;
+        };
+        match frame.step {
+            WizardStep::Directory => self.show_directory_input(frame.crumbs),
+            WizardStep::Method { cwd } => self.show_method_picker(cwd, frame.crumbs),
+            WizardStep::Branch { cwd, action } => self.show_branch_input(cwd, action, frame.crumbs),
+            WizardStep::Provider { pending, providers } => {
+                self.show_provider_picker(pending, providers, frame.crumbs)
+            }
+        }
+    }
+
+    fn show_directory_input(self: &Arc<Self>, crumbs: Vec<String>) {
+        self.set_input_stage(
+            InputKind::SearchDirectory,
+            "Search for a directory on the daemon:".to_string(),
+            "~/".to_string(),
+            None,
+            crumbs,
+        );
+        self.refresh_suggestions();
+    }
+
+    fn show_branch_input(
+        self: &Arc<Self>,
+        cwd: String,
+        action: WorktreeAction,
+        crumbs: Vec<String>,
+    ) {
+        let (kind, label) = match action {
+            WorktreeAction::BranchOff => {
+                (InputKind::BranchOff, "Base branch for the new worktree:")
+            }
+            WorktreeAction::Checkout => (
+                InputKind::CheckoutBranch,
+                "Branch to check out in a worktree:",
+            ),
+        };
+        self.set_input_stage(kind, label.to_string(), String::new(), Some(cwd), crumbs);
+        self.refresh_suggestions();
+    }
+
+    fn show_method_picker(&self, cwd: String, crumbs: Vec<String>) {
         let groups = vec![PickerGroup {
             label: "New agent".to_string(),
             collapsed: false,
@@ -1889,13 +2045,125 @@ impl PaseoAgentPane {
             ],
         }];
         let selected = first_entry_row(&groups);
-        self.enter_picker(
+        self.enter_picker_crumbs(
             "How should this agent run?".to_string(),
             PickerKind::Providers,
             groups,
             None,
             selected,
+            crumbs,
         );
+    }
+
+    fn show_provider_picker(
+        &self,
+        pending: PendingCreate,
+        providers: Vec<String>,
+        crumbs: Vec<String>,
+    ) {
+        let entries = providers
+            .into_iter()
+            .map(|id| PickerEntry {
+                label: provider_display(&id),
+                action: PickerAction::SelectProvider(id),
+            })
+            .collect();
+        let groups = vec![PickerGroup {
+            label: "Providers".to_string(),
+            collapsed: false,
+            entries,
+        }];
+        let selected = first_entry_row(&groups);
+        self.enter_picker_crumbs(
+            "Choose the agent to run".to_string(),
+            PickerKind::Providers,
+            groups,
+            Some(pending),
+            selected,
+            crumbs,
+        );
+    }
+
+    fn set_input_stage(
+        &self,
+        kind: InputKind,
+        label: String,
+        buffer: String,
+        context: Option<String>,
+        crumbs: Vec<String>,
+    ) {
+        self.mutate(|state| {
+            state.status_message = None;
+            state.follow = false;
+            state.scroll = 0;
+            state.picker = Some(PickerState {
+                title: label.clone(),
+                kind: PickerKind::Providers,
+                groups: Vec::new(),
+                selected: 0,
+                stage: PickerStage::Input {
+                    kind,
+                    label,
+                    buffer,
+                    context,
+                    suggestions: Vec::new(),
+                    suggestion_selected: 0,
+                    suggest_gen: 0,
+                },
+                pending: None,
+                pending_delete: false,
+                crumbs,
+            });
+            state.rebuild_rows();
+        });
+    }
+
+    fn wizard_to_provider(self: &Arc<Self>, pending: PendingCreate, crumbs: Vec<String>) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        self.mutate(|state| {
+            state.status_message = Some("⟳ checking available agents…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let providers = client.list_available_providers().await.unwrap_or_default();
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            match providers.len() {
+                0 => pane.set_status(
+                    "Error".into(),
+                    Some("no agent providers available on this daemon".into()),
+                ),
+                1 => {
+                    pane.wizard_reset();
+                    pane.execute_create(pending, providers[0].clone());
+                }
+                _ => pane.wizard_push(WizardStep::Provider { pending, providers }, crumbs),
+            }
+        })
+        .detach();
+    }
+
+    fn open_hub(self: &Arc<Self>) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let agents = client.fetch_agents().await.unwrap_or_default();
+            let workspaces = client.fetch_workspaces().await.unwrap_or_default();
+            let groups = build_picker_groups(agents, workspaces);
+            if let Some(pane) = weak.upgrade() {
+                pane.enter_hub(
+                    "Paseo — open an agent, or start one in a project".to_string(),
+                    groups,
+                );
+            }
+        })
+        .detach();
     }
 
     fn create_worktree_agent(
@@ -2341,7 +2609,9 @@ impl PaseoAgentPane {
         enum Chosen {
             Open(String),
             NewIn(String),
+            SearchDir,
             InPlace(String),
+            MethodBranch(String, WorktreeAction),
             StartInput(InputKind, String, Option<String>),
             RunInput(InputKind, String, Option<String>),
             ToggleGroup(usize),
@@ -2382,21 +2652,13 @@ impl PaseoAgentPane {
                                     Chosen::NewIn(cwd.clone())
                                 }
                                 PickerAction::WorktreeInPlace(cwd) => Chosen::InPlace(cwd.clone()),
-                                PickerAction::WorktreeNewBranch(cwd) => Chosen::StartInput(
-                                    InputKind::BranchOff,
-                                    "Base branch for the new worktree:".to_string(),
-                                    Some(cwd.clone()),
-                                ),
-                                PickerAction::WorktreeCheckoutBranch(cwd) => Chosen::StartInput(
-                                    InputKind::CheckoutBranch,
-                                    "Branch to check out in a worktree:".to_string(),
-                                    Some(cwd.clone()),
-                                ),
-                                PickerAction::SearchDirectory => Chosen::StartInput(
-                                    InputKind::SearchDirectory,
-                                    "Search for a directory on the daemon:".to_string(),
-                                    None,
-                                ),
+                                PickerAction::WorktreeNewBranch(cwd) => {
+                                    Chosen::MethodBranch(cwd.clone(), WorktreeAction::BranchOff)
+                                }
+                                PickerAction::WorktreeCheckoutBranch(cwd) => {
+                                    Chosen::MethodBranch(cwd.clone(), WorktreeAction::Checkout)
+                                }
+                                PickerAction::SearchDirectory => Chosen::SearchDir,
                                 PickerAction::NewDirectory => Chosen::StartInput(
                                     InputKind::NewDirectory,
                                     "New directory (full path on the daemon):".to_string(),
@@ -2426,8 +2688,27 @@ impl PaseoAgentPane {
         };
         match chosen {
             Some(Chosen::Open(id)) => self.open_agent_by_id(id),
-            Some(Chosen::NewIn(cwd)) => self.begin_worktree_choice(cwd),
-            Some(Chosen::InPlace(cwd)) => self.begin_create(PendingCreate::Workspace(cwd)),
+            Some(Chosen::NewIn(cwd)) => {
+                let crumb = crumb_basename(&cwd);
+                self.wizard_start(WizardStep::Method { cwd }, vec![crumb]);
+            }
+            Some(Chosen::SearchDir) => self.wizard_start(WizardStep::Directory, Vec::new()),
+            Some(Chosen::InPlace(cwd)) => {
+                let mut crumbs = self.wizard_top_crumbs();
+                crumbs.push("current checkout".to_string());
+                self.wizard_to_provider(PendingCreate::Workspace(cwd), crumbs);
+            }
+            Some(Chosen::MethodBranch(cwd, action)) => {
+                let mut crumbs = self.wizard_top_crumbs();
+                crumbs.push(
+                    match action {
+                        WorktreeAction::BranchOff => "new worktree",
+                        WorktreeAction::Checkout => "existing branch",
+                    }
+                    .to_string(),
+                );
+                self.wizard_push(WizardStep::Branch { cwd, action }, crumbs);
+            }
             Some(Chosen::ToggleGroup(gi)) => self.mutate(|state| {
                 if let Some(picker) = &mut state.picker {
                     if let Some(group) = picker.groups.get_mut(gi) {
@@ -2466,21 +2747,34 @@ impl PaseoAgentPane {
                 if !value.is_empty() {
                     match kind {
                         InputKind::AddConnection => self.run_add_connection(value),
-                        InputKind::SearchDirectory => self.begin_worktree_choice(value),
+                        InputKind::SearchDirectory => {
+                            let crumb = crumb_basename(&value);
+                            self.wizard_push(WizardStep::Method { cwd: value }, vec![crumb]);
+                        }
                         InputKind::BranchOff => {
                             if let Some(cwd) = context {
-                                self.begin_create(PendingCreate::WorktreeBranchOff {
-                                    cwd,
-                                    base_branch: value,
-                                });
+                                let mut crumbs = self.wizard_top_crumbs();
+                                crumbs.push(value.clone());
+                                self.wizard_to_provider(
+                                    PendingCreate::WorktreeBranchOff {
+                                        cwd,
+                                        base_branch: value,
+                                    },
+                                    crumbs,
+                                );
                             }
                         }
                         InputKind::CheckoutBranch => {
                             if let Some(cwd) = context {
-                                self.begin_create(PendingCreate::WorktreeCheckout {
-                                    cwd,
-                                    ref_name: value,
-                                });
+                                let mut crumbs = self.wizard_top_crumbs();
+                                crumbs.push(value.clone());
+                                self.wizard_to_provider(
+                                    PendingCreate::WorktreeCheckout {
+                                        cwd,
+                                        ref_name: value,
+                                    },
+                                    crumbs,
+                                );
                             }
                         }
                         InputKind::NewDirectory => {
@@ -2499,6 +2793,7 @@ impl PaseoAgentPane {
                     .as_ref()
                     .and_then(|p| p.pending.clone());
                 if let Some(pending) = pending {
+                    self.wizard_reset();
                     self.execute_create(pending, provider);
                 }
             }
@@ -2840,7 +3135,15 @@ impl Pane for PaseoAgentPane {
                             pane.picker_select();
                         }
                     }
-                    KeyCode::Escape => self.picker_cancel_input(),
+                    KeyCode::Escape => {
+                        if self.wizard_active() {
+                            if let Some(pane) = self.arc() {
+                                pane.wizard_back();
+                            }
+                        } else {
+                            self.picker_cancel_input();
+                        }
+                    }
                     KeyCode::Backspace => self.picker_input_backspace(),
                     KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CTRL) => {
                         self.picker_input_char(c)
@@ -2875,6 +3178,11 @@ impl Pane for PaseoAgentPane {
                     KeyCode::Char('\r') | KeyCode::Enter => {
                         if let Some(pane) = self.arc() {
                             pane.picker_select();
+                        }
+                    }
+                    KeyCode::Escape if self.wizard_active() => {
+                        if let Some(pane) = self.arc() {
+                            pane.wizard_back();
                         }
                     }
                     KeyCode::Char('q') | KeyCode::Escape => self.close(),
@@ -3087,6 +3395,7 @@ pub fn open_paseo_agent_pane(
             size: pane_size,
             seqno: 1,
             dead: false,
+            create_stack: Vec::new(),
         }),
     });
 
