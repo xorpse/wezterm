@@ -826,6 +826,12 @@ impl AgentState {
 
         let mut footer = Vec::new();
         if let Some(request) = &self.pending {
+            let is_question = request.kind == "question";
+            let prefix = if is_question {
+                "❓ question: "
+            } else {
+                "⚠ permission: "
+            };
             let title = request
                 .title
                 .clone()
@@ -833,15 +839,40 @@ impl AgentState {
                 .unwrap_or_else(|| request.name.clone());
             push_wrapped(
                 &mut footer,
-                "⚠ permission: ",
+                prefix,
                 &title,
                 &attr_bold_fg(AnsiColor::Yellow),
                 cols,
             );
+            if let Some(description) = request.description.clone().filter(|d| !d.trim().is_empty())
+            {
+                push_wrapped(
+                    &mut footer,
+                    "  ",
+                    &truncate_to(
+                        description.replace('\n', " ").trim(),
+                        cols.saturating_sub(2),
+                    ),
+                    &attr_dim(),
+                    cols,
+                );
+            }
+            let choices = if request.actions.is_empty() {
+                "[y] allow   [n] deny".to_string()
+            } else {
+                request
+                    .actions
+                    .iter()
+                    .take(9)
+                    .enumerate()
+                    .map(|(i, action)| format!("[{}] {}", i + 1, action.label))
+                    .collect::<Vec<_>>()
+                    .join("   ")
+            };
             push_wrapped(
                 &mut footer,
                 "  ",
-                "[y] allow   [n] deny",
+                &choices,
                 &attr_fg(AnsiColor::Yellow),
                 cols,
             );
@@ -1281,6 +1312,41 @@ impl PaseoAgentPane {
                     interrupt: false,
                 }
             };
+            promise::spawn::spawn(async move {
+                let _ = client
+                    .respond_permission(&agent_id, &request_id, response)
+                    .await;
+            })
+            .detach();
+        }
+        self.mutate(|state| {
+            state.pending = None;
+            state.rebuild_rows();
+        });
+    }
+
+    fn respond_action(&self, index: usize) {
+        let (agent_id, request_id, response) = {
+            let state = self.state.lock();
+            let Some(request) = &state.pending else {
+                return;
+            };
+            let Some(action) = request.actions.get(index) else {
+                return;
+            };
+            let response = if action.behavior == "deny" {
+                PermissionResponse::Deny {
+                    message: None,
+                    interrupt: false,
+                }
+            } else {
+                PermissionResponse::Allow {
+                    selected_action_id: Some(action.id.clone()),
+                }
+            };
+            (self.agent_id.lock().clone(), request.id.clone(), response)
+        };
+        if let (Some(agent_id), Some(client)) = (agent_id, self.client()) {
             promise::spawn::spawn(async move {
                 let _ = client
                     .respond_permission(&agent_id, &request_id, response)
@@ -2254,6 +2320,9 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
                 KeyCode::Char('d') => self.open_review(),
                 KeyCode::Char('q') | KeyCode::Escape => self.close(),
+                KeyCode::Char(c @ '1'..='9') if self.state.lock().pending.is_some() => {
+                    self.respond_action(c as usize - '1' as usize)
+                }
                 KeyCode::Char('y') => self.respond_permission(true),
                 KeyCode::Char('n') => self.respond_permission(false),
                 KeyCode::Char('x') => self.stop(),
