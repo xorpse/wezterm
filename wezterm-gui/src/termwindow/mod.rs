@@ -3134,11 +3134,15 @@ impl TermWindow {
                 }
             }
             ReviewMode(_) => {}
-            OpenPaseoAgentPane(args) => {
-                if let Err(err) = crate::paseo::open_paseo_agent_pane(self, args) {
+            OpenPaseoAgentPane(args) => match crate::paseo::open_paseo_agent_pane(self, args) {
+                Ok(true) => {
+                    let _ = self.activate_tab(-1);
+                }
+                Ok(false) => {}
+                Err(err) => {
                     log::error!("failed to open paseo agent pane: {err:#}");
                 }
-            }
+            },
             RotatePanes(direction) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {

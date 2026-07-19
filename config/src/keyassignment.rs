@@ -665,6 +665,8 @@ pub struct PaseoAgentArgs {
     pub cwd: Option<String>,
     #[dynamic(default)]
     pub prompt: Option<String>,
+    #[dynamic(default = "crate::default_true")]
+    pub new_tab: bool,
     #[dynamic(default = "review_default_direction")]
     pub direction: PaneDirection,
     #[dynamic(default)]

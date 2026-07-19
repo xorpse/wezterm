@@ -8,7 +8,7 @@ use mux::pane::{
     PaneId, WithPaneLines,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
+use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab as MuxTab};
 use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
@@ -1641,36 +1641,16 @@ impl Pane for PaseoAgentPane {
 pub fn open_paseo_agent_pane(
     term_window: &mut TermWindow,
     args: &PaseoAgentArgs,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mux = Mux::get();
+    let window_id = term_window.mux_window_id;
     let tab = mux
-        .get_active_tab_for_window(term_window.mux_window_id)
+        .get_active_tab_for_window(window_id)
         .ok_or_else(|| anyhow!("no active tab"))?;
     let source = tab
         .get_active_pane()
         .ok_or_else(|| anyhow!("no active pane"))?;
     let source_pane_id = source.pane_id();
-
-    let pane_index = tab
-        .iter_panes_ignoring_zoom()
-        .iter()
-        .find(|p| p.pane.pane_id() == source_pane_id)
-        .map(|p| p.index)
-        .ok_or_else(|| anyhow!("active pane not in tab"))?;
-
-    let request = SplitRequest {
-        direction: SplitDirection::Horizontal,
-        target_is_second: true,
-        size: match args.size {
-            config::keyassignment::SplitSize::Percent(n) => MuxSplitSize::Percent(n),
-            config::keyassignment::SplitSize::Cells(n) => MuxSplitSize::Cells(n),
-        },
-        top_level: false,
-    };
-
-    let split_size = tab
-        .compute_split_size(pane_index, request)
-        .ok_or_else(|| anyhow!("cannot compute split size"))?;
 
     let window = term_window
         .window
@@ -1684,9 +1664,47 @@ pub fn open_paseo_agent_pane(
         anyhow::bail!("domain {} is not a paseo domain", args.domain);
     }
 
+    enum Insertion {
+        NewTab,
+        Split {
+            pane_index: usize,
+            request: SplitRequest,
+        },
+    }
+
+    let (insertion, pane_size) = if args.new_tab {
+        (Insertion::NewTab, tab.get_size())
+    } else {
+        let pane_index = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .find(|p| p.pane.pane_id() == source_pane_id)
+            .map(|p| p.index)
+            .ok_or_else(|| anyhow!("active pane not in tab"))?;
+        let request = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            size: match args.size {
+                config::keyassignment::SplitSize::Percent(n) => MuxSplitSize::Percent(n),
+                config::keyassignment::SplitSize::Cells(n) => MuxSplitSize::Cells(n),
+            },
+            top_level: false,
+        };
+        let split_size = tab
+            .compute_split_size(pane_index, request)
+            .ok_or_else(|| anyhow!("cannot compute split size"))?;
+        (
+            Insertion::Split {
+                pane_index,
+                request,
+            },
+            split_size.second,
+        )
+    };
+
     let pane = Arc::new(PaseoAgentPane {
         pane_id: alloc_pane_id(),
-        domain_id: source.domain_id(),
+        domain_id: domain.domain_id(),
         agent_id: Mutex::new(None),
         domain: domain.clone(),
         client: Mutex::new(None),
@@ -1715,7 +1733,7 @@ pub fn open_paseo_agent_pane(
             scroll: 0,
             follow: true,
             rows_version: 0,
-            size: split_size.second,
+            size: pane_size,
             seqno: 1,
             dead: false,
         }),
@@ -1725,8 +1743,23 @@ pub fn open_paseo_agent_pane(
     *pane.weak.lock() = Arc::downgrade(&pane);
 
     let pane_dyn: Arc<dyn Pane> = pane.clone();
-    mux.add_pane(&pane_dyn)?;
-    tab.split_and_insert(pane_index, request, pane_dyn)?;
+    let created_tab = match insertion {
+        Insertion::NewTab => {
+            let new_tab = Arc::new(MuxTab::new(&pane_size));
+            new_tab.assign_pane(&pane_dyn);
+            mux.add_tab_and_active_pane(&new_tab)?;
+            mux.add_tab_to_window(&new_tab, window_id)?;
+            true
+        }
+        Insertion::Split {
+            pane_index,
+            request,
+        } => {
+            mux.add_pane(&pane_dyn)?;
+            tab.split_and_insert(pane_index, request, pane_dyn)?;
+            false
+        }
+    };
 
     pane.start(AgentSource {
         agent_id: args.agent_id.clone(),
@@ -1735,5 +1768,5 @@ pub fn open_paseo_agent_pane(
         prompt: args.prompt.clone(),
     });
 
-    Ok(())
+    Ok(created_tab)
 }
