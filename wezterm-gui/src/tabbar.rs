@@ -32,6 +32,7 @@ pub enum TabBarItem {
     Tab { tab_idx: usize, active: bool },
     NewTabButton,
     WindowButton(IntegratedTitleButton),
+    GroupHeader { domain_id: mux::domain::DomainId },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -572,7 +573,38 @@ impl TabBarState {
             line.append_line(left_status_line, SEQ_ZERO);
         }
 
+        let group_by_domain = config.tab_bar_group_by_domain
+            && config.use_fancy_tab_bar
+            && config
+                .tab_bar_placement
+                .unwrap_or(if config.tab_bar_at_bottom {
+                    config::TabBarPlacement::Bottom
+                } else {
+                    config::TabBarPlacement::Top
+                })
+                .is_vertical();
+        let mut last_group_domain: Option<mux::domain::DomainId> = None;
+
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
+            if group_by_domain {
+                if let Some(domain_id) = tab_info[tab_idx].domain_id {
+                    if last_group_domain != Some(domain_id) {
+                        last_group_domain = Some(domain_id);
+                        let label = mux::Mux::get()
+                            .get_domain(domain_id)
+                            .map(|d| d.domain_name().to_string())
+                            .unwrap_or_else(|| format!("domain {domain_id}"));
+                        let header_title = parse_status_text(&label, CellAttributes::default());
+                        items.push(TabEntry {
+                            item: TabBarItem::GroupHeader { domain_id },
+                            title: header_title,
+                            x,
+                            width: 0,
+                        });
+                    }
+                }
+            }
+
             let tab_title_len = tab_title.len.min(tab_width_max);
             let active = tab_idx == active_tab_no;
             let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);

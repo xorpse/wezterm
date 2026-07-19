@@ -218,6 +218,7 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    pub domain_id: Option<mux::domain::DomainId>,
 }
 
 impl UserData for TabInformation {
@@ -3523,6 +3524,7 @@ impl TermWindow {
                         .iter()
                         .find(|p| p.is_active)
                         .map(Self::pos_pane_to_pane_info),
+                    domain_id: tab.get_active_pane().map(|p| p.domain_id()),
                 }
             })
             .collect()

@@ -343,7 +343,13 @@ impl AgentState {
         if let Some(picker) = &self.picker {
             if let PickerStage::Input { label, buffer, .. } = &picker.stage {
                 let mut transcript = Vec::new();
-                push_wrapped(&mut transcript, "", label, &attr_bold_fg(AnsiColor::Teal), cols);
+                push_wrapped(
+                    &mut transcript,
+                    "",
+                    label,
+                    &attr_bold_fg(AnsiColor::Teal),
+                    cols,
+                );
                 self.transcript = transcript;
                 self.footer = vec![AgentRow {
                     text: format!("❯ {buffer}"),
@@ -1140,18 +1146,23 @@ impl PaseoAgentPane {
                 PickerStage::Input { kind, buffer, .. } => {
                     Some(Chosen::RunInput(*kind, buffer.trim().to_string()))
                 }
-                PickerStage::Browse => picker.entries.get(picker.selected).map(|e| match &e.action {
-                    PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
-                    PickerAction::NewAgentInWorkspace(cwd) => Chosen::NewIn(cwd.clone()),
-                    PickerAction::NewDirectory => Chosen::StartInput(
-                        InputKind::NewDirectory,
-                        "New directory (full path on the daemon):".to_string(),
-                    ),
-                    PickerAction::CloneRepo => Chosen::StartInput(
-                        InputKind::CloneRepo,
-                        "Clone GitHub repo (owner/name):".to_string(),
-                    ),
-                }),
+                PickerStage::Browse => {
+                    picker
+                        .entries
+                        .get(picker.selected)
+                        .map(|e| match &e.action {
+                            PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
+                            PickerAction::NewAgentInWorkspace(cwd) => Chosen::NewIn(cwd.clone()),
+                            PickerAction::NewDirectory => Chosen::StartInput(
+                                InputKind::NewDirectory,
+                                "New directory (full path on the daemon):".to_string(),
+                            ),
+                            PickerAction::CloneRepo => Chosen::StartInput(
+                                InputKind::CloneRepo,
+                                "Clone GitHub repo (owner/name):".to_string(),
+                            ),
+                        })
+                }
             }
         };
         match chosen {
@@ -1190,7 +1201,9 @@ impl PaseoAgentPane {
             let cwd = match kind {
                 InputKind::NewDirectory => {
                     let (parent, name) = match value.rsplit_once('/') {
-                        Some((p, n)) if !p.is_empty() && !n.is_empty() => (p.to_string(), n.to_string()),
+                        Some((p, n)) if !p.is_empty() && !n.is_empty() => {
+                            (p.to_string(), n.to_string())
+                        }
                         _ => {
                             if let Some(pane) = weak.upgrade() {
                                 pane.set_status(
@@ -1219,7 +1232,10 @@ impl PaseoAgentPane {
                         }
                         Err(err) => {
                             if let Some(pane) = weak.upgrade() {
-                                pane.set_status("Error".into(), Some(format!("create agent: {err}")));
+                                pane.set_status(
+                                    "Error".into(),
+                                    Some(format!("create agent: {err}")),
+                                );
                             }
                         }
                     }
@@ -1396,7 +1412,22 @@ impl Pane for PaseoAgentPane {
         format!("{glyph}{}", state.title)
     }
 
-    fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
+    fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        let text = text.to_string();
+        self.mutate(|state| {
+            if state.picker.is_none() {
+                state.mode = Mode::Compose;
+                for c in text.chars() {
+                    if c == '\r' {
+                        state.composer.push('\n');
+                    } else {
+                        state.composer.push(c);
+                    }
+                }
+                state.rebuild_rows();
+            }
+        });
+        self.scroll_to_bottom();
         Ok(())
     }
 

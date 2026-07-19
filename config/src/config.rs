@@ -501,6 +501,9 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_collapsible: bool,
 
+    #[dynamic(default)]
+    pub tab_bar_group_by_domain: bool,
+
     /// If true, show a per-tab icon derived from the foreground process.
     #[dynamic(default)]
     pub show_tab_icons: bool,

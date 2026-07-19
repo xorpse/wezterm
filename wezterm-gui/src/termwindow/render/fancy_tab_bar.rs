@@ -294,6 +294,31 @@ impl crate::TermWindow {
                     &metrics,
                     &self.config,
                 ),
+                TabBarItem::GroupHeader { .. } => {
+                    let inactive = colors.inactive_tab();
+                    element
+                        .item_type(UIItemType::TabBar(TabBarItem::None))
+                        .line_height(Some(1.4))
+                        .vertical_align(VerticalAlign::Middle)
+                        .margin(BoxDimension {
+                            left: Dimension::Cells(0.),
+                            right: Dimension::Cells(0.),
+                            top: Dimension::Cells(0.35),
+                            bottom: Dimension::Cells(0.),
+                        })
+                        .padding(BoxDimension {
+                            left: Dimension::Cells(0.75),
+                            right: Dimension::Cells(0.5),
+                            top: Dimension::Cells(0.1),
+                            bottom: Dimension::Cells(0.1),
+                        })
+                        .border(BoxDimension::new(Dimension::Pixels(0.)))
+                        .colors(ElementColors {
+                            border: BorderColor::default(),
+                            bg: LinearRgba::TRANSPARENT.into(),
+                            text: inactive.fg_color.to_linear().into(),
+                        })
+                }
             }
         };
 
