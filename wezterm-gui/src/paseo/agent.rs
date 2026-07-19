@@ -72,6 +72,17 @@ fn blank_row() -> AgentRow {
     }
 }
 
+fn truncate_to(text: &str, max: usize) -> String {
+    let max = max.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let mut s: String = chars[..max.saturating_sub(1)].iter().collect();
+    s.push('…');
+    s
+}
+
 fn push_wrapped(
     rows: &mut Vec<AgentRow>,
     prefix: &str,
@@ -451,29 +462,53 @@ impl AgentState {
                 return;
             }
 
+            let selected = picker.selected;
+            let count = picker.entries.len();
             let mut transcript = Vec::new();
             transcript.push(AgentRow {
-                text: "Paseo — pick an agent, or a workspace to start a new one:".to_string(),
+                text: "Paseo — open an agent, or start a new one in a workspace".to_string(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
             });
             transcript.push(blank_row());
             if picker.entries.is_empty() {
                 push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
             }
+            let mut sel_row = transcript.len();
             for (i, entry) in picker.entries.iter().enumerate() {
-                let attrs = if i == picker.selected {
+                let active = i == selected;
+                let attrs = if active {
                     attr_bold_fg(AnsiColor::Teal)
                 } else {
                     attr_default()
                 };
-                let prefix = if i == picker.selected { "▸ " } else { "  " };
-                push_wrapped(&mut transcript, prefix, &entry.label, &attrs, cols);
+                let prefix = if active { "▸ " } else { "  " };
+                if active {
+                    sel_row = transcript.len();
+                }
+                transcript.push(AgentRow {
+                    text: format!(
+                        "{prefix}{}",
+                        truncate_to(&entry.label, cols.saturating_sub(2))
+                    ),
+                    attrs,
+                });
             }
             self.transcript = transcript;
             self.footer = vec![AgentRow {
-                text: "❯ (Enter: select · j/k: move · q: close)".to_string(),
+                text: format!(
+                    "❯ {}/{}  ·  Enter: select · j/k: move · q: close",
+                    (selected + 1).min(count.max(1)),
+                    count
+                ),
                 attrs: attr_dim(),
             }];
+
+            let view = self.view_rows().max(1);
+            if sel_row < self.scroll {
+                self.scroll = sel_row;
+            } else if sel_row >= self.scroll + view {
+                self.scroll = sel_row + 1 - view;
+            }
             self.clamp_scroll();
             return;
         }
@@ -643,6 +678,11 @@ pub struct PaseoAgentPane {
 impl PaseoAgentPane {
     fn client(&self) -> Option<PaseoClient> {
         self.client.lock().clone()
+    }
+
+    fn arc(&self) -> Option<Arc<PaseoAgentPane>> {
+        let weak = self.weak.lock().clone();
+        weak.upgrade()
     }
 }
 
@@ -1124,6 +1164,8 @@ impl PaseoAgentPane {
         *self.agent_id.lock() = Some(agent_id.clone());
         self.mutate(|state| {
             state.picker = None;
+            state.follow = true;
+            state.scroll = 0;
             state.title = format!("Agent {}", short_id(&agent_id));
         });
         self.set_snapshot(&snapshot);
@@ -1206,6 +1248,8 @@ impl PaseoAgentPane {
     fn enter_hub(&self, entries: Vec<PickerEntry>, provider: String) {
         self.mutate(|state| {
             state.status_message = None;
+            state.follow = false;
+            state.scroll = 0;
             state.picker = Some(PickerState {
                 entries,
                 selected: 0,
@@ -1278,6 +1322,8 @@ impl PaseoAgentPane {
         };
         self.mutate(|state| {
             state.picker = None;
+            state.follow = true;
+            state.scroll = 0;
             state.status_message = Some(format!("⟳ starting {provider} in {cwd}…"));
             state.rebuild_rows();
         });
@@ -1392,6 +1438,8 @@ impl PaseoAgentPane {
         };
         self.mutate(|state| {
             state.picker = None;
+            state.follow = true;
+            state.scroll = 0;
             state.status_message = Some("⟳ creating project…".to_string());
             state.rebuild_rows();
         });
@@ -1665,7 +1713,7 @@ impl Pane for PaseoAgentPane {
             if is_input {
                 match key {
                     KeyCode::Char('\r') | KeyCode::Enter => {
-                        if let Some(pane) = self.weak.lock().upgrade() {
+                        if let Some(pane) = self.arc() {
                             pane.picker_select();
                         }
                     }
@@ -1681,7 +1729,7 @@ impl Pane for PaseoAgentPane {
                     KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
                     KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
                     KeyCode::Char('\r') | KeyCode::Enter => {
-                        if let Some(pane) = self.weak.lock().upgrade() {
+                        if let Some(pane) = self.arc() {
                             pane.picker_select();
                         }
                     }
@@ -1721,7 +1769,7 @@ impl Pane for PaseoAgentPane {
                     self.scroll_to_bottom();
                 }
                 KeyCode::Char('d') => {
-                    if let Some(pane) = self.weak.lock().upgrade() {
+                    if let Some(pane) = self.arc() {
                         pane.toggle_diff();
                     }
                 }
