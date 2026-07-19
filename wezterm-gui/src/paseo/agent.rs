@@ -708,6 +708,10 @@ fn build_picker_groups(
                         action: PickerAction::OpenAgent(agent.id.clone()),
                     });
                 }
+                entries.push(PickerEntry {
+                    label: "  ⊕ new agent here".to_string(),
+                    action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
+                });
                 Unit {
                     rank: agent_rank(primary),
                     sort_key: name.to_lowercase(),
