@@ -353,18 +353,20 @@ fn session_title(agent: &AgentSnapshot) -> String {
     }
 }
 
-fn picker_label(agent: &AgentSnapshot) -> String {
-    let worktree = basename(&agent.cwd);
-    if worktree.is_empty() {
-        format!("{} {}", status_glyph(agent), session_title(agent))
-    } else {
-        format!(
-            "{} {}  ·  {}",
-            status_glyph(agent),
-            session_title(agent),
-            worktree
-        )
-    }
+fn session_name(workspace_name: Option<&str>, agent: &AgentSnapshot) -> String {
+    workspace_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(80).collect())
+        .unwrap_or_else(|| session_title(agent))
+}
+
+fn agent_row_label(agent: &AgentSnapshot, workspace_name: Option<&str>) -> String {
+    format!(
+        "{} {}",
+        status_glyph(agent),
+        session_name(workspace_name, agent)
+    )
 }
 
 fn basename(path: &str) -> &str {
@@ -510,6 +512,7 @@ fn build_picker_groups(
     let mut order: Vec<String> = Vec::new();
     let mut index: HashMap<String, Proj> = HashMap::new();
     let mut cwd_project: HashMap<String, String> = HashMap::new();
+    let mut cwd_name: HashMap<String, String> = HashMap::new();
     let other_key = "\u{0}other".to_string();
 
     for ws in &workspaces {
@@ -535,13 +538,15 @@ fn build_picker_groups(
             }
         });
         cwd_project.insert(ws.cwd().to_string(), key.clone());
+        let ws_name = if ws.name.trim().is_empty() {
+            basename(ws.cwd()).to_string()
+        } else {
+            ws.name.clone()
+        };
+        cwd_name.insert(ws.cwd().to_string(), ws_name.clone());
         if let Some(proj) = index.get_mut(&key) {
             proj.workspaces.push(PickerEntry {
-                label: format!(
-                    "new  {}  ({})",
-                    basename(ws.cwd()),
-                    short_kind(&ws.workspace_kind)
-                ),
+                label: format!("new  {}  ({})", ws_name, short_kind(&ws.workspace_kind)),
                 action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
             });
         }
@@ -560,12 +565,13 @@ fn build_picker_groups(
             });
             other_key.clone()
         });
+        let name = cwd_name.get(&agent.cwd).map(String::as_str);
         if let Some(proj) = index.get_mut(&key) {
             proj.agents.push(AgentItem {
                 rank: agent_rank(&agent),
-                sort_title: agent.title.clone().unwrap_or_default().to_lowercase(),
+                sort_title: session_name(name, &agent).to_lowercase(),
                 entry: PickerEntry {
-                    label: picker_label(&agent),
+                    label: agent_row_label(&agent, name),
                     action: PickerAction::OpenAgent(agent.id.clone()),
                 },
             });
@@ -625,6 +631,7 @@ struct AgentState {
     pending: Option<PermissionRequest>,
     picker: Option<PickerState>,
     cwd: String,
+    workspace_name: Option<String>,
     mode: Mode,
     composer: String,
     provider: String,
@@ -1001,7 +1008,7 @@ impl PaseoAgentPane {
     fn set_snapshot(&self, snapshot: &AgentSnapshot) {
         self.mutate(|state| {
             state.cwd = snapshot.cwd.clone();
-            state.title = session_title(snapshot);
+            state.title = session_name(state.workspace_name.as_deref(), snapshot);
             state.provider = snapshot.provider.clone();
             state.agent_status = snapshot.status.clone();
             state.model = snapshot.model.clone();
@@ -1016,6 +1023,17 @@ impl PaseoAgentPane {
     fn set_models(&self, models: Vec<ModelDefinition>) {
         self.mutate(|state| {
             state.models = models;
+            state.rebuild_rows();
+        });
+    }
+
+    fn set_workspace_name(&self, name: String) {
+        if name.trim().is_empty() {
+            return;
+        }
+        self.mutate(|state| {
+            state.title = name.clone();
+            state.workspace_name = Some(name);
             state.rebuild_rows();
         });
     }
@@ -1289,6 +1307,7 @@ impl PaseoAgentPane {
         let agent_id = snapshot.id.clone();
         let provider = snapshot.provider.clone();
         let cwd = snapshot.cwd.clone();
+        let workspace_id = snapshot.workspace_id.clone();
         *self.agent_id.lock() = Some(agent_id.clone());
         self.mutate(|state| {
             state.picker = None;
@@ -1302,6 +1321,17 @@ impl PaseoAgentPane {
             return;
         };
         promise::spawn::spawn(async move {
+            let workspaces = client.fetch_workspaces().await.unwrap_or_default();
+            let name = workspaces
+                .iter()
+                .find(|ws| {
+                    workspace_id.as_deref() == Some(ws.id.as_str()) || ws.cwd() == cwd.as_str()
+                })
+                .map(|ws| ws.name.clone());
+            if let (Some(name), Some(pane)) = (name, weak.upgrade()) {
+                pane.set_workspace_name(name);
+            }
+
             if !provider.is_empty() {
                 if let Ok(models) = client.list_provider_models(&provider, Some(&cwd)).await {
                     if let Some(pane) = weak.upgrade() {
@@ -2333,6 +2363,7 @@ pub fn open_paseo_agent_pane(
             pending: None,
             picker: None,
             cwd: String::new(),
+            workspace_name: None,
             mode: Mode::Scroll,
             composer: String::new(),
             provider: String::new(),
