@@ -153,18 +153,29 @@ fn tool_call_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
 }
 
 fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRow>) {
+    let target = attr_fg(AnsiColor::Silver);
     match detail.kind.as_str() {
         "shell" => {
             if let Some(command) = &detail.command {
-                push_wrapped(rows, "  $ ", command, &attr_fg(AnsiColor::Silver), cols);
+                push_wrapped(rows, "  $ ", command, &target, cols);
             }
             if let Some(output) = &detail.output {
                 push_wrapped(rows, "  ", &truncate_lines(output, 40), &attr_dim(), cols);
             }
         }
+        "read" => {
+            if let Some(path) = &detail.file_path {
+                push_wrapped(rows, "  read ", path, &target, cols);
+            }
+        }
+        "write" => {
+            if let Some(path) = &detail.file_path {
+                push_wrapped(rows, "  write ", path, &target, cols);
+            }
+        }
         "edit" => {
-            if let Some(path) = &detail.path {
-                push_wrapped(rows, "  edit ", path, &attr_fg(AnsiColor::Silver), cols);
+            if let Some(path) = &detail.file_path {
+                push_wrapped(rows, "  edit ", path, &target, cols);
             }
             if let Some(diff) = &detail.unified_diff {
                 for line in truncate_lines(diff, 60).split('\n') {
@@ -179,11 +190,26 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
                 }
             }
         }
-        _ => {
-            if let Some(path) = &detail.path {
-                push_wrapped(rows, "  ", path, &attr_dim(), cols);
+        "search" => {
+            if let Some(query) = &detail.query {
+                push_wrapped(rows, "  search ", query, &target, cols);
             }
-            if let Some(text) = &detail.text {
+        }
+        "fetch" => {
+            if let Some(url) = &detail.url {
+                push_wrapped(rows, "  fetch ", url, &target, cols);
+            }
+        }
+        "sub_agent" => {
+            if let Some(description) = &detail.description {
+                push_wrapped(rows, "  ", description, &attr_dim(), cols);
+            }
+        }
+        _ => {
+            if let Some(path) = &detail.file_path {
+                push_wrapped(rows, "  ", path, &target, cols);
+            }
+            if let Some(text) = detail.text.as_ref().or(detail.content.as_ref()) {
                 push_wrapped(rows, "  ", &truncate_lines(text, 20), &attr_dim(), cols);
             }
         }
@@ -328,7 +354,7 @@ impl AgentState {
                 attrs: attr_default(),
             },
             Mode::Scroll => AgentRow {
-                text: "❯ (i: type · g/G: top/bottom · j/k: scroll)".to_string(),
+                text: "❯ (i: type · j/k: scroll · g/G: top/bottom · q: close)".to_string(),
                 attrs: attr_dim(),
             },
         };
@@ -557,6 +583,10 @@ impl PaseoAgentPane {
             })));
     }
 
+    fn close(&self) {
+        self.scroll(KeyAssignment::CloseCurrentPane { confirm: false });
+    }
+
     fn submit_composer(&self) {
         let text = {
             let mut state = self.state.lock();
@@ -613,11 +643,11 @@ impl PaseoAgentPane {
         });
     }
 
-    pub fn start(self: &Arc<Self>, requested_agent: Option<String>) {
+    pub fn start(self: &Arc<Self>, source: AgentSource) {
         let weak = Arc::downgrade(self);
         let client = self.client.clone();
         promise::spawn::spawn(async move {
-            let snapshot = match resolve_agent(&client, requested_agent).await {
+            let snapshot = match resolve_or_create(&client, source).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     if let Some(pane) = weak.upgrade() {
@@ -695,12 +725,27 @@ impl PaseoAgentPane {
     }
 }
 
-async fn resolve_agent(
+pub struct AgentSource {
+    pub agent_id: Option<String>,
+    pub provider: Option<String>,
+    pub cwd: Option<String>,
+    pub prompt: Option<String>,
+}
+
+async fn resolve_or_create(
     client: &PaseoClient,
-    requested: Option<String>,
+    source: AgentSource,
 ) -> anyhow::Result<AgentSnapshot> {
+    if let (Some(provider), Some(cwd)) = (source.provider.as_ref(), source.cwd.as_ref()) {
+        let workspace = client.open_project(cwd).await?;
+        return client
+            .create_agent(provider, cwd, Some(&workspace), source.prompt.as_deref())
+            .await
+            .map_err(anyhow::Error::from);
+    }
+
     let agents = client.fetch_agents().await?;
-    let entry = match requested {
+    let entry = match source.agent_id {
         Some(id) => agents.into_iter().find(|entry| entry.agent.id == id),
         None => agents
             .into_iter()
@@ -877,6 +922,7 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll(KeyAssignment::ScrollToBottom);
                 }
+                KeyCode::Char('q') => self.close(),
                 KeyCode::Char('y') => self.respond_permission(true),
                 KeyCode::Char('n') => self.respond_permission(false),
                 KeyCode::Char('x') => self.stop(),
@@ -887,10 +933,10 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('g') | KeyCode::Home => self.scroll(KeyAssignment::ScrollToTop),
                 KeyCode::Char('G') | KeyCode::End => self.scroll(KeyAssignment::ScrollToBottom),
                 KeyCode::Char('j') | KeyCode::DownArrow => {
-                    self.scroll(KeyAssignment::ScrollByLine(1))
+                    self.scroll(KeyAssignment::ScrollByLine(3))
                 }
                 KeyCode::Char('k') | KeyCode::UpArrow => {
-                    self.scroll(KeyAssignment::ScrollByLine(-1))
+                    self.scroll(KeyAssignment::ScrollByLine(-3))
                 }
                 _ => {}
             },
@@ -1010,7 +1056,12 @@ pub fn open_paseo_agent_pane(
     mux.add_pane(&pane_dyn)?;
     tab.split_and_insert(pane_index, request, pane_dyn)?;
 
-    pane.start(args.agent_id.clone());
+    pane.start(AgentSource {
+        agent_id: args.agent_id.clone(),
+        provider: args.provider.clone(),
+        cwd: args.cwd.clone(),
+        prompt: args.prompt.clone(),
+    });
 
     Ok(())
 }

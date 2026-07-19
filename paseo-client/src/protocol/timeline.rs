@@ -14,8 +14,16 @@ pub struct ToolCallDetail {
     pub exit_code: Option<i64>,
     #[serde(rename = "unifiedDiff", default)]
     pub unified_diff: Option<String>,
+    #[serde(rename = "filePath", default)]
+    pub file_path: Option<String>,
     #[serde(default)]
-    pub path: Option<String>,
+    pub content: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
 }

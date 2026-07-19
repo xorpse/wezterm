@@ -10,6 +10,7 @@ struct Options {
     create_probe: Option<String>,
     dump_timeline: Option<String>,
     watch_stream: Option<String>,
+    create_agent: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -32,6 +33,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         create_probe: None,
         dump_timeline: None,
         watch_stream: None,
+        create_agent: None,
     };
 
     if first == "--local" {
@@ -53,6 +55,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--create-probe" => {
                 options.create_probe = Some(iter.next().cloned().ok_or_else(usage)?);
+            }
+            "--create-agent" => {
+                options.create_agent = Some(iter.next().cloned().unwrap_or_default());
             }
             "--watch" => {
                 options.watch_stream = Some(iter.next().cloned().unwrap_or_default());
@@ -111,7 +116,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(agent_arg) = &options.watch_stream {
+    if let Some(spec) = &options.create_agent {
+        create_agent(&client, spec).await?;
+    } else if let Some(agent_arg) = &options.watch_stream {
         watch_stream(&client, agent_arg, &agents).await?;
     } else if let Some(agent_arg) = &options.dump_timeline {
         dump_timeline(&client, agent_arg, &agents).await?;
@@ -126,6 +133,30 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
     }
 
     client.close().await;
+    Ok(())
+}
+
+async fn create_agent(client: &PaseoClient, spec: &str) -> anyhow::Result<()> {
+    let mut parts = spec.splitn(3, ',');
+    let provider = parts.next().unwrap_or("").trim();
+    let cwd = parts.next().unwrap_or("").trim();
+    let prompt = parts.next().map(|p| p.trim().to_string());
+    if provider.is_empty() || cwd.is_empty() {
+        return Err(anyhow::anyhow!(
+            "usage: --create-agent provider,cwd[,prompt]"
+        ));
+    }
+    println!("opening project {cwd}");
+    let workspace = client.open_project(cwd).await?;
+    println!("workspace {workspace}");
+    println!("creating {provider} agent in {cwd}");
+    let snapshot = client
+        .create_agent(provider, cwd, Some(&workspace), prompt.as_deref())
+        .await?;
+    println!(
+        "created agent {} [{}] provider={} model={:?}",
+        snapshot.id, snapshot.status, snapshot.provider, snapshot.model
+    );
     Ok(())
 }
 

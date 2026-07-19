@@ -659,6 +659,12 @@ pub struct PaseoAgentArgs {
     pub domain: String,
     #[dynamic(default)]
     pub agent_id: Option<String>,
+    #[dynamic(default)]
+    pub provider: Option<String>,
+    #[dynamic(default)]
+    pub cwd: Option<String>,
+    #[dynamic(default)]
+    pub prompt: Option<String>,
     #[dynamic(default = "review_default_direction")]
     pub direction: PaneDirection,
     #[dynamic(default)]

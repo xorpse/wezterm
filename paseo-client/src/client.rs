@@ -181,6 +181,45 @@ impl PaseoClient {
         Ok(())
     }
 
+    pub async fn create_agent(
+        &self,
+        provider: &str,
+        cwd: &str,
+        workspace_id: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<crate::protocol::AgentSnapshot> {
+        let id = new_id();
+        let mut message = serde_json::json!({
+            "type": "create_agent_request",
+            "requestId": id,
+            "config": { "provider": provider, "cwd": cwd },
+            "labels": {}
+        });
+        if let Some(workspace_id) = workspace_id {
+            message["workspaceId"] = Value::from(workspace_id);
+        }
+        if let Some(initial_prompt) = initial_prompt {
+            message["initialPrompt"] = Value::from(initial_prompt);
+        }
+        let payload = self.request(message).await?;
+        match payload.get("status").and_then(Value::as_str) {
+            Some("agent_created") => {
+                let agent = payload
+                    .get("agent")
+                    .cloned()
+                    .ok_or_else(|| PaseoError::Protocol("agent_created missing agent".into()))?;
+                serde_json::from_value(agent).map_err(PaseoError::from)
+            }
+            _ => Err(PaseoError::Rpc(
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("create_agent failed")
+                    .to_string(),
+            )),
+        }
+    }
+
     pub async fn cancel_agent(&self, agent_id: &str) -> Result<()> {
         let id = new_id();
         self.request(agents::cancel_agent_request(&id, agent_id))
