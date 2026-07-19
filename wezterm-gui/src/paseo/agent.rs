@@ -237,14 +237,38 @@ enum Mode {
     Compose,
 }
 
+enum PickerAction {
+    OpenAgent(String),
+    NewAgentInWorkspace(String),
+    NewDirectory,
+    CloneRepo,
+}
+
 struct PickerEntry {
-    id: String,
     label: String,
+    action: PickerAction,
+}
+
+#[derive(Clone, Copy)]
+enum InputKind {
+    NewDirectory,
+    CloneRepo,
+}
+
+enum PickerStage {
+    Browse,
+    Input {
+        kind: InputKind,
+        label: String,
+        buffer: String,
+    },
 }
 
 struct PickerState {
     entries: Vec<PickerEntry>,
     selected: usize,
+    stage: PickerStage,
+    provider: String,
 }
 
 fn picker_label(agent: &AgentSnapshot) -> String {
@@ -317,26 +341,39 @@ impl AgentState {
         let cols = self.size.cols;
 
         if let Some(picker) = &self.picker {
+            if let PickerStage::Input { label, buffer, .. } = &picker.stage {
+                let mut transcript = Vec::new();
+                push_wrapped(&mut transcript, "", label, &attr_bold_fg(AnsiColor::Teal), cols);
+                self.transcript = transcript;
+                self.footer = vec![AgentRow {
+                    text: format!("❯ {buffer}"),
+                    attrs: attr_default(),
+                }];
+                self.clamp_scroll();
+                return;
+            }
+
             let mut transcript = Vec::new();
             transcript.push(AgentRow {
-                text: "Select an agent:".to_string(),
+                text: "Paseo — pick an agent, or a workspace to start a new one:".to_string(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
             });
             transcript.push(blank_row());
             if picker.entries.is_empty() {
-                push_wrapped(&mut transcript, "  ", "no agents", &attr_dim(), cols);
+                push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
             }
             for (i, entry) in picker.entries.iter().enumerate() {
-                let (prefix, attrs) = if i == picker.selected {
-                    ("▸ ", attr_bold_fg(AnsiColor::Teal))
+                let attrs = if i == picker.selected {
+                    attr_bold_fg(AnsiColor::Teal)
                 } else {
-                    ("  ", attr_default())
+                    attr_default()
                 };
+                let prefix = if i == picker.selected { "▸ " } else { "  " };
                 push_wrapped(&mut transcript, prefix, &entry.label, &attrs, cols);
             }
             self.transcript = transcript;
             self.footer = vec![AgentRow {
-                text: "❯ (Enter: open · j/k: move · q: close)".to_string(),
+                text: "❯ (Enter: select · j/k: move · q: close)".to_string(),
                 attrs: attr_dim(),
             }];
             self.clamp_scroll();
@@ -820,25 +857,44 @@ impl PaseoAgentPane {
             let _ = client.subscribe_agents().await;
 
             if source.agent_id.is_none() && source.provider.is_none() {
-                match client.fetch_agents().await {
-                    Ok(agents) => {
-                        let entries: Vec<PickerEntry> = agents
-                            .into_iter()
-                            .filter(|e| e.agent.archived_at.is_none())
-                            .map(|e| PickerEntry {
-                                id: e.agent.id.clone(),
-                                label: picker_label(&e.agent),
-                            })
-                            .collect();
-                        if let Some(pane) = weak.upgrade() {
-                            pane.enter_picker(entries);
-                        }
-                    }
-                    Err(err) => {
-                        if let Some(pane) = weak.upgrade() {
-                            pane.set_status("Agent (error)".to_string(), Some(format!("{err}")));
-                        }
-                    }
+                let agents = client.fetch_agents().await.unwrap_or_default();
+                let workspaces = client.fetch_workspaces().await.unwrap_or_default();
+                let hub_provider = agents
+                    .iter()
+                    .find(|e| e.agent.archived_at.is_none())
+                    .map(|e| e.agent.provider.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "codex".to_string());
+
+                let mut entries: Vec<PickerEntry> = Vec::new();
+                for e in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
+                    entries.push(PickerEntry {
+                        label: format!("open  {}", picker_label(&e.agent)),
+                        action: PickerAction::OpenAgent(e.agent.id.clone()),
+                    });
+                }
+                for ws in &workspaces {
+                    entries.push(PickerEntry {
+                        label: format!(
+                            "new   {} · {}  ({})",
+                            ws.project_display_name,
+                            ws.cwd(),
+                            ws.workspace_kind
+                        ),
+                        action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
+                    });
+                }
+                entries.push(PickerEntry {
+                    label: "＋    new directory + agent".to_string(),
+                    action: PickerAction::NewDirectory,
+                });
+                entries.push(PickerEntry {
+                    label: "＋    clone GitHub repo + agent".to_string(),
+                    action: PickerAction::CloneRepo,
+                });
+
+                if let Some(pane) = weak.upgrade() {
+                    pane.enter_hub(entries, hub_provider);
                 }
                 return;
             }
@@ -942,12 +998,14 @@ impl PaseoAgentPane {
         .detach();
     }
 
-    fn enter_picker(&self, entries: Vec<PickerEntry>) {
+    fn enter_hub(&self, entries: Vec<PickerEntry>, provider: String) {
         self.mutate(|state| {
             state.status_message = None;
             state.picker = Some(PickerState {
                 entries,
                 selected: 0,
+                stage: PickerStage::Browse,
+                provider,
             });
             state.rebuild_rows();
         });
@@ -967,17 +1025,80 @@ impl PaseoAgentPane {
         });
     }
 
-    fn picker_select(&self) {
-        let chosen = {
-            let state = self.state.lock();
-            state
-                .picker
-                .as_ref()
-                .and_then(|p| p.entries.get(p.selected).map(|e| e.id.clone()))
-        };
-        let Some(agent_id) = chosen else {
+    fn picker_input_char(&self, c: char) {
+        self.mutate(|state| {
+            if let Some(PickerState {
+                stage: PickerStage::Input { buffer, .. },
+                ..
+            }) = &mut state.picker
+            {
+                buffer.push(c);
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_input_backspace(&self) {
+        self.mutate(|state| {
+            if let Some(PickerState {
+                stage: PickerStage::Input { buffer, .. },
+                ..
+            }) = &mut state.picker
+            {
+                buffer.pop();
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn picker_cancel_input(&self) {
+        self.mutate(|state| {
+            if let Some(picker) = &mut state.picker {
+                picker.stage = PickerStage::Browse;
+            }
+            state.rebuild_rows();
+        });
+    }
+
+    fn create_agent_in(self: &Arc<Self>, cwd: String) {
+        let provider = self
+            .state
+            .lock()
+            .picker
+            .as_ref()
+            .map(|p| p.provider.clone())
+            .unwrap_or_else(|| "codex".to_string());
+        let Some(client) = self.client() else {
             return;
         };
+        self.mutate(|state| {
+            state.picker = None;
+            state.status_message = Some(format!("⟳ starting {provider} in {cwd}…"));
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let workspace = client.open_project(&cwd).await.ok();
+            match client
+                .create_agent(&provider, &cwd, workspace.as_deref(), None)
+                .await
+            {
+                Ok(snapshot) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.load_agent(snapshot);
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status("Agent (error)".into(), Some(format!("create: {err}")));
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn open_agent_by_id(self: &Arc<Self>, agent_id: String) {
         let Some(client) = self.client() else {
             return;
         };
@@ -995,10 +1116,117 @@ impl PaseoAgentPane {
                 }
                 Err(err) => {
                     if let Some(pane) = weak.upgrade() {
-                        pane.set_status(
-                            "Agent (error)".to_string(),
-                            Some(format!("load failed: {err}")),
-                        );
+                        pane.set_status("Agent (error)".into(), Some(format!("load: {err}")));
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn picker_select(self: &Arc<Self>) {
+        enum Chosen {
+            Open(String),
+            NewIn(String),
+            StartInput(InputKind, String),
+            RunInput(InputKind, String),
+        }
+        let chosen = {
+            let state = self.state.lock();
+            let Some(picker) = &state.picker else {
+                return;
+            };
+            match &picker.stage {
+                PickerStage::Input { kind, buffer, .. } => {
+                    Some(Chosen::RunInput(*kind, buffer.trim().to_string()))
+                }
+                PickerStage::Browse => picker.entries.get(picker.selected).map(|e| match &e.action {
+                    PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
+                    PickerAction::NewAgentInWorkspace(cwd) => Chosen::NewIn(cwd.clone()),
+                    PickerAction::NewDirectory => Chosen::StartInput(
+                        InputKind::NewDirectory,
+                        "New directory (full path on the daemon):".to_string(),
+                    ),
+                    PickerAction::CloneRepo => Chosen::StartInput(
+                        InputKind::CloneRepo,
+                        "Clone GitHub repo (owner/name):".to_string(),
+                    ),
+                }),
+            }
+        };
+        match chosen {
+            Some(Chosen::Open(id)) => self.open_agent_by_id(id),
+            Some(Chosen::NewIn(cwd)) => self.create_agent_in(cwd),
+            Some(Chosen::StartInput(kind, label)) => self.mutate(|state| {
+                if let Some(picker) = &mut state.picker {
+                    picker.stage = PickerStage::Input {
+                        kind,
+                        label,
+                        buffer: String::new(),
+                    };
+                }
+                state.rebuild_rows();
+            }),
+            Some(Chosen::RunInput(kind, value)) => {
+                if !value.is_empty() {
+                    self.run_project_creation(kind, value);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn run_project_creation(self: &Arc<Self>, kind: InputKind, value: String) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        self.mutate(|state| {
+            state.picker = None;
+            state.status_message = Some("⟳ creating project…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let cwd = match kind {
+                InputKind::NewDirectory => {
+                    let (parent, name) = match value.rsplit_once('/') {
+                        Some((p, n)) if !p.is_empty() && !n.is_empty() => (p.to_string(), n.to_string()),
+                        _ => {
+                            if let Some(pane) = weak.upgrade() {
+                                pane.set_status(
+                                    "Error".into(),
+                                    Some("give a full path like /Users/you/proj".into()),
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    client.project_create_directory(&parent, &name).await
+                }
+                InputKind::CloneRepo => client.project_github_clone(&value, "https").await,
+            };
+            match cwd {
+                Ok(cwd) => {
+                    let workspace = client.open_project(&cwd).await.ok();
+                    match client
+                        .create_agent("codex", &cwd, workspace.as_deref(), None)
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            if let Some(pane) = weak.upgrade() {
+                                pane.load_agent(snapshot);
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(pane) = weak.upgrade() {
+                                pane.set_status("Error".into(), Some(format!("create agent: {err}")));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status("Error".into(), Some(format!("create project: {err}")));
                     }
                 }
             }
@@ -1196,13 +1424,40 @@ impl Pane for PaseoAgentPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        if self.state.lock().picker.is_some() {
-            match key {
-                KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
-                KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
-                KeyCode::Char('\r') | KeyCode::Enter => self.picker_select(),
-                KeyCode::Char('q') | KeyCode::Escape => self.close(),
-                _ => {}
+        let picker_input = {
+            let state = self.state.lock();
+            state
+                .picker
+                .as_ref()
+                .map(|p| matches!(p.stage, PickerStage::Input { .. }))
+        };
+        if let Some(is_input) = picker_input {
+            if is_input {
+                match key {
+                    KeyCode::Char('\r') | KeyCode::Enter => {
+                        if let Some(pane) = self.weak.lock().upgrade() {
+                            pane.picker_select();
+                        }
+                    }
+                    KeyCode::Escape => self.picker_cancel_input(),
+                    KeyCode::Backspace => self.picker_input_backspace(),
+                    KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CTRL) => {
+                        self.picker_input_char(c)
+                    }
+                    _ => {}
+                }
+            } else {
+                match key {
+                    KeyCode::Char('j') | KeyCode::DownArrow => self.picker_move(1),
+                    KeyCode::Char('k') | KeyCode::UpArrow => self.picker_move(-1),
+                    KeyCode::Char('\r') | KeyCode::Enter => {
+                        if let Some(pane) = self.weak.lock().upgrade() {
+                            pane.picker_select();
+                        }
+                    }
+                    KeyCode::Char('q') | KeyCode::Escape => self.close(),
+                    _ => {}
+                }
             }
             return Ok(());
         }
