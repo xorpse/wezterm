@@ -169,10 +169,13 @@ impl Domain for PaseoDomain {
             info.id.clone(),
             size,
             remote,
+            client.clone(),
         );
         self.attached_terminals.lock().insert(info.id.clone());
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        Mux::get().add_pane(&pane_dyn)?;
         pane.start_io(handle, input_rx);
-        Ok(pane as Arc<dyn Pane>)
+        Ok(pane_dyn)
     }
 
     fn spawnable(&self) -> bool {
@@ -228,6 +231,7 @@ impl Domain for PaseoDomain {
                 info.id.clone(),
                 size,
                 remote,
+                client.clone(),
             );
 
             let pane_dyn: Arc<dyn Pane> = pane.clone();

@@ -13,6 +13,7 @@ struct Options {
     create_agent: Option<String>,
     inspect: Option<String>,
     diff: Option<String>,
+    spawn_editor: Option<String>,
 }
 
 fn usage() -> anyhow::Error {
@@ -38,6 +39,7 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
         create_agent: None,
         inspect: None,
         diff: None,
+        spawn_editor: None,
     };
 
     if first == "--local" {
@@ -74,6 +76,9 @@ async fn connect_from_args(args: &[String]) -> anyhow::Result<(PaseoClient, Opti
             }
             "--diff" => {
                 options.diff = Some(iter.next().cloned().unwrap_or_default());
+            }
+            "--spawn-editor" => {
+                options.spawn_editor = Some(iter.next().cloned().unwrap_or_default());
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -138,7 +143,9 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
-    if let Some(cwd) = &options.diff {
+    if let Some(cwd) = &options.spawn_editor {
+        spawn_editor_probe(&client, cwd).await?;
+    } else if let Some(cwd) = &options.diff {
         probe_diff(&client, cwd).await?;
     } else if let Some(a) = &options.inspect {
         inspect_agent(&client, a, &agents).await?;
@@ -389,6 +396,81 @@ async fn create_probe(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
     handle.unsubscribe().await?;
     println!("killing terminal {}", terminal.id);
     client.kill_terminal(&terminal.id).await?;
+    Ok(())
+}
+
+async fn spawn_editor_probe(client: &PaseoClient, cwd: &str) -> anyhow::Result<()> {
+    let workspace_id = client.open_project(cwd).await?;
+    println!("workspace {workspace_id}");
+    let file = "/tmp/paseo-editor-probe.txt";
+    let variants: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "direct",
+            "nvim".to_string(),
+            vec!["+1".to_string(), file.to_string()],
+        ),
+        (
+            "shell",
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "exec \"${SHELL:-/bin/sh}\" -ilc \"$1\"".to_string(),
+                "sh".to_string(),
+                format!("exec nvim '+1' '{file}'"),
+            ],
+        ),
+    ];
+
+    for (label, program, args) in variants {
+        println!("\n=== variant {label}: {program} {args:?} ===");
+        let opts = CreateTerminalOpts {
+            name: Some(format!("paseo-editor-{label}")),
+            command: Some(program),
+            args: Some(args),
+            workspace_id: Some(workspace_id.clone()),
+            rows: 40,
+            cols: 120,
+            ..Default::default()
+        };
+        let terminal = match client.create_terminal(cwd, opts).await {
+            Ok(t) => t,
+            Err(e) => {
+                println!("[{label}] create_terminal FAILED: {e}");
+                continue;
+            }
+        };
+        println!("[{label}] created terminal {}", terminal.id);
+        let handle = client.subscribe_terminal(&terminal.id, "live").await?;
+        let rx = handle.output();
+        handle.resize(40, 120).await?;
+
+        let tid = terminal.id.clone();
+        let collect = async {
+            let mut total = 0usize;
+            while let Ok(event) = rx.recv_async().await {
+                match event {
+                    TerminalStreamEvent::Output(bytes) | TerminalStreamEvent::Restore(bytes) => {
+                        total += bytes.len();
+                        let preview: String =
+                            String::from_utf8_lossy(&bytes).chars().take(80).collect();
+                        println!("[{label} +{} bytes] {:?}", bytes.len(), preview);
+                    }
+                    TerminalStreamEvent::Snapshot(_) => println!("[{label} snapshot]"),
+                }
+            }
+            println!("[{label}] STREAM ENDED after {total} bytes");
+        };
+        let timer = async {
+            smol::Timer::after(Duration::from_secs(4)).await;
+        };
+        smol::future::or(collect, timer).await;
+
+        let terms = client.list_terminals(None).await?;
+        let alive = terms.iter().any(|t| t.id == tid);
+        println!("[{label}] alive after 4s: {alive}");
+        let _ = handle.unsubscribe().await;
+        let _ = client.kill_terminal(&tid).await;
+    }
     Ok(())
 }
 

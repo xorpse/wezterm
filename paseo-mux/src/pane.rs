@@ -10,7 +10,7 @@ use mux::renderable::{
 };
 use mux::{Mux, MuxNotification};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
-use paseo_client::{TerminalHandle, TerminalStreamEvent, TerminalWriter};
+use paseo_client::{PaseoClient, TerminalHandle, TerminalStreamEvent, TerminalWriter};
 use rangeset::RangeSet;
 use std::io::Write;
 use std::ops::Range;
@@ -47,6 +47,8 @@ pub struct PaseoTerminalPane {
     terminal: Mutex<Terminal>,
     writer: Mutex<Box<dyn Write + Send>>,
     remote: TerminalWriter,
+    client: PaseoClient,
+    killed: AtomicBool,
     dead: AtomicBool,
 }
 
@@ -57,6 +59,7 @@ impl PaseoTerminalPane {
         remote_terminal_id: String,
         size: TerminalSize,
         remote: TerminalWriter,
+        client: PaseoClient,
     ) -> (Arc<PaseoTerminalPane>, flume::Receiver<Vec<u8>>) {
         let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
         let term_config = Arc::new(config::TermConfig::new());
@@ -76,9 +79,23 @@ impl PaseoTerminalPane {
             terminal: Mutex::new(terminal),
             writer: Mutex::new(Box::new(ChannelWriter { tx: input_tx })),
             remote,
+            client,
+            killed: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         });
         (pane, input_rx)
+    }
+
+    fn kill_remote(&self) {
+        if self.killed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let client = self.client.clone();
+        let terminal_id = self.remote_terminal_id.clone();
+        promise::spawn::spawn(async move {
+            let _ = client.kill_terminal(&terminal_id).await;
+        })
+        .detach();
     }
 
     pub fn remote_terminal_id(&self) -> &str {
@@ -109,6 +126,7 @@ impl PaseoTerminalPane {
                 match config::configuration().exit_behavior {
                     config::ExitBehavior::Hold => mux.prune_dead_windows(),
                     config::ExitBehavior::Close | config::ExitBehavior::CloseOnCleanExit => {
+                        pane.kill_remote();
                         mux.remove_pane(pane_id)
                     }
                 }
@@ -232,6 +250,11 @@ impl Pane for PaseoTerminalPane {
 
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    fn kill(&self) {
+        self.dead.store(true, Ordering::Relaxed);
+        self.kill_remote();
     }
 
     fn palette(&self) -> ColorPalette {
