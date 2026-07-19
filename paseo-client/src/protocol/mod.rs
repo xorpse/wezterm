@@ -2,6 +2,7 @@ pub mod agents;
 pub mod stream;
 pub mod terminals;
 pub mod timeline;
+pub mod workspaces;
 
 use serde::Deserialize;
 use serde_json::Value;

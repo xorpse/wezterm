@@ -112,6 +112,18 @@ async fn run_script(client: PaseoClient, options: Options) -> anyhow::Result<()>
         );
     }
 
+    let workspaces = client.fetch_workspaces().await?;
+    println!("workspaces: {}", workspaces.len());
+    for ws in &workspaces {
+        println!(
+            "  {} project={} kind={} cwd={}",
+            ws.id,
+            ws.project_display_name,
+            ws.workspace_kind,
+            ws.cwd()
+        );
+    }
+
     let terminals = client.list_terminals(None).await?;
     println!("terminals: {}", terminals.len());
     for terminal in &terminals {

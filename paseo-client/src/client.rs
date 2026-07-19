@@ -303,6 +303,61 @@ impl PaseoClient {
             .await
     }
 
+    pub async fn fetch_workspaces(&self) -> Result<Vec<crate::protocol::workspaces::Workspace>> {
+        let id = new_id();
+        let payload = self
+            .request(crate::protocol::workspaces::fetch_workspaces_request(&id))
+            .await?;
+        let entries = payload.get("entries").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::from_value(entries).unwrap_or_default())
+    }
+
+    pub async fn project_add(&self, cwd: &str) -> Result<()> {
+        let id = new_id();
+        self.request(crate::protocol::workspaces::project_add_request(&id, cwd))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn project_create_directory(&self, parent_path: &str, name: &str) -> Result<String> {
+        let id = new_id();
+        let payload = self
+            .request(
+                crate::protocol::workspaces::project_create_directory_request(
+                    &id,
+                    parent_path,
+                    name,
+                ),
+            )
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_string()));
+        }
+        payload
+            .get("directoryPath")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("create_directory missing directoryPath".into()))
+    }
+
+    pub async fn project_github_clone(&self, repo: &str, protocol: &str) -> Result<String> {
+        let id = new_id();
+        let payload = self
+            .request(crate::protocol::workspaces::project_github_clone_request(
+                &id, repo, protocol,
+            ))
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_string()));
+        }
+        payload
+            .get("project")
+            .and_then(|p| p.get("rootPath"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("github clone missing project.rootPath".into()))
+    }
+
     pub async fn open_project(&self, cwd: &str) -> Result<String> {
         let id = new_id();
         let payload = self

@@ -18,4 +18,5 @@ pub use protocol::agents::{
 pub use protocol::stream::AgentStreamEvent;
 pub use protocol::terminals::CreateTerminalOpts;
 pub use protocol::timeline::{TimelineItem, ToolCallDetail};
+pub use protocol::workspaces::Workspace;
 pub use protocol::{AgentSnapshot, ServerInfo, TerminalInfo};
