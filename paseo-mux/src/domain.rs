@@ -32,6 +32,7 @@ pub struct PaseoDomain {
     state: Mutex<DomainState>,
     attached_terminals: Mutex<HashSet<String>>,
     projects: Arc<Mutex<HashMap<String, String>>>,
+    workspace_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl PaseoDomain {
@@ -44,7 +45,21 @@ impl PaseoDomain {
             state: Mutex::new(DomainState::Detached),
             attached_terminals: Mutex::new(HashSet::new()),
             projects: Arc::new(Mutex::new(HashMap::new())),
+            workspace_ids: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    async fn resolve_workspace_id(&self, client: &PaseoClient, cwd: &str) -> Option<String> {
+        if let Some(id) = self.workspace_ids.lock().get(cwd).cloned() {
+            return Some(id);
+        }
+        if let Ok(workspaces) = client.fetch_workspaces().await {
+            let mut map = self.workspace_ids.lock();
+            for ws in &workspaces {
+                map.insert(ws.cwd().to_string(), ws.id.clone());
+            }
+        }
+        self.workspace_ids.lock().get(cwd).cloned()
     }
 
     fn client_id(&self) -> String {
@@ -76,12 +91,15 @@ impl PaseoDomain {
         {
             let client = client.clone();
             let projects = self.projects.clone();
+            let workspace_ids = self.workspace_ids.clone();
             promise::spawn::spawn(async move {
                 if let Ok(workspaces) = client.fetch_workspaces().await {
-                    let mut map = projects.lock();
+                    let mut projects = projects.lock();
+                    let mut workspace_ids = workspace_ids.lock();
                     for ws in workspaces {
+                        workspace_ids.insert(ws.cwd().to_string(), ws.id.clone());
                         if !ws.project_display_name.is_empty() {
-                            map.insert(ws.cwd().to_string(), ws.project_display_name.clone());
+                            projects.insert(ws.cwd().to_string(), ws.project_display_name.clone());
                         }
                     }
                 }
@@ -135,7 +153,7 @@ impl Domain for PaseoDomain {
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let client = self.ensure_client().await?;
         let cwd = command_dir.unwrap_or_else(|| "/tmp".to_string());
-        let workspace_id = client.open_project(&cwd).await?;
+        let workspace_id = self.resolve_workspace_id(&client, &cwd).await;
 
         let (program, args) = match command {
             Some(builder) => {
@@ -155,7 +173,7 @@ impl Domain for PaseoDomain {
         let opts = paseo_client::CreateTerminalOpts {
             command: program,
             args,
-            workspace_id: Some(workspace_id),
+            workspace_id,
             rows: size.rows as u32,
             cols: size.cols as u32,
             ..Default::default()
