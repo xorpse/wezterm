@@ -12,10 +12,11 @@ use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab as M
 use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
-    AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent, ModelDefinition, PaseoClient,
-    PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail,
+    AgentListEntry, AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent, ModelDefinition,
+    PaseoClient, PermissionRequest, PermissionResponse, TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use termwiz::cell::{CellAttributes, Intensity};
@@ -260,6 +261,17 @@ struct PickerEntry {
     action: PickerAction,
 }
 
+struct PickerGroup {
+    label: String,
+    collapsed: bool,
+    entries: Vec<PickerEntry>,
+}
+
+enum PickerRow {
+    Header(usize),
+    Entry(usize, usize),
+}
+
 #[derive(Clone, Copy)]
 enum InputKind {
     NewDirectory,
@@ -276,10 +288,25 @@ enum PickerStage {
 }
 
 struct PickerState {
-    entries: Vec<PickerEntry>,
+    groups: Vec<PickerGroup>,
     selected: usize,
     stage: PickerStage,
     provider: String,
+}
+
+impl PickerState {
+    fn visible_rows(&self) -> Vec<PickerRow> {
+        let mut rows = Vec::new();
+        for (gi, group) in self.groups.iter().enumerate() {
+            rows.push(PickerRow::Header(gi));
+            if !group.collapsed {
+                for ei in 0..group.entries.len() {
+                    rows.push(PickerRow::Entry(gi, ei));
+                }
+            }
+        }
+        rows
+    }
 }
 
 fn picker_label(agent: &AgentSnapshot) -> String {
@@ -290,6 +317,139 @@ fn picker_label(agent: &AgentSnapshot) -> String {
         title.replace('\n', " ").chars().take(60).collect()
     };
     format!("[{}] {} ({})", agent.status, title, agent.provider)
+}
+
+fn basename(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+}
+
+fn short_kind(kind: &str) -> &str {
+    match kind {
+        "worktree" => "worktree",
+        "local_checkout" => "checkout",
+        other => other,
+    }
+}
+
+fn build_picker_groups(
+    agents: Vec<AgentListEntry>,
+    workspaces: Vec<Workspace>,
+) -> Vec<PickerGroup> {
+    let mut groups = vec![PickerGroup {
+        label: "Create".to_string(),
+        collapsed: false,
+        entries: vec![
+            PickerEntry {
+                label: "new directory + agent".to_string(),
+                action: PickerAction::NewDirectory,
+            },
+            PickerEntry {
+                label: "clone GitHub repo + agent".to_string(),
+                action: PickerAction::CloneRepo,
+            },
+        ],
+    }];
+
+    struct Proj {
+        display: String,
+        agents: Vec<PickerEntry>,
+        workspaces: Vec<PickerEntry>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut index: HashMap<String, Proj> = HashMap::new();
+    let mut cwd_project: HashMap<String, String> = HashMap::new();
+    let other_key = "\u{0}other".to_string();
+
+    for ws in &workspaces {
+        let key = if ws.project_id.is_empty() {
+            ws.project_display_name.clone()
+        } else {
+            ws.project_id.clone()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let display = if ws.project_display_name.is_empty() {
+            key.clone()
+        } else {
+            ws.project_display_name.clone()
+        };
+        index.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Proj {
+                display,
+                agents: Vec::new(),
+                workspaces: Vec::new(),
+            }
+        });
+        cwd_project.insert(ws.cwd().to_string(), key.clone());
+        if let Some(proj) = index.get_mut(&key) {
+            proj.workspaces.push(PickerEntry {
+                label: format!(
+                    "new  {}  ({})",
+                    basename(ws.cwd()),
+                    short_kind(&ws.workspace_kind)
+                ),
+                action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
+            });
+        }
+    }
+
+    for entry in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
+        let agent = entry.agent;
+        let key = cwd_project.get(&agent.cwd).cloned().unwrap_or_else(|| {
+            index.entry(other_key.clone()).or_insert_with(|| {
+                order.push(other_key.clone());
+                Proj {
+                    display: "Other".to_string(),
+                    agents: Vec::new(),
+                    workspaces: Vec::new(),
+                }
+            });
+            other_key.clone()
+        });
+        if let Some(proj) = index.get_mut(&key) {
+            proj.agents.push(PickerEntry {
+                label: format!("open  {}", picker_label(&agent)),
+                action: PickerAction::OpenAgent(agent.id.clone()),
+            });
+        }
+    }
+
+    order.sort_by(|x, y| match (*x == other_key, *y == other_key) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => {
+            let dx = index
+                .get(x)
+                .map(|p| p.display.to_lowercase())
+                .unwrap_or_default();
+            let dy = index
+                .get(y)
+                .map(|p| p.display.to_lowercase())
+                .unwrap_or_default();
+            dx.cmp(&dy)
+        }
+    });
+
+    for key in order {
+        if let Some(proj) = index.remove(&key) {
+            let has_agents = !proj.agents.is_empty();
+            let mut entries = proj.agents;
+            entries.extend(proj.workspaces);
+            groups.push(PickerGroup {
+                label: proj.display,
+                collapsed: !has_agents,
+                entries,
+            });
+        }
+    }
+
+    groups
 }
 
 struct AgentState {
@@ -372,40 +532,55 @@ impl AgentState {
             }
 
             let selected = picker.selected;
-            let count = picker.entries.len();
+            let rows = picker.visible_rows();
+            let count = rows.len();
             let mut transcript = Vec::new();
             transcript.push(AgentRow {
-                text: "Paseo — open an agent, or start a new one in a workspace".to_string(),
+                text: "Paseo — open an agent, or start one in a project".to_string(),
                 attrs: attr_bold_fg(AnsiColor::Teal),
             });
             transcript.push(blank_row());
-            if picker.entries.is_empty() {
+            if picker.groups.is_empty() {
                 push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
             }
             let mut sel_row = transcript.len();
-            for (i, entry) in picker.entries.iter().enumerate() {
+            for (i, row) in rows.iter().enumerate() {
                 let active = i == selected;
-                let attrs = if active {
-                    attr_bold_fg(AnsiColor::Teal)
-                } else {
-                    attr_default()
-                };
-                let prefix = if active { "▸ " } else { "  " };
                 if active {
                     sel_row = transcript.len();
                 }
+                let (prefix, label, attrs) = match row {
+                    PickerRow::Header(gi) => {
+                        let group = &picker.groups[*gi];
+                        let glyph = if group.collapsed { "▸" } else { "▾" };
+                        let marker = if active { "❯ " } else { "  " };
+                        (
+                            format!("{marker}{glyph} "),
+                            format!("{}  ({})", group.label, group.entries.len()),
+                            attr_bold_fg(AnsiColor::Teal),
+                        )
+                    }
+                    PickerRow::Entry(gi, ei) => {
+                        let entry = &picker.groups[*gi].entries[*ei];
+                        let marker = if active { "❯   " } else { "    " };
+                        let attrs = if active {
+                            attr_bold_fg(AnsiColor::Silver)
+                        } else {
+                            attr_default()
+                        };
+                        (marker.to_string(), entry.label.clone(), attrs)
+                    }
+                };
+                let budget = cols.saturating_sub(prefix.chars().count());
                 transcript.push(AgentRow {
-                    text: format!(
-                        "{prefix}{}",
-                        truncate_to(&entry.label, cols.saturating_sub(2))
-                    ),
+                    text: format!("{prefix}{}", truncate_to(&label, budget)),
                     attrs,
                 });
             }
             self.transcript = transcript;
             self.footer = vec![AgentRow {
                 text: format!(
-                    "❯ {}/{}  ·  Enter: select · j/k: move · q: close",
+                    "❯ {}/{}  ·  Enter: open / expand · j/k: move · q: close",
                     (selected + 1).min(count.max(1)),
                     count
                 ),
@@ -925,35 +1100,9 @@ impl PaseoAgentPane {
                     .filter(|p| !p.is_empty())
                     .unwrap_or_else(|| "codex".to_string());
 
-                let mut entries: Vec<PickerEntry> = Vec::new();
-                for e in agents.into_iter().filter(|e| e.agent.archived_at.is_none()) {
-                    entries.push(PickerEntry {
-                        label: format!("open  {}", picker_label(&e.agent)),
-                        action: PickerAction::OpenAgent(e.agent.id.clone()),
-                    });
-                }
-                for ws in &workspaces {
-                    entries.push(PickerEntry {
-                        label: format!(
-                            "new   {} · {}  ({})",
-                            ws.project_display_name,
-                            ws.cwd(),
-                            ws.workspace_kind
-                        ),
-                        action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
-                    });
-                }
-                entries.push(PickerEntry {
-                    label: "＋    new directory + agent".to_string(),
-                    action: PickerAction::NewDirectory,
-                });
-                entries.push(PickerEntry {
-                    label: "＋    clone GitHub repo + agent".to_string(),
-                    action: PickerAction::CloneRepo,
-                });
-
+                let groups = build_picker_groups(agents, workspaces);
                 if let Some(pane) = weak.upgrade() {
-                    pane.enter_hub(entries, hub_provider);
+                    pane.enter_hub(groups, hub_provider);
                 }
                 return;
             }
@@ -1059,13 +1208,13 @@ impl PaseoAgentPane {
         .detach();
     }
 
-    fn enter_hub(&self, entries: Vec<PickerEntry>, provider: String) {
+    fn enter_hub(&self, groups: Vec<PickerGroup>, provider: String) {
         self.mutate(|state| {
             state.status_message = None;
             state.follow = false;
             state.scroll = 0;
             state.picker = Some(PickerState {
-                entries,
+                groups,
                 selected: 0,
                 stage: PickerStage::Browse,
                 provider,
@@ -1077,10 +1226,10 @@ impl PaseoAgentPane {
     fn picker_move(&self, delta: isize) {
         self.mutate(|state| {
             if let Some(picker) = &mut state.picker {
-                if picker.entries.is_empty() {
+                let len = picker.visible_rows().len() as isize;
+                if len == 0 {
                     return;
                 }
-                let len = picker.entries.len() as isize;
                 let next = (picker.selected as isize + delta).rem_euclid(len);
                 picker.selected = next as usize;
             }
@@ -1195,6 +1344,7 @@ impl PaseoAgentPane {
             NewIn(String),
             StartInput(InputKind, String),
             RunInput(InputKind, String),
+            ToggleGroup(usize),
         }
         let chosen = {
             let state = self.state.lock();
@@ -1206,27 +1356,45 @@ impl PaseoAgentPane {
                     Some(Chosen::RunInput(*kind, buffer.trim().to_string()))
                 }
                 PickerStage::Browse => {
-                    picker
-                        .entries
-                        .get(picker.selected)
-                        .map(|e| match &e.action {
-                            PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
-                            PickerAction::NewAgentInWorkspace(cwd) => Chosen::NewIn(cwd.clone()),
-                            PickerAction::NewDirectory => Chosen::StartInput(
-                                InputKind::NewDirectory,
-                                "New directory (full path on the daemon):".to_string(),
-                            ),
-                            PickerAction::CloneRepo => Chosen::StartInput(
-                                InputKind::CloneRepo,
-                                "Clone GitHub repo (owner/name):".to_string(),
-                            ),
-                        })
+                    let rows = picker.visible_rows();
+                    match rows.get(picker.selected) {
+                        Some(PickerRow::Header(gi)) => Some(Chosen::ToggleGroup(*gi)),
+                        Some(PickerRow::Entry(gi, ei)) => {
+                            picker.groups.get(*gi).and_then(|g| g.entries.get(*ei)).map(
+                                |e| match &e.action {
+                                    PickerAction::OpenAgent(id) => Chosen::Open(id.clone()),
+                                    PickerAction::NewAgentInWorkspace(cwd) => {
+                                        Chosen::NewIn(cwd.clone())
+                                    }
+                                    PickerAction::NewDirectory => Chosen::StartInput(
+                                        InputKind::NewDirectory,
+                                        "New directory (full path on the daemon):".to_string(),
+                                    ),
+                                    PickerAction::CloneRepo => Chosen::StartInput(
+                                        InputKind::CloneRepo,
+                                        "Clone GitHub repo (owner/name):".to_string(),
+                                    ),
+                                },
+                            )
+                        }
+                        None => None,
+                    }
                 }
             }
         };
         match chosen {
             Some(Chosen::Open(id)) => self.open_agent_by_id(id),
             Some(Chosen::NewIn(cwd)) => self.create_agent_in(cwd),
+            Some(Chosen::ToggleGroup(gi)) => self.mutate(|state| {
+                if let Some(picker) = &mut state.picker {
+                    if let Some(group) = picker.groups.get_mut(gi) {
+                        group.collapsed = !group.collapsed;
+                    }
+                    let max = picker.visible_rows().len().saturating_sub(1);
+                    picker.selected = picker.selected.min(max);
+                }
+                state.rebuild_rows();
+            }),
             Some(Chosen::StartInput(kind, label)) => self.mutate(|state| {
                 if let Some(picker) = &mut state.picker {
                     picker.stage = PickerStage::Input {
