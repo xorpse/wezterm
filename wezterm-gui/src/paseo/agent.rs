@@ -2247,10 +2247,18 @@ impl PaseoAgentPane {
                 }
             }
 
-            if let Ok(commands) = client.list_commands(&agent_id).await {
-                if let Some(pane) = weak.upgrade() {
-                    pane.mutate(|state| state.slash_commands = commands);
-                }
+            {
+                let client = client.clone();
+                let agent_id = agent_id.clone();
+                let weak = weak.clone();
+                promise::spawn::spawn(async move {
+                    if let Ok(commands) = client.list_commands(&agent_id).await {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.mutate(|state| state.slash_commands = commands);
+                        }
+                    }
+                })
+                .detach();
             }
 
             let _ = client
