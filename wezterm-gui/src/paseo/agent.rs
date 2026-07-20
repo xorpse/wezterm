@@ -1101,6 +1101,7 @@ struct AgentState {
     selection: Option<AgentSelection>,
     queued: Vec<String>,
     draining: bool,
+    send_interrupts: bool,
 }
 
 /// Manual text selection over the transcript. Coordinates are `(transcript_row,
@@ -1672,14 +1673,33 @@ impl AgentState {
                         attrs: attr_dim(),
                         line: None,
                     });
-                } else {
-                    let hint = if is_active_status(&self.agent_status) {
-                        "Enter: queue  ·  Ctrl-Enter: interrupt & send  ·  Ctrl-C: clear  ·  Esc: cancel"
+                } else if is_active_status(&self.agent_status) {
+                    let (chip, color) = if self.send_interrupts {
+                        (
+                            "send mode: INTERRUPT (Enter sends now · Shift-Tab: queue)",
+                            AnsiColor::Fuchsia,
+                        )
                     } else {
-                        "Enter: send  ·  Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel"
+                        (
+                            "send mode: QUEUE (Enter queues · Shift-Tab: interrupt)",
+                            AnsiColor::Olive,
+                        )
                     };
                     footer.push(AgentRow {
-                        text: hint.to_string(),
+                        text: chip.to_string(),
+                        attrs: attr_fg(color),
+                        line: None,
+                    });
+                    footer.push(AgentRow {
+                        text: "Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel".to_string(),
+                        attrs: attr_dim(),
+                        line: None,
+                    });
+                } else {
+                    footer.push(AgentRow {
+                        text:
+                            "Enter: send  ·  Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel"
+                                .to_string(),
                         attrs: attr_dim(),
                         line: None,
                     });
@@ -2295,8 +2315,11 @@ impl PaseoAgentPane {
             return;
         }
 
-        let running = is_active_status(&self.state.lock().agent_status);
-        if running {
+        let (running, interrupts) = {
+            let state = self.state.lock();
+            (is_active_status(&state.agent_status), state.send_interrupts)
+        };
+        if running && !interrupts {
             self.mutate(|state| {
                 state.queued.push(text);
                 state.rebuild_rows();
@@ -2316,20 +2339,6 @@ impl PaseoAgentPane {
             })
             .detach();
         }
-    }
-
-    fn interrupt_and_send(&self) {
-        let text = {
-            let mut state = self.state.lock();
-            state.composer_cursor = 0;
-            std::mem::take(&mut state.composer).trim().to_string()
-        };
-        if text.is_empty() {
-            self.mutate(|state| state.rebuild_rows());
-            return;
-        }
-        self.send_now(text);
-        self.mutate(|state| state.rebuild_rows());
     }
 
     fn maybe_drain_queue(&self) {
@@ -4010,9 +4019,11 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll_to_bottom();
                 }
-                KeyCode::Char('\r') | KeyCode::Enter if mods.contains(KeyModifiers::CTRL) => {
-                    self.interrupt_and_send();
-                }
+                KeyCode::Char('\t') | KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => self
+                    .mutate(|state| {
+                        state.send_interrupts = !state.send_interrupts;
+                        state.rebuild_rows();
+                    }),
                 KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.mutate(|state| {
                     state.composer.clear();
                     state.composer_cursor = 0;
@@ -4286,6 +4297,7 @@ pub fn open_paseo_agent_pane(
             selection: None,
             queued: Vec::new(),
             draining: false,
+            send_interrupts: false,
         }),
     });
 
