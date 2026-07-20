@@ -252,6 +252,22 @@ fn truncate_to(text: &str, max: usize) -> String {
     s
 }
 
+fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + width).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
+}
+
 fn push_wrapped(
     rows: &mut Vec<AgentRow>,
     prefix: &str,
@@ -1236,6 +1252,38 @@ impl AgentState {
         self.composer_cursor = idx + target_col;
     }
 
+    fn composer_rows(&self) -> Vec<String> {
+        let width = self.size.cols.saturating_sub(2).max(1);
+        let mut out = Vec::new();
+        for (i, line) in self.composer.split('\n').enumerate() {
+            let head = if i == 0 { "❯ " } else { "  " };
+            for (ci, chunk) in wrap_chars(line, width).into_iter().enumerate() {
+                let prefix = if ci == 0 { head } else { "  " };
+                out.push(format!("{prefix}{chunk}"));
+            }
+        }
+        out
+    }
+
+    fn composer_cursor_display(&self) -> (usize, usize) {
+        let width = self.size.cols.saturating_sub(2).max(1);
+        let (line, col) = self.composer_line_col();
+        let mut row = 0;
+        for (i, l) in self.composer.split('\n').enumerate() {
+            if i == line {
+                break;
+            }
+            let len = l.chars().count();
+            row += if len == 0 { 1 } else { len.div_ceil(width) };
+        }
+        let (sub_row, sub_col) = if col > 0 && col % width == 0 {
+            (col / width - 1, width)
+        } else {
+            (col / width, col % width)
+        };
+        (row + sub_row, 2 + sub_col)
+    }
+
     fn composer_move_horizontal(&mut self, delta: isize) {
         let len = self.composer_char_len();
         let next = (self.composer_cursor.min(len) as isize + delta).clamp(0, len as isize);
@@ -1612,10 +1660,9 @@ impl AgentState {
                         line: None,
                     });
                 }
-                for (i, line) in self.composer.split('\n').enumerate() {
-                    let prefix = if i == 0 { "❯ " } else { "  " };
+                for text in self.composer_rows() {
                     footer.push(AgentRow {
-                        text: format!("{prefix}{line}"),
+                        text,
                         attrs: attr_default(),
                         line: None,
                     });
@@ -3662,12 +3709,12 @@ impl Pane for PaseoAgentPane {
     fn get_cursor_position(&self) -> StableCursorPosition {
         let state = self.state.lock();
         if state.mode == Mode::Compose {
-            let num_lines = state.composer.split('\n').count().max(1);
-            let (line, col) = state.composer_line_col();
-            let first_row = state.size.rows.saturating_sub(num_lines);
+            let total = state.composer_rows().len().max(1);
+            let (drow, dcol) = state.composer_cursor_display();
+            let first_row = state.size.rows.saturating_sub(total);
             return StableCursorPosition {
-                x: 2 + col,
-                y: (first_row + line) as StableRowIndex,
+                x: dcol,
+                y: (first_row + drow) as StableRowIndex,
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: CursorVisibility::Visible,
             };
