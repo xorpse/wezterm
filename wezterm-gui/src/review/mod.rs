@@ -108,6 +108,21 @@ struct EditState {
 }
 
 impl EditState {
+    fn display_pos(&self, width: usize) -> (usize, usize) {
+        let width = width.max(1);
+        let chunks_for = |len: usize| if len == 0 { 1 } else { len.div_ceil(width) };
+        let mut row_offset = 0usize;
+        for line in self.lines.iter().take(self.row) {
+            row_offset += chunks_for(line.chars().count());
+        }
+        let (sub_row, display_col) = if self.col > 0 && self.col % width == 0 {
+            (self.col / width - 1, width)
+        } else {
+            (self.col / width, self.col % width)
+        };
+        (row_offset + sub_row, display_col)
+    }
+
     fn new(anchor: LineAnchor, line_text: String, existing: Option<&String>) -> Self {
         let lines: Vec<String> = match existing {
             Some(text) if !text.is_empty() => text.split('\n').map(|s| s.to_string()).collect(),
@@ -417,7 +432,10 @@ impl ReviewState {
         }
         self.edit_first_row = self.rows.iter().position(|r| r.kind == RowKind::NoteEdit);
         match (self.edit_first_row, &self.editing) {
-            (Some(first), Some(edit)) => self.cursor = first + edit.row,
+            (Some(first), Some(edit)) => {
+                let width = self.size.cols.saturating_sub(NOTE_TEXT_COL).max(1);
+                self.cursor = first + edit.display_pos(width).0;
+            }
             _ => {
                 let max = self.rows.len().saturating_sub(1);
                 if self.cursor > max {
@@ -1366,12 +1384,15 @@ fn push_note_rows(
 ) {
     match editing {
         Some(edit) if &edit.anchor == anchor => {
+            let width = cols.saturating_sub(NOTE_TEXT_COL).max(1);
             for line in &edit.lines {
-                rows.push(note_row(
-                    format!("{EDIT_PREFIX}{line}"),
-                    RowKind::NoteEdit,
-                    anchor,
-                ));
+                for chunk in edit_wrap_chunks(line, width) {
+                    rows.push(note_row(
+                        format!("{EDIT_PREFIX}{chunk}"),
+                        RowKind::NoteEdit,
+                        anchor,
+                    ));
+                }
             }
         }
         _ => {
@@ -1412,6 +1433,21 @@ fn push_orphan_rows(
             first = false;
         }
     }
+}
+
+fn edit_wrap_chunks(line: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + width).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
 }
 
 fn wrap_note_lines(prefix: &str, text: &str, cols: usize) -> Vec<String> {
@@ -1775,9 +1811,11 @@ impl Pane for ReviewPane {
     fn get_cursor_position(&self) -> StableCursorPosition {
         let state = self.state.lock();
         if let (Some(edit), Some(first)) = (&state.editing, state.edit_first_row) {
-            let y = (first + edit.row).saturating_sub(state.scroll) as StableRowIndex;
+            let width = state.size.cols.saturating_sub(NOTE_TEXT_COL).max(1);
+            let (row_offset, display_col) = edit.display_pos(width);
+            let y = (first + row_offset).saturating_sub(state.scroll) as StableRowIndex;
             return StableCursorPosition {
-                x: NOTE_TEXT_COL + edit.col,
+                x: NOTE_TEXT_COL + display_col,
                 y,
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: CursorVisibility::Visible,
