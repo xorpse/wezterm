@@ -27,7 +27,7 @@ use termwiz::surface::{CursorVisibility, Line, SequenceNo};
 use url::Url;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{unicode_column_width, KeyCode, KeyModifiers, StableRowIndex, TerminalSize};
-use window::{Window, WindowOps};
+use window::{Clipboard, Window, WindowOps};
 
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
     let width = unicode_column_width(text, None);
@@ -1082,6 +1082,42 @@ struct AgentState {
     seqno: SequenceNo,
     dead: bool,
     create_stack: Vec<WizardFrame>,
+    selection: Option<AgentSelection>,
+}
+
+/// Manual text selection over the transcript. Coordinates are `(transcript_row,
+/// column)` in absolute transcript space so the highlight survives scrolling.
+/// Custom panes report `is_mouse_grabbed() == true`, which disables wezterm's
+/// native selection, so we track and render it ourselves.
+#[derive(Clone, Copy)]
+struct AgentSelection {
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+    dragging: bool,
+}
+
+impl AgentSelection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    fn cols_for_row(&self, row: usize) -> Option<Range<usize>> {
+        let (start, end) = self.ordered();
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let lo = if row == start.0 { start.1 } else { 0 };
+        let hi = if row == end.0 { end.1 } else { usize::MAX };
+        Some(lo..hi)
+    }
 }
 
 fn is_core_agent_key(ch: char) -> bool {
@@ -1594,6 +1630,10 @@ impl AgentState {
         }
         self.footer = footer;
 
+        if !self.selection.map(|s| s.dragging).unwrap_or(false) {
+            self.selection = None;
+        }
+
         self.clamp_scroll();
     }
 
@@ -1616,18 +1656,54 @@ impl AgentState {
     fn row_line(&self, screen_row: usize) -> Line {
         let cols = self.size.cols;
         let view_rows = self.view_rows();
-        let row = if screen_row < view_rows {
-            self.transcript.get(self.scroll + screen_row)
+        let (row, transcript_row) = if screen_row < view_rows {
+            let idx = self.scroll + screen_row;
+            (self.transcript.get(idx), Some(idx))
         } else {
-            self.footer.get(screen_row - view_rows)
+            (self.footer.get(screen_row - view_rows), None)
         };
-        match row {
+        let mut line = match row {
+            Some(AgentRow {
+                line: Some(line), ..
+            }) => line.clone(),
+            Some(row) => make_line(&row.text, &row.attrs, self.seqno, cols),
+            None => make_line("", &CellAttributes::default(), self.seqno, cols),
+        };
+        if let (Some(idx), Some(sel)) = (transcript_row, self.selection) {
+            if let Some(range) = sel.cols_for_row(idx) {
+                let cells = line.cells_mut_for_attr_changes_only();
+                let hi = range.end.min(cells.len());
+                for cell in cells.iter_mut().take(hi).skip(range.start) {
+                    cell.attrs_mut().set_reverse(true);
+                }
+            }
+        }
+        line
+    }
+
+    fn transcript_line(&self, idx: usize) -> Line {
+        let cols = self.size.cols;
+        match self.transcript.get(idx) {
             Some(AgentRow {
                 line: Some(line), ..
             }) => line.clone(),
             Some(row) => make_line(&row.text, &row.attrs, self.seqno, cols),
             None => make_line("", &CellAttributes::default(), self.seqno, cols),
         }
+    }
+
+    fn selected_text(&self) -> String {
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
+        let (start, end) = sel.ordered();
+        let mut lines = Vec::new();
+        for row in start.0..=end.0.min(self.transcript.len().saturating_sub(1)) {
+            let range = sel.cols_for_row(row).unwrap_or(0..0);
+            let text = self.transcript_line(row).columns_as_str(range);
+            lines.push(text.trim_end().to_string());
+        }
+        lines.join("\n")
     }
 
     fn apply_live_item(&mut self, item: TimelineItem) {
@@ -2013,6 +2089,65 @@ impl PaseoAgentPane {
     fn scroll_page(&self, dir: isize) {
         let page = self.state.lock().view_rows().max(1) as isize;
         self.scroll_lines(dir * page);
+    }
+
+    fn selection_start(&self, x: usize, y: i64) {
+        self.mutate(|state| {
+            let view_rows = state.view_rows();
+            if y < 0 || y as usize >= view_rows {
+                state.selection = None;
+                return;
+            }
+            let row = state.scroll + y as usize;
+            if row >= state.transcript.len() {
+                state.selection = None;
+                return;
+            }
+            let point = (row, x);
+            state.selection = Some(AgentSelection {
+                anchor: point,
+                cursor: point,
+                dragging: true,
+            });
+        });
+    }
+
+    fn selection_extend(&self, x: usize, y: i64) {
+        self.mutate(|state| {
+            let Some(mut sel) = state.selection else {
+                return;
+            };
+            if !sel.dragging {
+                return;
+            }
+            let view_rows = state.view_rows().max(1);
+            let screen_row = (y.max(0) as usize).min(view_rows - 1);
+            let row = (state.scroll + screen_row).min(state.transcript.len().saturating_sub(1));
+            sel.cursor = (row, x);
+            state.selection = Some(sel);
+        });
+    }
+
+    fn selection_finish(&self) {
+        let mut text = String::new();
+        self.mutate(|state| {
+            let Some(mut sel) = state.selection else {
+                return;
+            };
+            if !sel.dragging {
+                return;
+            }
+            sel.dragging = false;
+            if sel.is_empty() {
+                state.selection = None;
+                return;
+            }
+            state.selection = Some(sel);
+            text = state.selected_text();
+        });
+        if !text.is_empty() {
+            self.window.set_clipboard(Clipboard::Clipboard, text);
+        }
     }
 
     fn scroll_to_top(&self) {
@@ -3858,13 +3993,24 @@ impl Pane for PaseoAgentPane {
                 Some(p) if matches!(p.stage, PickerStage::Browse)
             )
         };
-        if event.kind == MouseEventKind::Press {
-            match event.button {
+        match event.kind {
+            MouseEventKind::Press => match event.button {
                 MouseButton::WheelUp(n) if in_picker => self.picker_move(-(n.max(1) as isize)),
                 MouseButton::WheelDown(n) if in_picker => self.picker_move(n.max(1) as isize),
                 MouseButton::WheelUp(n) => self.scroll_lines(-(n.max(1) as isize)),
                 MouseButton::WheelDown(n) => self.scroll_lines(n.max(1) as isize),
+                MouseButton::Left if !in_picker => self.selection_start(event.x, event.y),
                 _ => {}
+            },
+            MouseEventKind::Move => {
+                if event.button == MouseButton::Left && !in_picker {
+                    self.selection_extend(event.x, event.y);
+                }
+            }
+            MouseEventKind::Release => {
+                if event.button == MouseButton::Left && !in_picker {
+                    self.selection_finish();
+                }
             }
         }
         Ok(())
@@ -4006,6 +4152,7 @@ pub fn open_paseo_agent_pane(
             seqno: 1,
             dead: false,
             create_stack: Vec::new(),
+            selection: None,
         }),
     });
 
