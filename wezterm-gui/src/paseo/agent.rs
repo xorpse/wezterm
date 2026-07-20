@@ -4269,15 +4269,10 @@ pub fn open_paseo_agent_pane(
     } else if args.chooser {
         // The chooser adds the first daemon; it never spawns through
         // self.domain, so any placeholder domain satisfies the pane struct.
-        log::info!("open_paseo_agent_pane: no paseo domain, using default for chooser");
         mux.default_domain()
     } else {
         anyhow::bail!("no paseo domains configured; add one to paseo_daemons");
     };
-    log::info!(
-        "open_paseo_agent_pane: resolved domain {}",
-        domain.domain_name()
-    );
 
     enum Insertion {
         NewTab,
@@ -4386,12 +4381,6 @@ pub fn open_paseo_agent_pane(
             false
         }
     };
-
-    log::info!(
-        "open_paseo_agent_pane: inserted pane {} created_tab={created_tab} chooser={}",
-        pane.pane_id,
-        args.chooser
-    );
 
     if args.chooser {
         pane.start_chooser();

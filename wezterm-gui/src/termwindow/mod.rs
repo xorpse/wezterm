@@ -3207,29 +3207,23 @@ impl TermWindow {
                 }
             }
             ReviewMode(_) => {}
-            OpenPaseoAgentPane(args) => {
-                log::info!(
-                    "OpenPaseoAgentPane: chooser={} new_tab={} domain={:?}",
-                    args.chooser,
-                    args.new_tab,
-                    args.domain
-                );
-                match crate::paseo::open_paseo_agent_pane(self, args) {
-                    Ok(created_tab) => {
-                        log::info!("OpenPaseoAgentPane ok, created_tab={created_tab}");
-                        if created_tab {
-                            let _ = self.activate_tab(-1);
+            OpenPaseoAgentPane(args) => match crate::paseo::open_paseo_agent_pane(self, args) {
+                Ok(created_tab) => {
+                    if created_tab {
+                        let _ = self.activate_tab(-1);
+                        if let Some(window) = self.window.as_ref() {
+                            window.invalidate();
                         }
                     }
-                    Err(err) => {
-                        log::error!("failed to open paseo agent pane: {err:#}");
-                        wezterm_toast_notification::persistent_toast_notification(
-                            "Paseo",
-                            &format!("Couldn't open the agent pane: {err:#}"),
-                        );
-                    }
                 }
-            }
+                Err(err) => {
+                    log::error!("failed to open paseo agent pane: {err:#}");
+                    wezterm_toast_notification::persistent_toast_notification(
+                        "Paseo",
+                        &format!("Couldn't open the agent pane: {err:#}"),
+                    );
+                }
+            },
             RotatePanes(direction) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {

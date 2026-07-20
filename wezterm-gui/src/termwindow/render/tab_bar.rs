@@ -377,10 +377,7 @@ impl crate::TermWindow {
                 texts.pop();
             }
             let first = texts.len().saturating_sub(preview_rows);
-            let preview: Vec<String> = texts[first..]
-                .iter()
-                .map(|s| truncate(s, cols))
-                .collect();
+            let preview: Vec<String> = texts[first..].iter().map(|s| truncate(s, cols)).collect();
 
             (title, meta, preview)
         };
@@ -489,7 +486,10 @@ impl crate::TermWindow {
         } else {
             strip + border.left.get() as f32 + gap
         };
-        let ty = self.hovered_tab_rect.map(|r| r.1).unwrap_or(border.top.get() as f32);
+        let ty = self
+            .hovered_tab_rect
+            .map(|r| r.1)
+            .unwrap_or(border.top.get() as f32);
         let max_y = (pixel_height - h - border.bottom.get() as f32).max(border.top.get() as f32);
         let y = ty.min(max_y).max(border.top.get() as f32);
 
