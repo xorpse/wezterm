@@ -1986,9 +1986,8 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         OpenPaseoAgentPane(_) => CommandDef {
-            brief: "Paseo: open agent / connect a daemon".into(),
-            doc: "Open the Paseo picker to connect to (or add) a daemon and open agent sessions"
-                .into(),
+            brief: "Paseo: open agents".into(),
+            doc: "Open the Paseo picker to connect a daemon and open agent sessions".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
             menubar: &["Shell"],
