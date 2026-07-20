@@ -1909,8 +1909,13 @@ impl Pane for ReviewPane {
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.mutate(|state| {
+            let cols_changed = state.size.cols != size.cols;
             state.size = size;
-            state.ensure_visible();
+            if cols_changed {
+                state.rebuild_rows();
+            } else {
+                state.ensure_visible();
+            }
         });
         Ok(())
     }
