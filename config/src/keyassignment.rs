@@ -676,6 +676,21 @@ pub struct PaseoAgentArgs {
     #[dynamic(default)]
     pub size: SplitSize,
 }
+impl Default for PaseoAgentArgs {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            chooser: false,
+            agent_id: None,
+            provider: None,
+            cwd: None,
+            prompt: None,
+            new_tab: true,
+            direction: review_default_direction(),
+            size: SplitSize::default(),
+        }
+    }
+}
 impl_lua_conversion_dynamic!(PaseoAgentArgs);
 
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]

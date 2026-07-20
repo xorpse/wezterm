@@ -1986,8 +1986,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         OpenPaseoAgentPane(_) => CommandDef {
-            brief: "Open Paseo agent pane".into(),
-            doc: "Split the current pane and show a Paseo agent session".into(),
+            brief: "Paseo: open agent / connect a daemon".into(),
+            doc: "Open the Paseo picker to connect to (or add) a daemon and open agent sessions"
+                .into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
             menubar: &["Shell"],
@@ -2073,6 +2074,11 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),
         ResetTerminal,
         OpenReviewPane(ReviewPaneArgs::default()),
+        OpenPaseoAgentPane(PaseoAgentArgs {
+            chooser: true,
+            new_tab: true,
+            ..Default::default()
+        }),
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
         PasteFrom(ClipboardPasteSource::PrimarySelection),
