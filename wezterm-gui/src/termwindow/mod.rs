@@ -3214,6 +3214,10 @@ impl TermWindow {
                 Ok(false) => {}
                 Err(err) => {
                     log::error!("failed to open paseo agent pane: {err:#}");
+                    wezterm_toast_notification::persistent_toast_notification(
+                        "Paseo",
+                        &format!("Couldn't open the agent pane: {err:#}"),
+                    );
                 }
             },
             RotatePanes(direction) => {
