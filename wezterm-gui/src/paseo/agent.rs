@@ -405,6 +405,11 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
                 push_wrapped(rows, "  ", description, &attr_dim(), cols);
             }
         }
+        "plan" => {
+            if let Some(text) = &detail.text {
+                rows.extend(markdown_to_lines(text.trim(), cols));
+            }
+        }
         _ => {
             if let Some(path) = &detail.file_path {
                 push_wrapped(rows, "  ", path, &target, cols);
@@ -553,6 +558,36 @@ fn question_rows(request: &PermissionRequest, cols: usize) -> Vec<AgentRow> {
             }
         }
     }
+    rows
+}
+
+fn plan_text(request: &PermissionRequest) -> Option<String> {
+    if let Some(text) = request.detail.as_ref().and_then(|d| d.text.as_ref()) {
+        if !text.trim().is_empty() {
+            return Some(text.clone());
+        }
+    }
+    let input = request.input.as_ref()?.as_object()?;
+    for key in ["plan", "planText"] {
+        if let Some(text) = input.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn plan_rows(text: &str, cols: usize) -> Vec<AgentRow> {
+    let mut rows = vec![blank_row()];
+    push_wrapped(
+        &mut rows,
+        "",
+        "📋 Proposed plan",
+        &attr_bold_fg(AnsiColor::Yellow),
+        cols,
+    );
+    rows.extend(markdown_to_lines(text.trim(), cols));
     rows
 }
 
@@ -1505,6 +1540,19 @@ impl AgentState {
         let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
         if let Some(request) = self.pending.as_ref().filter(|r| pending_is_question(r)) {
             transcript.extend(question_rows(request, cols));
+        } else if let Some(text) = self.pending.as_ref().and_then(plan_text) {
+            let already_shown = self.items.iter().any(|item| {
+                item.kind == "tool_call"
+                    && item
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.text.as_deref())
+                        .map(str::trim)
+                        == Some(text.trim())
+            });
+            if !already_shown {
+                transcript.extend(plan_rows(&text, cols));
+            }
         }
         self.transcript = transcript;
 
@@ -4063,6 +4111,8 @@ impl Pane for PaseoAgentPane {
                     state.composer_move_vertical(1);
                     state.rebuild_rows();
                 }),
+                KeyCode::PageUp => self.scroll_page(-1),
+                KeyCode::PageDown => self.scroll_page(1),
                 KeyCode::Home => self.mutate(|state| {
                     state.composer_home();
                     state.rebuild_rows();
