@@ -1595,14 +1595,21 @@ fn build_rows(
                     let anchor = line_anchor(&file.file_path, line);
                     let marked = anchor.as_ref().is_some_and(|a| annotations.contains_key(a));
                     let glyph = if marked { '●' } else { ' ' };
-                    rows.push(RenderRow {
-                        text: format!("{glyph}{old} {new} {}{}", line.marker(), line.text),
-                        kind,
-                        anchor: anchor.clone(),
-                        payload: Some(format!("{}{}", line.marker(), line.text)),
-                        file: Some(file.file_path.clone()),
-                        commented: false,
-                    });
+                    let gutter = format!("{glyph}{old} {new} ");
+                    let content = format!("{}{}", line.marker(), line.text);
+                    let width = cols.saturating_sub(gutter.chars().count()).max(1);
+                    let indent = " ".repeat(gutter.chars().count());
+                    for (ci, chunk) in edit_wrap_chunks(&content, width).into_iter().enumerate() {
+                        let prefix = if ci == 0 { &gutter } else { &indent };
+                        rows.push(RenderRow {
+                            text: format!("{prefix}{chunk}"),
+                            kind,
+                            anchor: anchor.clone(),
+                            payload: if ci == 0 { Some(content.clone()) } else { None },
+                            file: Some(file.file_path.clone()),
+                            commented: false,
+                        });
+                    }
                     if let Some(a) = &anchor {
                         rendered_anchors.insert(a.clone());
                         push_note_rows(&mut rows, a, editing, annotations.get(a), cols);
@@ -2241,6 +2248,53 @@ mod tests {
         assert!(add.text.contains('2'));
         let del = rows.iter().find(|r| r.kind == RowKind::Delete).unwrap();
         assert!(del.text.contains("-old"));
+    }
+
+    #[test]
+    fn long_diff_line_wraps() {
+        let long = "a".repeat(80);
+        let hunk = DiffHunk {
+            old_start_line: 1,
+            old_line_count: 0,
+            new_start_line: 1,
+            new_line_count: 1,
+            lines: vec![dline(DiffLineType::Add, None, Some(2), &long)],
+        };
+        let data = GitDiffData {
+            files: vec![FileDiff {
+                file_path: "src/foo.rs".to_string(),
+                status: GitFileStatus::Modified,
+                hunks: vec![hunk],
+                is_binary: false,
+                oversized: false,
+                additions: 1,
+                deletions: 0,
+            }],
+            total_additions: 1,
+            total_deletions: 0,
+        };
+
+        let cols = 40;
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            cols,
+        );
+        let adds: Vec<&RenderRow> = rows.iter().filter(|r| r.kind == RowKind::Add).collect();
+        assert!(adds.len() > 1, "long line should wrap to multiple rows");
+        for r in &adds {
+            assert!(r.text.chars().count() <= cols, "row must fit within cols");
+            assert!(r.anchor == adds[0].anchor, "wrapped rows share the anchor");
+        }
+        let with_payload: Vec<&&RenderRow> = adds.iter().filter(|r| r.payload.is_some()).collect();
+        assert_eq!(with_payload.len(), 1, "only the head row carries a payload");
+        assert_eq!(
+            with_payload[0].payload.as_deref(),
+            Some(format!("+{long}").as_str())
+        );
     }
 
     #[test]
