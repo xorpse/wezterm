@@ -498,7 +498,7 @@ pub struct Config {
 
     /// If true, a vertical tab bar can be collapsed (hidden) via a
     /// hover-revealed button at the middle of its inner edge.
-    #[dynamic(default)]
+    #[dynamic(default = "default_true")]
     pub tab_bar_collapsible: bool,
 
     #[dynamic(default)]
