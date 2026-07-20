@@ -3609,8 +3609,29 @@ impl Pane for PaseoAgentPane {
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
         let text = text.to_string();
-        self.mutate(|state| {
-            if state.picker.is_none() {
+        let mut refresh = false;
+        self.mutate(|state| match &mut state.picker {
+            Some(PickerState {
+                stage:
+                    PickerStage::Input {
+                        kind,
+                        buffer,
+                        suggestion_selected,
+                        ..
+                    },
+                ..
+            }) => {
+                for c in text.chars() {
+                    if !c.is_control() {
+                        buffer.push(c);
+                    }
+                }
+                *suggestion_selected = 0;
+                refresh = kind.autocompletes();
+                state.rebuild_rows();
+            }
+            Some(_) => {}
+            None => {
                 state.mode = Mode::Compose;
                 for c in text.chars() {
                     state.composer_insert(if c == '\r' { '\n' } else { c });
@@ -3618,6 +3639,9 @@ impl Pane for PaseoAgentPane {
                 state.rebuild_rows();
             }
         });
+        if refresh {
+            self.refresh_suggestions();
+        }
         self.scroll_to_bottom();
         Ok(())
     }
