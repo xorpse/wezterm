@@ -1099,6 +1099,8 @@ struct AgentState {
     dead: bool,
     create_stack: Vec<WizardFrame>,
     selection: Option<AgentSelection>,
+    queued: Vec<String>,
+    draining: bool,
 }
 
 /// Manual text selection over the transcript. Coordinates are `(transcript_row,
@@ -1621,6 +1623,24 @@ impl AgentState {
                 line: None,
             });
         }
+        if !self.queued.is_empty() {
+            footer.push(AgentRow {
+                text: format!(
+                    "⏳ {} queued · sends when the agent is idle",
+                    self.queued.len()
+                ),
+                attrs: attr_fg(AnsiColor::Olive),
+                line: None,
+            });
+            for (i, msg) in self.queued.iter().enumerate() {
+                let first = msg.lines().next().unwrap_or("");
+                footer.push(AgentRow {
+                    text: truncate_to(&format!("  {}. {first}", i + 1), cols),
+                    attrs: attr_dim(),
+                    line: None,
+                });
+            }
+        }
         match self.mode {
             Mode::Compose => {
                 let filtered = self.filtered_slash();
@@ -1653,9 +1673,13 @@ impl AgentState {
                         line: None,
                     });
                 } else {
+                    let hint = if is_active_status(&self.agent_status) {
+                        "Enter: queue  ·  Ctrl-Enter: interrupt & send  ·  Ctrl-C: clear  ·  Esc: cancel"
+                    } else {
+                        "Enter: send  ·  Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel"
+                    };
                     footer.push(AgentRow {
-                        text: "Enter: send  ·  Shift-Enter: newline  ·  ←→↑↓: move  ·  Esc: cancel"
-                            .to_string(),
+                        text: hint.to_string(),
                         attrs: attr_dim(),
                         line: None,
                     });
@@ -1849,6 +1873,7 @@ impl PaseoAgentPane {
             "turn_started" => {
                 self.mutate(|state| {
                     state.agent_status = "running".to_string();
+                    state.draining = false;
                     state.rebuild_rows();
                 });
                 return;
@@ -1858,6 +1883,7 @@ impl PaseoAgentPane {
                     state.agent_status = "idle".to_string();
                     state.rebuild_rows();
                 });
+                self.maybe_drain_queue();
                 return;
             }
             "turn_failed" => {
@@ -1865,6 +1891,7 @@ impl PaseoAgentPane {
                     state.agent_status = "error".to_string();
                     state.rebuild_rows();
                 });
+                self.maybe_drain_queue();
                 return;
             }
             "timeline" => {}
@@ -1893,6 +1920,9 @@ impl PaseoAgentPane {
             state.title = session_name(state.workspace_name.as_deref(), snapshot);
             state.provider = snapshot.provider.clone();
             state.agent_status = snapshot.status.clone();
+            if is_active_status(&state.agent_status) {
+                state.draining = false;
+            }
             state.model = snapshot.model.clone();
             state.current_mode_id = snapshot.current_mode_id.clone();
             state.available_modes = snapshot.available_modes.clone();
@@ -1904,6 +1934,7 @@ impl PaseoAgentPane {
             }
             state.rebuild_rows();
         });
+        self.maybe_drain_queue();
     }
 
     fn set_models(&self, models: Vec<ModelDefinition>) {
@@ -2264,13 +2295,57 @@ impl PaseoAgentPane {
             return;
         }
 
+        let running = is_active_status(&self.state.lock().agent_status);
+        if running {
+            self.mutate(|state| {
+                state.queued.push(text);
+                state.rebuild_rows();
+            });
+            self.scroll_to_bottom();
+            return;
+        }
+
+        self.send_now(text);
+        self.mutate(|state| state.rebuild_rows());
+    }
+
+    fn send_now(&self, text: String) {
         if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
             promise::spawn::spawn(async move {
                 let _ = client.send_agent_message(&agent_id, &text).await;
             })
             .detach();
         }
+    }
+
+    fn interrupt_and_send(&self) {
+        let text = {
+            let mut state = self.state.lock();
+            state.composer_cursor = 0;
+            std::mem::take(&mut state.composer).trim().to_string()
+        };
+        if text.is_empty() {
+            self.mutate(|state| state.rebuild_rows());
+            return;
+        }
+        self.send_now(text);
         self.mutate(|state| state.rebuild_rows());
+    }
+
+    fn maybe_drain_queue(&self) {
+        let next = {
+            let mut state = self.state.lock();
+            if state.draining || is_active_status(&state.agent_status) || state.queued.is_empty() {
+                None
+            } else {
+                state.draining = true;
+                Some(state.queued.remove(0))
+            }
+        };
+        if let Some(text) = next {
+            self.send_now(text);
+            self.mutate(|state| state.rebuild_rows());
+        }
     }
 
     fn respond_permission(&self, allow: bool) {
@@ -3935,6 +4010,15 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll_to_bottom();
                 }
+                KeyCode::Char('\r') | KeyCode::Enter if mods.contains(KeyModifiers::CTRL) => {
+                    self.interrupt_and_send();
+                }
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.mutate(|state| {
+                    state.composer.clear();
+                    state.composer_cursor = 0;
+                    state.slash_dismissed = false;
+                    state.rebuild_rows();
+                }),
                 KeyCode::Char('\t') | KeyCode::Tab if self.slash_active() => self.slash_accept(),
                 KeyCode::Char('\r') | KeyCode::Enter if self.slash_active() => self.slash_accept(),
                 KeyCode::UpArrow if self.slash_active() => self.slash_move(-1),
@@ -4200,6 +4284,8 @@ pub fn open_paseo_agent_pane(
             dead: false,
             create_stack: Vec::new(),
             selection: None,
+            queued: Vec::new(),
+            draining: false,
         }),
     });
 
