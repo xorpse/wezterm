@@ -415,6 +415,28 @@ fn is_message(kind: &str) -> bool {
     matches!(kind, "assistant_message" | "reasoning" | "user_message")
 }
 
+fn coalesce_messages(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
+    let mut out: Vec<TimelineItem> = Vec::with_capacity(items.len());
+    for item in items {
+        if is_message(&item.kind) && item.message_id.is_some() {
+            if let Some(last) = out.last_mut() {
+                if last.kind == item.kind && last.message_id == item.message_id {
+                    let old = last.text.clone().unwrap_or_default();
+                    let new = item.text.clone().unwrap_or_default();
+                    last.text = Some(if new.starts_with(&old) {
+                        new
+                    } else {
+                        format!("{old}{new}")
+                    });
+                    continue;
+                }
+            }
+        }
+        out.push(item);
+    }
+    out
+}
+
 struct QuestionOption {
     label: String,
     description: Option<String>,
@@ -1683,7 +1705,7 @@ impl PaseoAgentPane {
     fn set_timeline(&self, items: &[TimelineItem]) {
         self.mutate(|state| {
             state.status_message = None;
-            state.items = items.to_vec();
+            state.items = coalesce_messages(items.to_vec());
             state.rebuild_rows();
         });
     }
