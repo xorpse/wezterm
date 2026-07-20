@@ -412,6 +412,7 @@ impl ReviewState {
                 &self.collapsed,
                 &self.file_loads,
                 self.editing.as_ref(),
+                self.size.cols,
             );
         }
         self.edit_first_row = self.rows.iter().position(|r| r.kind == RowKind::NoteEdit);
@@ -784,6 +785,21 @@ impl ReviewPane {
                 }
             }
         });
+    }
+
+    fn clear_comments(&self) {
+        self.mutate(|s| {
+            if !s.annotations.is_empty() {
+                s.annotations.clear();
+                s.editing = None;
+                s.rebuild_rows();
+            }
+        });
+    }
+
+    fn refresh_clear(&self) {
+        self.mutate(|s| s.annotations.clear());
+        self.recompute(true);
     }
 
     fn cancel_edit(&self) {
@@ -1346,6 +1362,7 @@ fn push_note_rows(
     anchor: &LineAnchor,
     editing: Option<&EditState>,
     saved: Option<&Comment>,
+    cols: usize,
 ) {
     match editing {
         Some(edit) if &edit.anchor == anchor => {
@@ -1360,11 +1377,9 @@ fn push_note_rows(
         _ => {
             if let Some(note) = saved {
                 for line in note.body.split('\n') {
-                    rows.push(note_row(
-                        format!("{NOTE_PREFIX}{line}"),
-                        RowKind::Note,
-                        anchor,
-                    ));
+                    for wrapped in wrap_note_lines(NOTE_PREFIX, line, cols) {
+                        rows.push(note_row(wrapped, RowKind::Note, anchor));
+                    }
                 }
             }
         }
@@ -1376,6 +1391,7 @@ fn push_orphan_rows(
     file: &str,
     annotations: &HashMap<LineAnchor, Comment>,
     rendered: &HashSet<LineAnchor>,
+    cols: usize,
 ) {
     let mut orphans: Vec<(&LineAnchor, &Comment)> = annotations
         .iter()
@@ -1383,15 +1399,66 @@ fn push_orphan_rows(
         .collect();
     orphans.sort_by_key(|(a, _)| a.line);
     for (anchor, comment) in orphans {
-        for (i, line) in comment.body.split('\n').enumerate() {
-            let text = if i == 0 {
-                format!("        ⚠ (outdated) {line}")
+        let mut first = true;
+        for line in comment.body.split('\n') {
+            let prefix = if first {
+                "        ⚠ (outdated) "
             } else {
-                format!("{NOTE_PREFIX}{line}")
+                NOTE_PREFIX
             };
-            rows.push(note_row(text, RowKind::Summary, anchor));
+            for wrapped in wrap_note_lines(prefix, line, cols) {
+                rows.push(note_row(wrapped, RowKind::Summary, anchor));
+            }
+            first = false;
         }
     }
+}
+
+fn wrap_note_lines(prefix: &str, text: &str, cols: usize) -> Vec<String> {
+    let width = cols.saturating_sub(prefix.chars().count()).max(1);
+    if text.chars().count() <= width {
+        return vec![format!("{prefix}{text}")];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split(' ') {
+        let ww = word.chars().count();
+        if ww > width {
+            if cur_w > 0 {
+                out.push(format!("{prefix}{cur}"));
+                cur.clear();
+                cur_w = 0;
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + width).min(chars.len());
+                out.push(format!(
+                    "{prefix}{}",
+                    chars[i..end].iter().collect::<String>()
+                ));
+                i = end;
+            }
+            continue;
+        }
+        let need = if cur_w == 0 { ww } else { cur_w + 1 + ww };
+        if need > width && cur_w > 0 {
+            out.push(format!("{prefix}{cur}"));
+            cur.clear();
+            cur_w = 0;
+        }
+        if cur_w > 0 {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        cur.push_str(word);
+        cur_w += ww;
+    }
+    if cur_w > 0 || out.is_empty() {
+        out.push(format!("{prefix}{cur}"));
+    }
+    out
 }
 
 fn build_rows(
@@ -1400,6 +1467,7 @@ fn build_rows(
     collapsed: &HashSet<String>,
     file_loads: &HashMap<String, FileLoad>,
     editing: Option<&EditState>,
+    cols: usize,
 ) -> Vec<RenderRow> {
     let mut rows = Vec::new();
     if data.files.is_empty() {
@@ -1501,13 +1569,19 @@ fn build_rows(
                     });
                     if let Some(a) = &anchor {
                         rendered_anchors.insert(a.clone());
-                        push_note_rows(&mut rows, a, editing, annotations.get(a));
+                        push_note_rows(&mut rows, a, editing, annotations.get(a), cols);
                     }
                 }
             }
         }
 
-        push_orphan_rows(&mut rows, &file.file_path, annotations, &rendered_anchors);
+        push_orphan_rows(
+            &mut rows,
+            &file.file_path,
+            annotations,
+            &rendered_anchors,
+            cols,
+        );
         rows.push(RenderRow::plain(String::new(), RowKind::Context));
     }
 
@@ -1906,6 +1980,8 @@ impl Pane for ReviewPane {
             }
             KeyCode::Char('b') => self.cycle_diff_mode(),
             KeyCode::Char('r') => self.recompute(false),
+            KeyCode::Char('R') => self.refresh_clear(),
+            KeyCode::Char('D') => self.clear_comments(),
             KeyCode::Char('g') => self.mutate(|s| s.to_top()),
             KeyCode::Char('G') => self.mutate(|s| s.to_bottom()),
             KeyCode::Char('u') if ctrl => self.mutate(|s| s.page(-1)),
@@ -2105,6 +2181,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert_eq!(rows[0].kind, RowKind::FileHeader);
         assert!(rows[0].text.contains("src/foo.rs"));
@@ -2144,6 +2221,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert!(rows
             .iter()
@@ -2155,6 +2233,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].kind, RowKind::Info);
@@ -2181,6 +2260,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert!(rows
             .iter()
@@ -2219,7 +2299,14 @@ mod tests {
             cmt("needs work"),
         );
 
-        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &ann,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         let note = rows.iter().find(|r| r.kind == RowKind::Note).unwrap();
         assert!(note.text.contains("needs work"));
         let add = rows.iter().find(|r| r.kind == RowKind::Add).unwrap();
@@ -2231,6 +2318,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert!(plain.iter().all(|r| r.kind != RowKind::Note));
     }
@@ -2269,7 +2357,14 @@ mod tests {
             },
             cmt("use the new api"),
         );
-        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &ann,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         let payload = build_send_payload(&rows, &ann, 0, rows.len() - 1);
 
         assert!(payload.contains("src/a.rs"));
@@ -2307,6 +2402,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         assert!(expanded.iter().any(|r| r.kind == RowKind::Add));
         assert!(expanded
@@ -2318,7 +2414,14 @@ mod tests {
 
         let mut collapsed = HashSet::new();
         collapsed.insert("src/foo.rs".to_string());
-        let folded = build_rows(&data, &HashMap::new(), &collapsed, &HashMap::new(), None);
+        let folded = build_rows(
+            &data,
+            &HashMap::new(),
+            &collapsed,
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         assert!(folded.iter().all(|r| r.kind == RowKind::FileHeader));
         assert!(folded[0].text.starts_with('▸'));
     }
@@ -2395,6 +2498,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             Some(&edit),
+            usize::MAX,
         );
         let edits: Vec<_> = rows
             .iter()
@@ -2438,7 +2542,14 @@ mod tests {
         let mut ann = HashMap::new();
         ann.insert(anchor_a1(), cmt("note"));
 
-        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &ann,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         let header = rows.iter().find(|r| r.kind == RowKind::FileHeader).unwrap();
         assert!(header.commented);
         assert!(header.text.contains('💬'));
@@ -2449,6 +2560,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             None,
+            usize::MAX,
         );
         let h2 = plain
             .iter()
@@ -2514,7 +2626,14 @@ mod tests {
             },
             cmt("stale note"),
         );
-        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &ann,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         assert!(rows
             .iter()
             .any(|r| r.text.contains("(outdated)") && r.text.contains("stale note")));
@@ -2525,7 +2644,14 @@ mod tests {
         let data = one_add_file();
         let mut ann = HashMap::new();
         ann.insert(anchor_a1(), cmt("line one\nline two"));
-        let rows = build_rows(&data, &ann, &HashSet::new(), &HashMap::new(), None);
+        let rows = build_rows(
+            &data,
+            &ann,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            usize::MAX,
+        );
         let notes: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::Note).collect();
         assert_eq!(notes.len(), 2);
         assert!(notes[0].text.contains("line one"));
