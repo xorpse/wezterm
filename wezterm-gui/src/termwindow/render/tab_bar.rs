@@ -153,7 +153,7 @@ impl crate::TermWindow {
             strip_width
         };
 
-        if !collapsed && !self.tab_bar_revealed {
+        if !self.tab_bar_revealed {
             return Ok(());
         }
 
