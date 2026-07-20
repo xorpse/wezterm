@@ -419,6 +419,45 @@ impl crate::TermWindow {
             let filtering = self.config.tab_bar_search && !query.is_empty();
             let mut match_count = 0usize;
 
+            let render_items: Vec<_> = if filtering {
+                let mut out: Vec<_> = Vec::new();
+                let mut pending: Vec<_> = Vec::new();
+                for item in items {
+                    match item.item {
+                        TabBarItem::WindowButton(_) | TabBarItem::NewTabButton => {}
+                        TabBarItem::GroupHeader { .. } => {
+                            pending.clear();
+                            pending.push(item);
+                        }
+                        TabBarItem::ProjectHeader { .. } => {
+                            if pending
+                                .last()
+                                .is_some_and(|h| matches!(h.item, TabBarItem::ProjectHeader { .. }))
+                            {
+                                pending.pop();
+                            }
+                            pending.push(item);
+                        }
+                        TabBarItem::Tab { tab_idx, .. } => {
+                            let hit = item.title.as_str().to_lowercase().contains(&query)
+                                || self
+                                    .tab_search_content(tab_idx)
+                                    .map(|c| c.to_lowercase().contains(&query))
+                                    .unwrap_or(false);
+                            if hit {
+                                out.append(&mut pending);
+                                out.push(item);
+                                match_count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out
+            } else {
+                items.iter().collect()
+            };
+
             if self.config.tab_bar_search && !collapsed {
                 let is_placeholder = self.tab_search_query.is_empty() && !self.tab_search_active;
                 let shown = if is_placeholder {
@@ -457,7 +496,7 @@ impl crate::TermWindow {
                 );
             }
 
-            for item in items {
+            for item in render_items {
                 if collapsed {
                     break;
                 }
@@ -466,20 +505,6 @@ impl crate::TermWindow {
                     TabBarItem::WindowButton(_) | TabBarItem::NewTabButton
                 ) {
                     continue;
-                }
-                if filtering {
-                    if let TabBarItem::Tab { tab_idx, .. } = item.item {
-                        let title_hit = item.title.as_str().to_lowercase().contains(&query);
-                        let content_hit = title_hit
-                            || self
-                                .tab_search_content(tab_idx)
-                                .map(|c| c.to_lowercase().contains(&query))
-                                .unwrap_or(false);
-                        if !content_hit {
-                            continue;
-                        }
-                        match_count += 1;
-                    }
                 }
                 let row = match item.item {
                     TabBarItem::Tab { tab_idx, active } => {
@@ -530,7 +555,9 @@ impl crate::TermWindow {
                     row.display(DisplayType::Block)
                         .float(Float::None)
                         .item_type(UIItemType::TabBar(item.item.clone()))
-                        .min_width(Some(Dimension::Pixels((strip_width - inset - gutter).max(0.))))
+                        .min_width(Some(Dimension::Pixels(
+                            (strip_width - inset - gutter).max(0.),
+                        )))
                         .max_width(Some(Dimension::Pixels((strip_width - gutter).max(0.)))),
                 );
             }
@@ -540,7 +567,12 @@ impl crate::TermWindow {
                     .colors(ElementColors {
                         border: BorderColor::default(),
                         bg: LinearRgba::TRANSPARENT.into(),
-                        text: colors.inactive_tab().fg_color.to_linear().mul_alpha(0.6).into(),
+                        text: colors
+                            .inactive_tab()
+                            .fg_color
+                            .to_linear()
+                            .mul_alpha(0.6)
+                            .into(),
                     })
                     .padding(BoxDimension {
                         left: Dimension::Cells(0.5),
