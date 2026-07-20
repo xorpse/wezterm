@@ -4252,18 +4252,27 @@ pub fn open_paseo_agent_pane(
         .clone()
         .ok_or_else(|| anyhow!("no window handle"))?;
 
-    let domain = if args.domain.is_empty() {
-        mux.iter_domains()
-            .into_iter()
-            .find(|d| d.downcast_ref::<paseo_mux::PaseoDomain>().is_some())
-            .ok_or_else(|| anyhow!("no paseo domains configured; add one to paseo_daemons"))?
+    let domain = if !args.domain.is_empty() {
+        let domain = mux
+            .get_domain_by_name(&args.domain)
+            .ok_or_else(|| anyhow!("paseo domain {} not found", args.domain))?;
+        if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_none() {
+            anyhow::bail!("domain {} is not a paseo domain", args.domain);
+        }
+        domain
+    } else if let Some(domain) = mux
+        .iter_domains()
+        .into_iter()
+        .find(|d| d.downcast_ref::<paseo_mux::PaseoDomain>().is_some())
+    {
+        domain
+    } else if args.chooser {
+        // The chooser adds the first daemon; it never spawns through
+        // self.domain, so any placeholder domain satisfies the pane struct.
+        mux.default_domain()
     } else {
-        mux.get_domain_by_name(&args.domain)
-            .ok_or_else(|| anyhow!("paseo domain {} not found", args.domain))?
+        anyhow::bail!("no paseo domains configured; add one to paseo_daemons");
     };
-    if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_none() {
-        anyhow::bail!("domain {} is not a paseo domain", args.domain);
-    }
 
     enum Insertion {
         NewTab,
