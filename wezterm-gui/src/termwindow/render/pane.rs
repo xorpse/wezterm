@@ -60,19 +60,11 @@ impl crate::TermWindow {
         let config = self.config.clone();
         let palette = pos.pane.palette();
 
-        let (padding_left, padding_top) = self.padding_left_top();
+        let (mut padding_left, padding_top) = self.padding_left_top();
+        let insets = self.tab_bar_insets();
+        padding_left += insets.left;
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, bottom_bar_height) = (insets.top, insets.bottom);
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -247,7 +239,10 @@ impl crate::TermWindow {
             let config = &self.config;
             let padding = self.effective_right_padding(&config) as f32;
 
-            let thumb_x = self.dimensions.pixel_width - padding as usize - border.right.get();
+            let thumb_x = self.dimensions.pixel_width
+                - padding as usize
+                - border.right.get()
+                - insets.right as usize;
 
             // Register the scroll bar location
             self.ui_items.push(UIItem {
@@ -587,17 +582,10 @@ impl crate::TermWindow {
 
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
-        let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        };
-        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (mut padding_left, padding_top) = self.padding_left_top();
+        let insets = self.tab_bar_insets();
+        padding_left += insets.left;
+        let top_bar_height = insets.top;
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;

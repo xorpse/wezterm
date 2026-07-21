@@ -15,6 +15,7 @@ use crate::keyassignment::{
 };
 use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
+use crate::paseo::PaseoDaemon;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
@@ -362,6 +363,9 @@ pub struct Config {
     pub exec_domains: Vec<ExecDomain>,
 
     #[dynamic(default)]
+    pub paseo_daemons: Vec<PaseoDaemon>,
+
+    #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,
 
     /// The set of unix domains
@@ -481,6 +485,48 @@ pub struct Config {
 
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
+
+    /// Where to place the tab bar. When unset, derives from `tab_bar_at_bottom`
+    /// (Top, or Bottom). `Left`/`Right` render a vertical sidebar and require
+    /// `use_fancy_tab_bar = true`.
+    #[dynamic(default)]
+    pub tab_bar_placement: Option<TabBarPlacement>,
+
+    /// Width (in cells) of a vertical (Left/Right) tab bar.
+    #[dynamic(default = "default_tab_bar_width")]
+    pub tab_bar_width: usize,
+
+    /// If true, a vertical tab bar can be collapsed (hidden) via a
+    /// hover-revealed button at the middle of its inner edge.
+    #[dynamic(default = "default_true")]
+    pub tab_bar_collapsible: bool,
+
+    #[dynamic(default)]
+    pub tab_bar_group_by_domain: bool,
+
+    /// If true, show a per-tab icon derived from the foreground process.
+    #[dynamic(default)]
+    pub show_tab_icons: bool,
+
+    /// If true, a vertical tab bar shows a search field at the top that
+    /// filters the tab list (by substring, case-insensitive) as you type.
+    #[dynamic(default = "default_true")]
+    pub tab_bar_search: bool,
+
+    /// If true, hovering a tab in a vertical tab bar reveals a floating card
+    /// previewing the tab's active pane (metadata plus recent output).
+    #[dynamic(default = "default_true")]
+    pub show_tab_hover_preview: bool,
+
+    /// Delay, in milliseconds, before the vertical tab bar hover preview card
+    /// appears once the pointer settles on a tab.
+    #[dynamic(default = "default_tab_hover_preview_delay_ms")]
+    pub tab_hover_preview_delay_ms: u64,
+
+    /// Width, in pixels, of the border drawn around the vertical tab bar hover
+    /// preview card.
+    #[dynamic(default = "default_tab_hover_preview_border_width")]
+    pub tab_hover_preview_border_width: f32,
 
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
@@ -1879,6 +1925,32 @@ fn default_enq_answerback() -> String {
 
 fn default_tab_max_width() -> usize {
     16
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum TabBarPlacement {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl TabBarPlacement {
+    pub fn is_vertical(self) -> bool {
+        matches!(self, TabBarPlacement::Left | TabBarPlacement::Right)
+    }
+}
+
+fn default_tab_bar_width() -> usize {
+    24
+}
+
+fn default_tab_hover_preview_delay_ms() -> u64 {
+    350
+}
+
+fn default_tab_hover_preview_border_width() -> f32 {
+    1.0
 }
 
 fn default_update_interval() -> u64 {

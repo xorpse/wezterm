@@ -159,6 +159,9 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    TabBarResize,
+    TabBarCollapse,
+    TabSearch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +209,19 @@ pub struct PaneState {
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
 }
 
+fn paseo_tab_project(pane: &Arc<dyn Pane>) -> Option<String> {
+    let domain = Mux::get().get_domain(pane.domain_id())?;
+    let paseo = domain.downcast_ref::<paseo_mux::PaseoDomain>()?;
+    let url = pane.get_current_working_dir(CachePolicy::FetchImmediate)?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = percent_encoding::percent_decode_str(url.path())
+        .decode_utf8_lossy()
+        .into_owned();
+    paseo.project_for_cwd(&path)
+}
+
 /// Data used when synchronously formatting pane and window titles
 #[derive(Debug, Clone)]
 pub struct TabInformation {
@@ -216,6 +232,8 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    pub domain_id: Option<mux::domain::DomainId>,
+    pub project: Option<String>,
 }
 
 impl UserData for TabInformation {
@@ -393,6 +411,17 @@ pub struct TermWindow {
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    tab_bar_width_override: Option<f32>,
+    tab_bar_collapsed: bool,
+    tab_bar_revealed: bool,
+    tab_search_active: bool,
+    tab_search_query: String,
+    tab_search_cache: RefCell<HashMap<usize, Option<String>>>,
+    hovered_tab: Option<usize>,
+    hovered_tab_rect: Option<(f32, f32, f32, f32)>,
+    hovered_card_rect: Option<(f32, f32, f32, f32)>,
+    hovered_card: Option<(usize, box_model::ComputedElement)>,
+    hovered_tab_since: Option<Instant>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -607,11 +636,35 @@ impl TermWindow {
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
-            Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
-        } else {
-            0
-        };
+        let (tab_bar_height, tab_bar_width) =
+            if show_tab_bar {
+                use config::TabBarPlacement;
+                let default = if config.tab_bar_at_bottom {
+                    TabBarPlacement::Bottom
+                } else {
+                    TabBarPlacement::Top
+                };
+                let placement = config.tab_bar_placement.unwrap_or(default);
+                let placement = if placement.is_vertical() && !config.use_fancy_tab_bar {
+                    default
+                } else {
+                    placement
+                };
+                if placement.is_vertical() {
+                    let width = Self::load_tab_bar_width().unwrap_or(
+                        Self::tab_bar_pixel_width_impl(&config, &fontconfig, &render_metrics)?,
+                    );
+                    (0, width as usize)
+                } else {
+                    (
+                        Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)?
+                            as usize,
+                        0,
+                    )
+                }
+            } else {
+                (0, 0)
+            };
 
         let terminal_size = TerminalSize {
             rows: physical_rows,
@@ -654,7 +707,8 @@ impl TermWindow {
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let mut dimensions = Dimensions {
-            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
+            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize
+                + tab_bar_width,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -715,6 +769,17 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            tab_bar_width_override: Self::load_tab_bar_width(),
+            tab_bar_collapsed: false,
+            tab_bar_revealed: false,
+            tab_search_active: false,
+            tab_search_query: String::new(),
+            tab_search_cache: RefCell::new(HashMap::new()),
+            hovered_tab: None,
+            hovered_tab_rect: None,
+            hovered_card_rect: None,
+            hovered_card: None,
+            hovered_tab_since: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2113,20 +2178,17 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
+            let insets = self.tab_bar_insets();
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
                 Point::new(
                     (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
+                        .add(padding_left as isize)
+                        .add(insets.left as isize),
                     ((cursor.y + pos.top as isize - top).max(0)
                         * self.render_metrics.cell_size.height)
-                        .add(tab_bar_height as isize)
+                        .add(insets.top as isize)
                         .add(padding_top as isize),
                 ),
                 self.render_metrics.cell_size,
@@ -2207,6 +2269,29 @@ impl TermWindow {
         Ok(())
     }
 
+    fn matching_tab_indices(&self) -> Vec<usize> {
+        let query = self.tab_search_query.trim().to_lowercase();
+        if query.is_empty() || !self.config.tab_bar_search {
+            return vec![];
+        }
+        self.tab_bar
+            .items()
+            .iter()
+            .filter_map(|entry| {
+                if let TabBarItem::Tab { tab_idx, .. } = entry.item {
+                    let hit = entry.title.as_str().to_lowercase().contains(&query)
+                        || self
+                            .tab_search_content(tab_idx)
+                            .map(|c| c.to_lowercase().contains(&query))
+                            .unwrap_or(false);
+                    hit.then_some(tab_idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
         let mux = Mux::get();
         let window = mux
@@ -2215,10 +2300,30 @@ impl TermWindow {
 
         let max = window.len();
         ensure!(max > 0, "no more tabs");
+        let active = window.get_active_idx() as isize;
+        drop(window);
+
+        let filtered = self.matching_tab_indices();
+        if !filtered.is_empty() {
+            let n = filtered.len() as isize;
+            let target = match filtered.iter().position(|&i| i as isize == active) {
+                Some(pos) => {
+                    let mut p = pos as isize + delta;
+                    if wrap {
+                        p = ((p % n) + n) % n;
+                    } else {
+                        p = p.clamp(0, n - 1);
+                    }
+                    filtered[p as usize]
+                }
+                None if delta >= 0 => filtered[0],
+                None => filtered[(n - 1) as usize],
+            };
+            return self.activate_tab(target as isize);
+        }
 
         // This logic is coupled with the CliSubCommand::ActivateTab
         // logic in wezterm/src/main.rs. If you update this, update that!
-        let active = window.get_active_idx() as isize;
         let tab = active + delta;
         let tab = if wrap {
             let tab = if tab < 0 { max as isize + tab } else { tab };
@@ -2232,7 +2337,6 @@ impl TermWindow {
                 tab
             }
         };
-        drop(window);
         self.activate_tab(tab)
     }
 
@@ -3097,6 +3201,29 @@ impl TermWindow {
             CopyMode(_) => {
                 // NOP here; handled by the overlay directly
             }
+            OpenReviewPane(args) => {
+                if let Err(err) = crate::review::open_review_pane(self, args) {
+                    log::error!("failed to open review pane: {err:#}");
+                }
+            }
+            ReviewMode(_) => {}
+            OpenPaseoAgentPane(args) => match crate::paseo::open_paseo_agent_pane(self, args) {
+                Ok(created_tab) => {
+                    if created_tab {
+                        let _ = self.activate_tab(-1);
+                        if let Some(window) = self.window.as_ref() {
+                            window.invalidate();
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::error!("failed to open paseo agent pane: {err:#}");
+                    wezterm_toast_notification::persistent_toast_notification(
+                        "Paseo",
+                        &format!("Couldn't open the agent pane: {err:#}"),
+                    );
+                }
+            },
             RotatePanes(direction) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -3158,6 +3285,16 @@ impl TermWindow {
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
+            }
+            ActivateTabSearch => {
+                if self.config.tab_bar_search && self.resolved_tab_bar_placement().is_vertical() {
+                    self.tab_search_active = true;
+                    self.clear_tab_search_cache();
+                    self.invalidate_fancy_tab_bar();
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
@@ -3467,6 +3604,11 @@ impl TermWindow {
             .enumerate()
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
+                let active_pane = tab.get_active_pane();
+                let domain_id = active_pane.as_ref().map(|p| p.domain_id());
+                let project = active_pane
+                    .as_ref()
+                    .and_then(|pane| paseo_tab_project(pane));
 
                 TabInformation {
                     tab_index: idx,
@@ -3482,6 +3624,8 @@ impl TermWindow {
                         .iter()
                         .find(|p| p.is_active)
                         .map(Self::pos_pane_to_pane_info),
+                    domain_id,
+                    project,
                 }
             })
             .collect()

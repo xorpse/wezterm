@@ -1969,6 +1969,30 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit", "Copy Mode"],
             icon: None,
         },
+        OpenReviewPane(_) => CommandDef {
+            brief: "Open git review pane".into(),
+            doc: "Split the current pane and show a git diff review".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
+        ReviewMode(action) => CommandDef {
+            brief: format!("{action:?}").into(),
+            doc: "".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit", "Review Mode"],
+            icon: None,
+        },
+        OpenPaseoAgentPane(_) => CommandDef {
+            brief: "Paseo: open agents".into(),
+            doc: "Open the Paseo picker to connect a daemon and open agent sessions".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
         RotatePanes(direction) => CommandDef {
             brief: format!("Rotate panes {direction:?}").into(),
             doc: format!("Rotate panes {direction:?}").into(),
@@ -2011,6 +2035,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        ActivateTabSearch => CommandDef {
+            brief: "Search tabs".into(),
+            doc: "Focuses the vertical tab bar search field to filter tabs".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_magnify"),
+        },
     })
 }
 
@@ -2040,6 +2072,12 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         CloseCurrentPane { confirm: true },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),
         ResetTerminal,
+        OpenReviewPane(ReviewPaneArgs::default()),
+        OpenPaseoAgentPane(PaseoAgentArgs {
+            chooser: true,
+            new_tab: true,
+            ..Default::default()
+        }),
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
         PasteFrom(ClipboardPasteSource::PrimarySelection),
@@ -2054,6 +2092,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        ActivateTabSearch,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,

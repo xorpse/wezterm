@@ -43,6 +43,9 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarResize
+            | UIItemType::TabBarCollapse
+            | UIItemType::TabSearch
             | UIItemType::Split(_) => {}
         }
     }
@@ -54,6 +57,9 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarResize
+            | UIItemType::TabBarCollapse
+            | UIItemType::TabSearch
             | UIItemType::Split(_) => {}
         }
     }
@@ -66,16 +72,16 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+        self.update_tab_bar_edge_hover(&event, context);
+        self.update_tab_hover(&event, context);
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let insets = self.tab_bar_insets();
+        let first_line_offset = insets.top as isize + border.top.get() as isize;
 
-        let (padding_left, padding_top) = self.padding_left_top();
+        let (mut padding_left, padding_top) = self.padding_left_top();
+        padding_left += insets.left;
 
         let y = (event
             .coords
@@ -129,9 +135,14 @@ impl super::TermWindow {
                     // Completed a window drag
                     return;
                 }
-                if press == &MousePress::Left && self.dragging.take().is_some() {
-                    // Completed a drag
-                    return;
+                if press == &MousePress::Left {
+                    if let Some((item, _)) = self.dragging.take() {
+                        // Completed a drag
+                        if matches!(item.item_type, UIItemType::TabBarResize) {
+                            self.save_tab_bar_width();
+                        }
+                        return;
+                    }
                 }
             }
 
@@ -216,6 +227,18 @@ impl super::TermWindow {
             None
         };
 
+        if matches!(event.kind, WMEK::Press(_)) && self.tab_search_active {
+            let clicked_search = matches!(
+                &ui_item,
+                Some(item) if item.item_type == UIItemType::TabSearch
+            );
+            if !clicked_search {
+                self.tab_search_active = false;
+                self.invalidate_fancy_tab_bar();
+                context.invalidate();
+            }
+        }
+
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
@@ -246,6 +269,11 @@ impl super::TermWindow {
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
+        self.tab_bar_revealed = false;
+        if self.hovered_tab.take().is_some() {
+            self.hovered_tab_rect = None;
+            self.hovered_tab_since = None;
+        }
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
@@ -348,6 +376,9 @@ impl super::TermWindow {
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
             }
+            UIItemType::TabBarResize => {
+                self.drag_tab_bar_resize(item, start_event, event);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
@@ -382,7 +413,165 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::TabBarResize => {
+                self.mouse_event_tab_bar_resize(item, event, context);
+            }
+            UIItemType::TabBarCollapse => {
+                self.mouse_event_tab_bar_collapse(event);
+            }
+            UIItemType::TabSearch => {
+                self.mouse_event_tab_search(event, context);
+            }
         }
+    }
+
+    fn update_tab_bar_edge_hover(&mut self, event: &MouseEvent, context: &dyn WindowOps) {
+        let near = if self.resolved_tab_bar_placement().is_vertical()
+            && self.config.tab_bar_collapsible
+        {
+            let strip_width = self.vertical_tab_bar_width();
+            let edge_x = if self.resolved_tab_bar_placement() == config::TabBarPlacement::Right {
+                self.dimensions.pixel_width as f32 - strip_width
+            } else {
+                strip_width
+            };
+            let mid_y = self.dimensions.pixel_height as f32 / 2.0;
+            let y_band = self.render_metrics.cell_size.height as f32 * 3.0;
+            let x_zone = if self.tab_bar_collapsed {
+                24.0
+            } else {
+                strip_width.min(60.).max(24.)
+            };
+            (event.coords.x as f32 - edge_x).abs() <= x_zone
+                && (event.coords.y as f32 - mid_y).abs() <= y_band
+        } else {
+            false
+        };
+        if near != self.tab_bar_revealed {
+            self.tab_bar_revealed = near;
+            context.invalidate();
+        }
+    }
+
+    fn clear_tab_hover(&mut self, context: &dyn WindowOps) {
+        if self.hovered_tab.take().is_some() {
+            self.hovered_tab_rect = None;
+            self.hovered_card_rect = None;
+            self.hovered_card = None;
+            self.hovered_tab_since = None;
+            context.invalidate();
+        }
+    }
+
+    fn update_tab_hover(&mut self, event: &MouseEvent, context: &dyn WindowOps) {
+        if !self.config.show_tab_hover_preview
+            || !self.resolved_tab_bar_placement().is_vertical()
+            || self.tab_bar_collapsed
+        {
+            self.clear_tab_hover(context);
+            return;
+        }
+
+        let x = event.coords.x as f32;
+        let y = event.coords.y as f32;
+
+        let over_card = self
+            .hovered_card_rect
+            .map(|(cx, cy, cw, ch)| x >= cx && x <= cx + cw && y >= cy && y <= cy + ch)
+            .unwrap_or(false);
+
+        let hovered = self.resolve_ui_item(event).and_then(|item| {
+            if let UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) = item.item_type {
+                Some((tab_idx, item))
+            } else {
+                None
+            }
+        });
+
+        match hovered {
+            Some((tab_idx, item)) => {
+                let rect = (
+                    item.x as f32,
+                    item.y as f32,
+                    item.width as f32,
+                    item.height as f32,
+                );
+                if self.hovered_tab != Some(tab_idx) {
+                    self.hovered_tab = Some(tab_idx);
+                    self.hovered_tab_rect = Some(rect);
+                    self.hovered_card = None;
+                    self.hovered_tab_since = Some(std::time::Instant::now());
+                    context.invalidate();
+                } else if self.hovered_tab_rect != Some(rect) {
+                    self.hovered_tab_rect = Some(rect);
+                    context.invalidate();
+                }
+            }
+            None => {
+                if !over_card {
+                    self.clear_tab_hover(context);
+                }
+            }
+        }
+    }
+
+    pub fn mouse_event_tab_search(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.tab_search_active = true;
+            self.clear_tab_search_cache();
+            self.invalidate_fancy_tab_bar();
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_tab_bar_collapse(&mut self, event: MouseEvent) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.tab_bar_collapsed = !self.tab_bar_collapsed;
+            self.relayout_for_tab_bar();
+        }
+    }
+
+    fn relayout_for_tab_bar(&mut self) {
+        if let Some(window) = self.window.clone() {
+            let dims = self.dimensions;
+            self.apply_dimensions(&dims, None, &window);
+        }
+        self.invalidate_fancy_tab_bar();
+    }
+
+    pub fn mouse_event_tab_bar_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    fn drag_tab_bar_resize(&mut self, item: UIItem, start_event: MouseEvent, event: MouseEvent) {
+        use config::TabBarPlacement;
+        let mouse_x = event.coords.x as f32;
+        let border = self.get_os_border();
+        let width = match self.resolved_tab_bar_placement() {
+            TabBarPlacement::Right => {
+                self.dimensions.pixel_width as f32 - mouse_x - border.right.get() as f32
+            }
+            _ => mouse_x - border.left.get() as f32,
+        };
+        let min = 4.0 * self.render_metrics.cell_size.width as f32;
+        let max = self.dimensions.pixel_width as f32 / 2.0;
+        let width = width.clamp(min, max);
+        self.tab_bar_width_override = Some(width);
+
+        if let Some(window) = self.window.clone() {
+            let dims = self.dimensions;
+            self.apply_dimensions(&dims, None, &window);
+        }
+        self.invalidate_fancy_tab_bar();
+        self.dragging.replace((item, start_event));
     }
 
     pub fn mouse_event_close_tab(
@@ -467,6 +656,19 @@ impl super::TermWindow {
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
+                TabBarItem::GroupHeader { domain_id } => {
+                    crate::tabbar::toggle_tab_group(domain_id, None);
+                    self.invalidate_fancy_tab_bar();
+                    self.update_title();
+                }
+                TabBarItem::ProjectHeader {
+                    domain_id,
+                    project_hash,
+                } => {
+                    crate::tabbar::toggle_tab_group(domain_id, Some(project_hash));
+                    self.invalidate_fancy_tab_bar();
+                    self.update_title();
+                }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     let maximized = self
                         .window_state
@@ -520,6 +722,8 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
@@ -532,10 +736,16 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
-                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::GroupHeader { .. }
+                | TabBarItem::ProjectHeader { .. } => {
                     context.set_window_drag_position(event.screen_coords);
                 }
                 TabBarItem::WindowButton(window::IntegratedTitleButton::Maximize) => {

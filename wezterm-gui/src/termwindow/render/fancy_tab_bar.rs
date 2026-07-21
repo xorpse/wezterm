@@ -4,6 +4,7 @@ use crate::termwindow::box_model::*;
 use crate::termwindow::render::corners::*;
 
 use crate::termwindow::render::window_buttons::window_button_element;
+use crate::termwindow::render::LinearRgba;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{Dimension, DimensionContext, TabBarColors};
@@ -89,6 +90,7 @@ impl crate::TermWindow {
             .into(),
         };
 
+        let is_vertical = self.resolved_tab_bar_placement().is_vertical();
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
 
@@ -253,7 +255,11 @@ impl crate::TermWindow {
                         let bg = bg_color
                             .unwrap_or_else(|| inactive_tab.bg_color.into())
                             .to_linear();
-                        let edge = colors.inactive_tab_edge().to_linear();
+                        let edge = if is_vertical {
+                            bg
+                        } else {
+                            colors.inactive_tab_edge().to_linear()
+                        };
                         ElementColors {
                             border: BorderColor {
                                 left: bg,
@@ -293,6 +299,31 @@ impl crate::TermWindow {
                     &metrics,
                     &self.config,
                 ),
+                TabBarItem::GroupHeader { .. } | TabBarItem::ProjectHeader { .. } => {
+                    let inactive = colors.inactive_tab();
+                    element
+                        .item_type(UIItemType::TabBar(item.item))
+                        .line_height(Some(1.4))
+                        .vertical_align(VerticalAlign::Middle)
+                        .margin(BoxDimension {
+                            left: Dimension::Cells(0.),
+                            right: Dimension::Cells(0.),
+                            top: Dimension::Cells(0.35),
+                            bottom: Dimension::Cells(0.),
+                        })
+                        .padding(BoxDimension {
+                            left: Dimension::Cells(0.75),
+                            right: Dimension::Cells(0.5),
+                            top: Dimension::Cells(0.1),
+                            bottom: Dimension::Cells(0.1),
+                        })
+                        .border(BoxDimension::new(Dimension::Pixels(0.)))
+                        .colors(ElementColors {
+                            border: BorderColor::default(),
+                            bg: LinearRgba::TRANSPARENT.into(),
+                            text: inactive.fg_color.to_linear().into(),
+                        })
+                }
             }
         };
 
@@ -355,6 +386,248 @@ impl crate::TermWindow {
                 }
                 _ => left_eles.push(item_to_elem(item)),
             }
+        }
+
+        if self.resolved_tab_bar_placement().is_vertical() {
+            use config::TabBarPlacement;
+            let collapsed = self.tab_bar_collapsed;
+            let strip_width = self.vertical_tab_bar_width();
+            let tab_gutter = metrics.cell_size.width as f32 * 0.4;
+            let border = self.get_os_border();
+
+            let mut col: Vec<Element> = vec![];
+
+            if !collapsed {
+                let window_buttons: Vec<Element> = items
+                    .iter()
+                    .filter(|item| matches!(item.item, TabBarItem::WindowButton(_)))
+                    .map(item_to_elem)
+                    .collect();
+                if !window_buttons.is_empty() {
+                    col.push(
+                        Element::new(&font, ElementContent::Children(window_buttons))
+                            .display(DisplayType::Block)
+                            .vertical_align(VerticalAlign::Top)
+                            .min_width(Some(Dimension::Pixels(strip_width)))
+                            .max_width(Some(Dimension::Pixels(strip_width)))
+                            .colors(bar_colors.clone()),
+                    );
+                }
+            }
+
+            let query = self.tab_search_query.trim().to_lowercase();
+            let filtering = self.config.tab_bar_search && !query.is_empty();
+            let mut match_count = 0usize;
+
+            let render_items: Vec<_> = if filtering {
+                let mut out: Vec<_> = Vec::new();
+                let mut pending: Vec<_> = Vec::new();
+                for item in items {
+                    match item.item {
+                        TabBarItem::WindowButton(_) | TabBarItem::NewTabButton => {}
+                        TabBarItem::GroupHeader { .. } => {
+                            pending.clear();
+                            pending.push(item);
+                        }
+                        TabBarItem::ProjectHeader { .. } => {
+                            if pending
+                                .last()
+                                .is_some_and(|h| matches!(h.item, TabBarItem::ProjectHeader { .. }))
+                            {
+                                pending.pop();
+                            }
+                            pending.push(item);
+                        }
+                        TabBarItem::Tab { tab_idx, .. } => {
+                            let hit = item.title.as_str().to_lowercase().contains(&query)
+                                || self
+                                    .tab_search_content(tab_idx)
+                                    .map(|c| c.to_lowercase().contains(&query))
+                                    .unwrap_or(false);
+                            if hit {
+                                out.append(&mut pending);
+                                out.push(item);
+                                match_count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out
+            } else {
+                items.iter().collect()
+            };
+
+            if self.config.tab_bar_search && !collapsed {
+                let is_placeholder = self.tab_search_query.is_empty() && !self.tab_search_active;
+                let shown = if is_placeholder {
+                    " \u{f002}  \u{2026}".to_string()
+                } else if self.tab_search_active {
+                    format!(" \u{f002}  {}\u{258f}", self.tab_search_query)
+                } else {
+                    format!(" \u{f002}  {}", self.tab_search_query)
+                };
+                let base_fg = colors.inactive_tab().fg_color.to_linear();
+                let text_color = if is_placeholder {
+                    base_fg.mul_alpha(0.5)
+                } else {
+                    base_fg
+                };
+                let inner = Element::new(&font, ElementContent::Text(shown))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: text_color.into(),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.25),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)));
+                col.push(
+                    Element::new(&font, ElementContent::Children(vec![inner]))
+                        .display(DisplayType::Block)
+                        .item_type(UIItemType::TabSearch)
+                        .min_width(Some(Dimension::Pixels((strip_width - tab_gutter).max(0.))))
+                        .max_width(Some(Dimension::Pixels((strip_width - tab_gutter).max(0.))))
+                        .colors(bar_colors.clone()),
+                );
+            }
+
+            for item in render_items {
+                if collapsed {
+                    break;
+                }
+                if matches!(
+                    item.item,
+                    TabBarItem::WindowButton(_) | TabBarItem::NewTabButton
+                ) {
+                    continue;
+                }
+                let row = match item.item {
+                    TabBarItem::Tab { tab_idx, active } => {
+                        let mut e = item_to_elem(item);
+                        e.content = match e.content {
+                            ElementContent::Children(mut kids) => {
+                                if self.config.show_close_tab_button_in_tabs {
+                                    kids.push(make_x_button(
+                                        &font, &metrics, &colors, tab_idx, active,
+                                    ));
+                                }
+                                ElementContent::Children(kids)
+                            }
+                            other => other,
+                        };
+                        e.vertical_align(VerticalAlign::Top)
+                    }
+                    TabBarItem::NewTabButton => {
+                        let new_tab = colors.new_tab();
+                        let new_tab_hover = colors.new_tab_hover();
+                        let inner = item_to_elem(item)
+                            .colors(ElementColors {
+                                border: BorderColor::default(),
+                                bg: LinearRgba::TRANSPARENT.into(),
+                                text: new_tab.fg_color.to_linear().into(),
+                            })
+                            .hover_colors(None);
+                        Element::new(&font, ElementContent::Children(vec![inner]))
+                            .colors(ElementColors {
+                                border: BorderColor::default(),
+                                bg: new_tab.bg_color.to_linear().into(),
+                                text: new_tab.fg_color.to_linear().into(),
+                            })
+                            .hover_colors(Some(ElementColors {
+                                border: BorderColor::default(),
+                                bg: new_tab_hover.bg_color.to_linear().into(),
+                                text: new_tab_hover.fg_color.to_linear().into(),
+                            }))
+                    }
+                    _ => Element::new(&font, ElementContent::Children(vec![item_to_elem(item)])),
+                };
+                let (inset, gutter) = if matches!(item.item, TabBarItem::Tab { .. }) {
+                    (metrics.cell_size.width as f32 + 2.0, tab_gutter)
+                } else {
+                    (0.0, 0.0)
+                };
+                col.push(
+                    row.display(DisplayType::Block)
+                        .float(Float::None)
+                        .item_type(UIItemType::TabBar(item.item.clone()))
+                        .min_width(Some(Dimension::Pixels(
+                            (strip_width - inset - gutter).max(0.),
+                        )))
+                        .max_width(Some(Dimension::Pixels((strip_width - gutter).max(0.)))),
+                );
+            }
+
+            if filtering && match_count == 0 {
+                let inner = Element::new(&font, ElementContent::Text("No tabs match".to_string()))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: colors
+                            .inactive_tab()
+                            .fg_color
+                            .to_linear()
+                            .mul_alpha(0.6)
+                            .into(),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.5),
+                        bottom: Dimension::Cells(0.5),
+                    });
+                col.push(
+                    Element::new(&font, ElementContent::Children(vec![inner]))
+                        .display(DisplayType::Block)
+                        .min_width(Some(Dimension::Pixels(strip_width)))
+                        .max_width(Some(Dimension::Pixels(strip_width)))
+                        .colors(bar_colors.clone()),
+                );
+            }
+
+            let tabs = Element::new(&font, ElementContent::Children(col))
+                .display(DisplayType::Block)
+                .item_type(UIItemType::TabBar(TabBarItem::None))
+                .min_width(Some(Dimension::Pixels(strip_width)))
+                .min_height(Some(Dimension::Pixels(self.dimensions.pixel_height as f32)))
+                .colors(bar_colors);
+
+            let x0 = if self.resolved_tab_bar_placement() == TabBarPlacement::Right {
+                self.dimensions.pixel_width as f32 - strip_width - border.right.get() as f32
+            } else {
+                border.left.get() as f32
+            };
+
+            let computed = self.compute_element(
+                &LayoutContext {
+                    height: DimensionContext {
+                        dpi: self.dimensions.dpi as f32,
+                        pixel_max: self.dimensions.pixel_height as f32,
+                        pixel_cell: metrics.cell_size.height as f32,
+                    },
+                    width: DimensionContext {
+                        dpi: self.dimensions.dpi as f32,
+                        pixel_max: strip_width,
+                        pixel_cell: metrics.cell_size.width as f32,
+                    },
+                    bounds: euclid::rect(
+                        x0,
+                        border.top.get() as f32,
+                        strip_width,
+                        self.dimensions.pixel_height as f32
+                            - (border.top + border.bottom).get() as f32,
+                    ),
+                    metrics: &metrics,
+                    gl_state: self.render_state.as_ref().unwrap(),
+                    zindex: 10,
+                },
+                &tabs,
+            )?;
+            return Ok(computed);
         }
 
         let mut children = vec![];

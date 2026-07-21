@@ -640,14 +640,119 @@ pub enum KeyAssignment {
     ResetTerminal,
     OpenUri(String),
     ActivateCommandPalette,
+    ActivateTabSearch,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
+
+    OpenReviewPane(ReviewPaneArgs),
+    ReviewMode(ReviewModeAssignment),
+
+    OpenPaseoAgentPane(PaseoAgentArgs),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct PaseoAgentArgs {
+    #[dynamic(default)]
+    pub domain: String,
+    #[dynamic(default)]
+    pub chooser: bool,
+    #[dynamic(default)]
+    pub agent_id: Option<String>,
+    #[dynamic(default)]
+    pub provider: Option<String>,
+    #[dynamic(default)]
+    pub cwd: Option<String>,
+    #[dynamic(default)]
+    pub prompt: Option<String>,
+    #[dynamic(default = "crate::default_true")]
+    pub new_tab: bool,
+    #[dynamic(default = "review_default_direction")]
+    pub direction: PaneDirection,
+    #[dynamic(default)]
+    pub size: SplitSize,
+}
+impl Default for PaseoAgentArgs {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            chooser: false,
+            agent_id: None,
+            provider: None,
+            cwd: None,
+            prompt: None,
+            new_tab: true,
+            direction: review_default_direction(),
+            size: SplitSize::default(),
+        }
+    }
+}
+impl_lua_conversion_dynamic!(PaseoAgentArgs);
+
+#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ReviewDiffMode {
+    WorkingTree,
+    Staged,
+    Branch(String),
+    MergeBase(String),
+}
+
+impl Default for ReviewDiffMode {
+    fn default() -> Self {
+        Self::WorkingTree
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct ReviewPaneArgs {
+    #[dynamic(default = "review_default_direction")]
+    pub direction: PaneDirection,
+    #[dynamic(default)]
+    pub size: SplitSize,
+    #[dynamic(default)]
+    pub mode: ReviewDiffMode,
+}
+
+fn review_default_direction() -> PaneDirection {
+    PaneDirection::Right
+}
+
+impl Default for ReviewPaneArgs {
+    fn default() -> Self {
+        Self {
+            direction: review_default_direction(),
+            size: SplitSize::default(),
+            mode: ReviewDiffMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ReviewModeAssignment {
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    MoveToTop,
+    MoveToBottom,
+    NextHunk,
+    PrevHunk,
+    NextFile,
+    PrevFile,
+    ToggleSelect,
+    Annotate,
+    SendSelection,
+    SendAll,
+    ToggleFold,
+    FindFile,
+    CycleDiffMode,
+    Refresh,
+    Close,
+}
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct SplitPane {

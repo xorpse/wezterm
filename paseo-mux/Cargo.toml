@@ -1,0 +1,22 @@
+[package]
+name = "paseo-mux"
+version = "0.1.0"
+edition = "2021"
+description = "WezTerm mux Domain and Pane backed by a Paseo daemon"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+url = { workspace = true }
+flume = { workspace = true }
+rangeset = { workspace = true }
+config = { workspace = true }
+mux = { workspace = true }
+wezterm-term = { workspace = true }
+termwiz = { workspace = true }
+promise = { workspace = true }
+portable-pty = { workspace = true }
+paseo-client = { workspace = true }
