@@ -6,7 +6,6 @@ members = [
   "sync-color-schemes",
   "deps/cairo",
   "git-review",
-  "paseo-client",
   "paseo-mux",
   "wezterm",
   "wezterm-blob-leases",
@@ -163,7 +162,7 @@ objc2-user-notifications = "0.3"
 openssl = "0.10.57"
 ordered-float = {version="4.1", default-features=false}
 parking_lot = "0.12"
-paseo-client = { path = "paseo-client" }
+paseo-client = { git = "ssh://git@github.com/xorpse/paseo-client.git", branch = "dev" }
 paseo-mux = { path = "paseo-mux" }
 passfd = "0.1.6"
 percent-encoding = "2.3"

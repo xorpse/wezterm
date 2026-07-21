@@ -19,4 +19,4 @@ wezterm-term = { workspace = true }
 termwiz = { workspace = true }
 promise = { workspace = true }
 portable-pty = { workspace = true }
-paseo-client = { path = "../paseo-client" }
+paseo-client = { workspace = true }
