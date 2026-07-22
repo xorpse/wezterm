@@ -1,14 +1,15 @@
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use anyhow::anyhow;
 use config::keyassignment::{
-    KeyAssignment, PaneDirection, ReviewDiffMode, ReviewModeAssignment, ReviewPaneArgs,
-    SpawnCommand, SpawnTabDomain, SplitSize as ConfigSplitSize,
+    KeyAssignment, PaneDirection, ReviewDiffLayout, ReviewDiffMode, ReviewModeAssignment,
+    ReviewPaneArgs, SpawnCommand, SpawnTabDomain, SplitSize as ConfigSplitSize,
 };
+use futures::{Stream, StreamExt};
 use git_review::{
     compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, parent_branch,
-    DiffLimits, DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
+    DiffLimits, DiffLine, DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
-use paseo_client::PaseoClient;
+use paseo_client::{DaemonEvent, PaseoClient};
 
 mod highlight;
 mod paseo_source;
@@ -61,6 +62,8 @@ const NOTE_TEXT_COL: usize = 10;
 const NOTE_PREFIX: &str = "        ▎ ";
 const EDIT_PREFIX: &str = "        ┃ ";
 const HEADER_ROWS: usize = 3;
+const MIN_SPLIT_COLS: usize = 100;
+const H_SCROLL_STEP: usize = 8;
 
 #[derive(Hash)]
 enum ViewRow {
@@ -119,6 +122,9 @@ impl RenderRow {
             let mut attrs = attrs.clone();
             if let Some(color) = span.color {
                 attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(color));
+            }
+            if let Some(color) = span.background {
+                attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(color));
             }
             segments.push((text, attrs));
         }
@@ -288,16 +294,21 @@ struct ComputedDiff {
     repo_root: String,
     branch: Option<String>,
     parent_branch: Option<String>,
+    subscription: Option<String>,
     data: GitDiffData,
 }
 
 struct ReviewState {
     status: LoadStatus,
     mode: DiffMode,
+    layout: ReviewDiffLayout,
+    h_scroll: usize,
+    focus: Side,
     source: DiffSource,
     repo_root: String,
     branch: Option<String>,
     parent_branch: Option<String>,
+    subscription: Option<String>,
     data: Option<GitDiffData>,
     cache: HashMap<DiffMode, GitDiffData>,
     highlights: HashMap<String, FileHighlight>,
@@ -380,6 +391,30 @@ impl ReviewState {
         self.annotations = new_map;
     }
 
+    fn effective_layout(&self) -> ReviewDiffLayout {
+        if self.layout == ReviewDiffLayout::SideBySide && self.size.cols >= MIN_SPLIT_COLS {
+            ReviewDiffLayout::SideBySide
+        } else {
+            ReviewDiffLayout::Unified
+        }
+    }
+
+    fn max_h_scroll(&self) -> usize {
+        let Some(data) = &self.data else {
+            return 0;
+        };
+        let widest = data
+            .files
+            .iter()
+            .filter(|file| !self.collapsed.contains(&file.file_path))
+            .flat_map(|file| &file.hunks)
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| line.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        widest.saturating_sub(self.size.cols / 4)
+    }
+
     fn header_rows(&self) -> usize {
         HEADER_ROWS.min(self.size.rows.saturating_sub(1))
     }
@@ -442,8 +477,16 @@ impl ReviewState {
                     segments.push((files.as_str(), CellAttributes::default()));
                     segments.push(("  ·  ", dim.clone()));
                     segments.push((additions.as_str(), added));
-                    segments.push((" ", dim));
+                    segments.push((" ", dim.clone()));
                     segments.push((deletions.as_str(), removed));
+                }
+                let scrolled = format!("  ·  col:{}", self.h_scroll + 1);
+                if self.effective_layout() == ReviewDiffLayout::SideBySide {
+                    segments.push(("  ·  ", dim.clone()));
+                    segments.push(("side-by-side", dim.clone()));
+                    if self.h_scroll > 0 {
+                        segments.push((scrolled.as_str(), dim));
+                    }
                 }
                 styled_line(segments)
             }
@@ -493,6 +536,8 @@ impl ReviewState {
                 self.branch.hash(&mut h);
                 self.repo_root.hash(&mut h);
                 self.status.hash(&mut h);
+                self.effective_layout().hash(&mut h);
+                self.h_scroll.hash(&mut h);
                 if let Some(data) = &self.data {
                     data.files.len().hash(&mut h);
                     data.total_additions.hash(&mut h);
@@ -592,6 +637,13 @@ impl ReviewState {
             }
         }
         self.highlights.extend(fresh);
+        let layout = RowLayout {
+            diff: self.effective_layout(),
+            cols: self.size.cols,
+            h_scroll: self.h_scroll,
+            focus: self.focus,
+            tints: self.tints,
+        };
         if let Some(data) = &self.data {
             self.rows = build_rows(
                 data,
@@ -600,7 +652,7 @@ impl ReviewState {
                 &self.file_loads,
                 &self.highlights,
                 self.editing.as_ref(),
-                self.size.cols,
+                &layout,
             );
         }
         self.edit_first_row = self.rows.iter().position(|r| r.kind == RowKind::NoteEdit);
@@ -747,9 +799,16 @@ impl ReviewPane {
     }
 
     fn request_close(&self) {
-        {
+        let (source, subscription) = {
             let mut state = self.state.lock();
             state.dead = true;
+            (state.source.clone(), state.subscription.take())
+        };
+        if let (DiffSource::Paseo { client, .. }, Some(subscription)) = (source, subscription) {
+            promise::spawn::spawn(async move {
+                let _ = client.unsubscribe_checkout_diff(&subscription).await;
+            })
+            .detach();
         }
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -780,6 +839,11 @@ impl ReviewPane {
             SendSelection => self.send_selection(),
             SendAll => self.send_comments(),
             ToggleFold => self.toggle_fold(),
+            ToggleLayout => self.toggle_layout(),
+            FocusOldSide => self.focus_side(Side::Old),
+            FocusNewSide => self.focus_side(Side::New),
+            ScrollLeft => self.scroll_horizontally(-1),
+            ScrollRight => self.scroll_horizontally(1),
             FindFile => self.start_find(),
             CycleDiffMode => self.cycle_diff_mode(),
             Refresh => self.recompute(false),
@@ -820,6 +884,43 @@ impl ReviewPane {
             }
         }
         self.recompute(true);
+    }
+
+    fn toggle_layout(&self) {
+        self.mutate(|s| {
+            s.layout = match s.layout {
+                ReviewDiffLayout::SideBySide => ReviewDiffLayout::Unified,
+                ReviewDiffLayout::Unified => ReviewDiffLayout::SideBySide,
+            };
+            s.h_scroll = 0;
+            s.rebuild_rows();
+        });
+    }
+
+    fn focus_side(&self, side: Side) {
+        self.mutate(|s| {
+            if s.focus == side || s.effective_layout() != ReviewDiffLayout::SideBySide {
+                return;
+            }
+            s.focus = side;
+            s.rebuild_rows();
+        });
+    }
+
+    fn scroll_horizontally(&self, direction: isize) {
+        self.mutate(|s| {
+            if s.effective_layout() != ReviewDiffLayout::SideBySide {
+                return;
+            }
+            let step = H_SCROLL_STEP as isize * direction;
+            let next = (s.h_scroll as isize + step).max(0) as usize;
+            let next = next.min(s.max_h_scroll());
+            if next == s.h_scroll {
+                return;
+            }
+            s.h_scroll = next;
+            s.rebuild_rows();
+        });
     }
 
     fn toggle_select(&self) {
@@ -1223,6 +1324,7 @@ impl ReviewPane {
                             repo_root: root,
                             branch,
                             parent_branch: parent,
+                            subscription: None,
                             data,
                         })
                     })();
@@ -1237,8 +1339,22 @@ impl ReviewPane {
             }
             DiffSource::Paseo { client, cwd } => {
                 promise::spawn::spawn(async move {
-                    let result = paseo_source::fetch(client, cwd, mode.clone()).await;
+                    let events = client.events();
+                    let stale = pane.state.lock().subscription.take();
+                    if let Some(stale) = stale {
+                        let _ = client.unsubscribe_checkout_diff(&stale).await;
+                    }
+                    let result = paseo_source::fetch(client.clone(), cwd, mode.clone()).await;
+                    let subscription = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|computed| computed.subscription.clone());
+                    let weak = Arc::downgrade(&pane);
                     Self::apply_compute_result(&pane, seq, reset_view, mode, result, None);
+                    drop(pane);
+                    if let Some(subscription) = subscription {
+                        Self::watch_diff_updates(weak, client, events, subscription, seq).await;
+                    }
                 })
                 .detach();
             }
@@ -1263,11 +1379,13 @@ impl ReviewPane {
                     repo_root,
                     branch,
                     parent_branch,
+                    subscription,
                     data,
                 }) => {
                     state.repo_root = repo_root;
                     state.branch = branch;
                     state.parent_branch = parent_branch;
+                    state.subscription = subscription;
                     state.highlights.clear();
                     state.cache.insert(mode.clone(), data.clone());
                     if reset_view {
@@ -1294,6 +1412,44 @@ impl ReviewPane {
             state.seqno += 1;
         }
         pane.window.invalidate();
+    }
+
+    async fn watch_diff_updates(
+        weak: Weak<ReviewPane>,
+        client: PaseoClient,
+        mut events: impl Stream<Item = DaemonEvent> + Unpin,
+        subscription: String,
+        seq: u64,
+    ) {
+        while let Some(event) = events.next().await {
+            let Some(pane) = weak.upgrade() else { break };
+            let DaemonEvent::CheckoutDiff(diff) = event else {
+                continue;
+            };
+            if diff.subscription_id != subscription || diff.error.is_some() {
+                continue;
+            }
+            let data = paseo_source::convert(diff.files);
+            {
+                let mut state = pane.state.lock();
+                if state.dead || state.compute_seq != seq {
+                    break;
+                }
+                if state.editing.is_some() || state.find.is_some() {
+                    continue;
+                }
+                let mode = state.mode.clone();
+                state.highlights.clear();
+                state.cache.insert(mode, data.clone());
+                state.data = Some(data);
+                state.status = LoadStatus::Ready;
+                state.reanchor_annotations();
+                state.rebuild_rows();
+                state.seqno += 1;
+            }
+            pane.window.invalidate();
+        }
+        let _ = client.unsubscribe_checkout_diff(&subscription).await;
     }
 
     fn spawn_loading_ticker(pane: Arc<ReviewPane>, seq: u64) {
@@ -1699,6 +1855,189 @@ fn wrap_note_lines(prefix: &str, text: &str, cols: usize) -> Vec<String> {
     out
 }
 
+struct RowLayout {
+    diff: ReviewDiffLayout,
+    cols: usize,
+    h_scroll: usize,
+    focus: Side,
+    tints: DiffTints,
+}
+
+impl RowLayout {
+    fn column_width(&self) -> usize {
+        self.cols.saturating_sub(1) / 2
+    }
+}
+
+struct SplitSide {
+    text: String,
+    spans: Vec<Span>,
+    anchor: Option<LineAnchor>,
+    payload: Option<String>,
+}
+
+fn split_side(
+    line: Option<&DiffLine>,
+    file_path: &str,
+    annotations: &HashMap<LineAnchor, Comment>,
+    highlight: Option<&FileHighlight>,
+    width: usize,
+    layout: &RowLayout,
+) -> SplitSide {
+    let Some(line) = line else {
+        return SplitSide {
+            text: " ".repeat(width),
+            spans: vec![Span::plain(width)],
+            anchor: None,
+            payload: None,
+        };
+    };
+
+    let background = match line.line_type {
+        DiffLineType::Add => Some(layout.tints.add),
+        DiffLineType::Delete => Some(layout.tints.delete),
+        DiffLineType::Context => None,
+    };
+    let anchor = line_anchor(file_path, line);
+    let marked = anchor.as_ref().is_some_and(|a| annotations.contains_key(a));
+    let number = match line.line_type {
+        DiffLineType::Delete => line.old_line_number,
+        DiffLineType::Add | DiffLineType::Context => line.new_line_number,
+    };
+    let gutter = format!(
+        "{}{} {}",
+        if marked { '●' } else { ' ' },
+        number.map_or_else(|| "     ".to_string(), |n| format!("{n:>5}")),
+        line.marker()
+    );
+
+    let available = width.saturating_sub(gutter.chars().count());
+    let text_chars = line.text.chars().count();
+    let overflows = text_chars.saturating_sub(layout.h_scroll) > available;
+    let visible = if overflows {
+        available.saturating_sub(1)
+    } else {
+        available
+    };
+    let body: String = line
+        .text
+        .chars()
+        .skip(layout.h_scroll)
+        .take(visible)
+        .collect();
+    let body_len = body.chars().count();
+
+    let mut text = format!("{gutter}{body}");
+    let mut spans = vec![Span::plain(gutter.chars().count()).on(background)];
+    let line_spans = highlight.map_or(&[][..], |h| h.spans(line));
+    if line_spans.is_empty() {
+        spans.push(Span::plain(body_len).on(background));
+    } else {
+        spans.extend(
+            highlight::slice(line_spans, layout.h_scroll, body_len)
+                .into_iter()
+                .map(|span| span.on(background)),
+        );
+    }
+    if overflows {
+        text.push('…');
+        spans.push(Span::plain(1).on(background));
+    }
+    let pad = width.saturating_sub(text.chars().count());
+    if pad > 0 {
+        text.push_str(&" ".repeat(pad));
+        spans.push(Span::plain(pad).on(background));
+    }
+
+    SplitSide {
+        text,
+        spans,
+        anchor,
+        payload: Some(format!("{}{}", line.marker(), line.text)),
+    }
+}
+
+fn push_split_rows(
+    rows: &mut Vec<RenderRow>,
+    file: &git_review::FileDiff,
+    hunk: &git_review::DiffHunk,
+    annotations: &HashMap<LineAnchor, Comment>,
+    highlight: Option<&FileHighlight>,
+    editing: Option<&EditState>,
+    layout: &RowLayout,
+    rendered_anchors: &mut HashSet<LineAnchor>,
+) {
+    type Pair<'a> = (Option<&'a DiffLine>, Option<&'a DiffLine>);
+
+    fn flush<'a>(
+        deletes: &mut Vec<&'a DiffLine>,
+        adds: &mut Vec<&'a DiffLine>,
+        pairs: &mut Vec<Pair<'a>>,
+    ) {
+        for index in 0..deletes.len().max(adds.len()) {
+            pairs.push((deletes.get(index).copied(), adds.get(index).copied()));
+        }
+        deletes.clear();
+        adds.clear();
+    }
+
+    let mut deletes: Vec<&DiffLine> = Vec::new();
+    let mut adds: Vec<&DiffLine> = Vec::new();
+    let mut pairs: Vec<Pair> = Vec::new();
+    for line in &hunk.lines {
+        match line.line_type {
+            DiffLineType::Delete => deletes.push(line),
+            DiffLineType::Add => adds.push(line),
+            DiffLineType::Context => {
+                flush(&mut deletes, &mut adds, &mut pairs);
+                pairs.push((Some(line), Some(line)));
+            }
+        }
+    }
+    flush(&mut deletes, &mut adds, &mut pairs);
+
+    let width = layout.column_width();
+    for (old, new) in pairs {
+        let left = split_side(old, &file.file_path, annotations, highlight, width, layout);
+        let right = split_side(
+            new,
+            &file.file_path,
+            annotations,
+            highlight,
+            layout.cols.saturating_sub(width + 1),
+            layout,
+        );
+        let (anchor, payload) = match layout.focus {
+            Side::Old => (left.anchor.clone(), left.payload.clone()),
+            Side::New => (right.anchor.clone(), right.payload.clone()),
+        };
+        let mut spans = left.spans;
+        spans.push(Span::plain(1));
+        spans.extend(right.spans);
+        rows.push(RenderRow {
+            text: format!("{}│{}", left.text, right.text),
+            kind: RowKind::Context,
+            anchor,
+            payload,
+            file: Some(file.file_path.clone()),
+            commented: false,
+            spans,
+        });
+        for anchor in [left.anchor, right.anchor] {
+            let Some(anchor) = anchor else { continue };
+            if rendered_anchors.insert(anchor.clone()) {
+                push_note_rows(
+                    rows,
+                    &anchor,
+                    editing,
+                    annotations.get(&anchor),
+                    layout.cols,
+                );
+            }
+        }
+    }
+}
+
 fn dark_background() -> bool {
     let palette = config::configuration().resolved_palette.clone();
     palette.background.map_or(true, |color| {
@@ -1714,8 +2053,9 @@ fn build_rows(
     file_loads: &HashMap<String, FileLoad>,
     highlights: &HashMap<String, FileHighlight>,
     editing: Option<&EditState>,
-    cols: usize,
+    layout: &RowLayout,
 ) -> Vec<RenderRow> {
+    let cols = layout.cols;
     let mut rows = Vec::new();
     if data.files.is_empty() {
         rows.push(RenderRow::plain(
@@ -1791,6 +2131,19 @@ fn build_rows(
                 }
                 rows.push(RenderRow::plain(hunk.header_text(), RowKind::HunkHeader));
                 let file_highlight = highlights.get(&file.file_path);
+                if layout.diff == ReviewDiffLayout::SideBySide {
+                    push_split_rows(
+                        &mut rows,
+                        file,
+                        hunk,
+                        annotations,
+                        file_highlight,
+                        editing,
+                        layout,
+                        &mut rendered_anchors,
+                    );
+                    continue;
+                }
                 for line in &hunk.lines {
                     let old = line
                         .old_line_number
@@ -1921,10 +2274,14 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
         state: Mutex::new(ReviewState {
             status: LoadStatus::Loading,
             mode: config_mode_to_diff(&args.mode),
+            layout: args.layout,
+            h_scroll: 0,
+            focus: Side::New,
             source: diff_source,
             repo_root: start_path,
             branch: None,
             parent_branch: None,
+            subscription: None,
             data: None,
             cache: HashMap::new(),
             highlights: HashMap::new(),
@@ -2255,6 +2612,11 @@ impl Pane for ReviewPane {
                 }
             }
             KeyCode::Char('b') => self.cycle_diff_mode(),
+            KeyCode::Char('s') => self.toggle_layout(),
+            KeyCode::Char('h') | KeyCode::LeftArrow => self.focus_side(Side::Old),
+            KeyCode::Char('l') | KeyCode::RightArrow => self.focus_side(Side::New),
+            KeyCode::Char('<') => self.scroll_horizontally(-1),
+            KeyCode::Char('>') => self.scroll_horizontally(1),
             KeyCode::Char('r') => self.recompute(false),
             KeyCode::Char('R') => self.refresh_clear(),
             KeyCode::Char('D') => self.clear_comments(),
@@ -2288,6 +2650,19 @@ impl Pane for ReviewPane {
                     ViewRow::Doc(doc) => doc,
                     ViewRow::Header(_) | ViewRow::FindBar => return Ok(()),
                 };
+                let clicked_side = {
+                    let s = self.state.lock();
+                    (s.effective_layout() == ReviewDiffLayout::SideBySide).then(|| {
+                        if (event.x as usize) > s.size.cols.saturating_sub(1) / 2 {
+                            Side::New
+                        } else {
+                            Side::Old
+                        }
+                    })
+                };
+                if let Some(side) = clicked_side {
+                    self.focus_side(side);
+                }
                 let now = Instant::now();
                 let double = {
                     let mut s = self.state.lock();
@@ -2411,6 +2786,18 @@ mod tests {
     use super::*;
     use git_review::{DiffHunk, DiffLine, FileDiff, GitDiffData};
 
+    impl RowLayout {
+        fn unified(cols: usize) -> Self {
+            Self {
+                diff: ReviewDiffLayout::Unified,
+                cols,
+                h_scroll: 0,
+                focus: Side::New,
+                tints: highlight::tints(true),
+            }
+        }
+    }
+
     fn dline(t: DiffLineType, old: Option<usize>, new: Option<usize>, s: &str) -> DiffLine {
         DiffLine {
             line_type: t,
@@ -2459,7 +2846,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert_eq!(rows[0].kind, RowKind::FileHeader);
         assert!(rows[0].text.contains("src/foo.rs"));
@@ -2510,7 +2897,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            cols,
+            &RowLayout::unified(cols),
         );
         let adds: Vec<&RenderRow> = rows.iter().filter(|r| r.kind == RowKind::Add).collect();
         assert!(adds.len() > 1, "long line should wrap to multiple rows");
@@ -2567,7 +2954,7 @@ mod tests {
             &HashMap::new(),
             &highlights,
             None,
-            40,
+            &RowLayout::unified(40),
         );
         let highlighted: Vec<&RenderRow> = rows.iter().filter(|r| !r.spans.is_empty()).collect();
         assert!(
@@ -2582,6 +2969,88 @@ mod tests {
                 row.text
             );
         }
+    }
+
+    #[test]
+    fn side_by_side_pairs_changed_lines() {
+        let hunk = DiffHunk {
+            old_start_line: 1,
+            old_line_count: 3,
+            new_start_line: 1,
+            new_line_count: 4,
+            lines: vec![
+                dline(DiffLineType::Context, Some(1), Some(1), "fn main() {"),
+                dline(DiffLineType::Delete, Some(2), None, "    let a = 1;"),
+                dline(DiffLineType::Delete, Some(3), None, "    let b = 2;"),
+                dline(DiffLineType::Add, None, Some(2), "    let a = 10;"),
+                dline(DiffLineType::Add, None, Some(3), "    let b = 20;"),
+                dline(DiffLineType::Add, None, Some(4), "    let c = 30;"),
+            ],
+        };
+        let data = GitDiffData {
+            files: vec![FileDiff {
+                file_path: "src/foo.rs".to_string(),
+                status: GitFileStatus::Modified,
+                hunks: vec![hunk],
+                is_binary: false,
+                oversized: false,
+                additions: 3,
+                deletions: 2,
+            }],
+            total_additions: 3,
+            total_deletions: 2,
+        };
+
+        let cols = 120;
+        let layout = RowLayout {
+            diff: ReviewDiffLayout::SideBySide,
+            cols,
+            h_scroll: 0,
+            focus: Side::New,
+            tints: highlight::tints(true),
+        };
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &layout,
+        );
+
+        let body: Vec<&RenderRow> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Context && r.anchor.is_some())
+            .collect();
+        assert_eq!(body.len(), 4, "one row per pair, longest run wins");
+        for row in &body {
+            assert_eq!(
+                row.text.chars().count(),
+                cols,
+                "each pair fills the pane width"
+            );
+            assert_eq!(
+                row.spans.iter().map(|s| s.len).sum::<usize>(),
+                cols,
+                "spans cover both columns and the divider"
+            );
+        }
+        assert!(
+            body[1].text.contains("let a = 1;") && body[1].text.contains("let a = 10;"),
+            "the first delete pairs with the first add: {:?}",
+            body[1].text
+        );
+        assert!(
+            body[3].text.contains("let c = 30;"),
+            "the unpaired add keeps its own row: {:?}",
+            body[3].text
+        );
+        assert_eq!(
+            body[3].anchor.as_ref().map(|a| a.side),
+            Some(Side::New),
+            "the focused side drives the anchor"
+        );
     }
 
     #[test]
@@ -2606,7 +3075,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(rows
             .iter()
@@ -2619,7 +3088,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].kind, RowKind::Info);
@@ -2647,7 +3116,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(rows
             .iter()
@@ -2693,7 +3162,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let note = rows.iter().find(|r| r.kind == RowKind::Note).unwrap();
         assert!(note.text.contains("needs work"));
@@ -2707,7 +3176,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(plain.iter().all(|r| r.kind != RowKind::Note));
     }
@@ -2753,7 +3222,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let payload = build_send_payload(&rows, &ann, 0, rows.len() - 1);
 
@@ -2793,7 +3262,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(expanded.iter().any(|r| r.kind == RowKind::Add));
         assert!(expanded
@@ -2812,7 +3281,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(folded.iter().all(|r| r.kind == RowKind::FileHeader));
         assert!(folded[0].text.starts_with('▸'));
@@ -2891,7 +3360,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Some(&edit),
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let edits: Vec<_> = rows
             .iter()
@@ -2942,7 +3411,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let header = rows.iter().find(|r| r.kind == RowKind::FileHeader).unwrap();
         assert!(header.commented);
@@ -2955,7 +3424,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let h2 = plain
             .iter()
@@ -3028,7 +3497,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         assert!(rows
             .iter()
@@ -3047,7 +3516,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
-            usize::MAX,
+            &RowLayout::unified(usize::MAX),
         );
         let notes: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::Note).collect();
         assert_eq!(notes.len(), 2);

@@ -34,6 +34,8 @@ use window::{Clipboard, Window, WindowOps};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(90);
+const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
     let width = unicode_column_width(text, None);
@@ -371,6 +373,7 @@ fn tool_running(status: &str) -> bool {
 fn agent_status_color(status: &str) -> AnsiColor {
     match status {
         "disconnected" => AnsiColor::Grey,
+        "reconnecting" => AnsiColor::Yellow,
         "error" => AnsiColor::Red,
         "idle" => AnsiColor::Green,
         "running" => AnsiColor::Yellow,
@@ -1338,6 +1341,7 @@ struct AgentState {
     queued: Vec<String>,
     draining: bool,
     show_controls: bool,
+    reconnecting: bool,
     spinner_frame: usize,
     spinner_ticking: bool,
     tool_expand_overrides: HashMap<String, bool>,
@@ -1802,7 +1806,10 @@ impl AgentState {
         let mut footer = Vec::new();
         if !self.queued.is_empty() {
             footer.push(AgentRow {
-                text: format!("◷ {} queued · sends when idle", self.queued.len()),
+                text: format!(
+                    "◷ {} queued · sends when idle · ctrl+enter sends now",
+                    self.queued.len()
+                ),
                 attrs: attr_fg(AnsiColor::Olive),
                 line: None,
             });
@@ -2675,6 +2682,9 @@ impl PaseoAgentPane {
             std::mem::take(&mut state.composer).trim().to_string()
         };
         if text.is_empty() {
+            if interrupt {
+                self.flush_queue();
+            }
             self.mutate(|state| state.rebuild_rows());
             return;
         }
@@ -2718,17 +2728,57 @@ impl PaseoAgentPane {
             return;
         }
 
-        self.send_now(text);
+        let mut messages = self.take_queue();
+        messages.push(text);
+        self.send_sequence(messages);
         self.mutate(|state| state.rebuild_rows());
     }
 
-    fn send_now(&self, text: String) {
-        if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
-            promise::spawn::spawn(async move {
-                let _ = client.send_agent_message(&agent_id, &text).await;
-            })
-            .detach();
+    fn take_queue(&self) -> Vec<String> {
+        self.mutate(|state| {
+            let queued = std::mem::take(&mut state.queued);
+            state.rebuild_rows();
+            queued
+        })
+    }
+
+    fn flush_queue(&self) {
+        let queued = self.take_queue();
+        self.send_sequence(queued);
+    }
+
+    fn send_sequence(&self, messages: Vec<String>) {
+        if messages.is_empty() {
+            return;
         }
+        let Some(agent_id) = self.agent_id() else {
+            self.requeue(messages);
+            return;
+        };
+        let Some(client) = self.client() else {
+            self.requeue(messages);
+            return;
+        };
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            for (index, text) in messages.iter().enumerate() {
+                if client.send_agent_message(&agent_id, text).await.is_err() {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.requeue(messages[index..].to_vec());
+                    }
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn requeue(&self, unsent: Vec<String>) {
+        self.mutate(|state| {
+            state.queued.splice(0..0, unsent);
+            state.rebuild_rows();
+        });
+        log::error!("paseo: failed to send agent messages; re-queued");
     }
 
     fn maybe_drain_queue(&self) {
@@ -2887,14 +2937,30 @@ impl PaseoAgentPane {
             let _ = client.subscribe_agents().await;
 
             if source.agent_id.is_none() && source.provider.is_none() {
-                let agents = client.fetch_agents().await.unwrap_or_default();
-                let workspaces = client.fetch_workspaces().await.unwrap_or_default();
-                let groups = build_picker_groups(agents, workspaces);
-                if let Some(pane) = weak.upgrade() {
-                    pane.enter_hub(
-                        "Paseo — open an agent, or start one in a project".to_string(),
-                        groups,
-                    );
+                let hub = match fetch_hub(&client).await {
+                    Ok(hub) => Ok(hub),
+                    Err(_) => match reconnect_domain(&domain, &weak).await {
+                        Ok(fresh) => fetch_hub(&fresh).await,
+                        Err(err) => Err(err),
+                    },
+                };
+                match hub {
+                    Ok(groups) => {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.enter_hub(
+                                "Paseo — open an agent, or start one in a project".to_string(),
+                                groups,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.set_status(
+                                "Paseo — connect".to_string(),
+                                Some(format!("could not read agents and projects: {err}")),
+                            );
+                        }
+                    }
                 }
                 return;
             }
@@ -3007,19 +3073,57 @@ impl PaseoAgentPane {
                     DaemonEvent::AgentUpsert(snapshot) if snapshot.id == agent_id => {
                         pane.set_snapshot(&snapshot);
                     }
-                    DaemonEvent::Disconnected => {
-                        pane.mutate(|state| {
-                            state.agent_status = "disconnected".to_string();
-                            state.rebuild_rows();
-                        });
-                        break;
-                    }
+                    DaemonEvent::Disconnected => break,
                     _ => {}
                 }
             }
 
             if let Some(pane) = weak.upgrade() {
-                pane.state.lock().dead = true;
+                pane.spawn_reconnect();
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_reconnect(self: &Arc<Self>) {
+        let stale = self.mutate(|state| {
+            let stale = state.dead || state.reconnecting;
+            if !stale {
+                state.reconnecting = true;
+                state.agent_status = "reconnecting".to_string();
+                state.rebuild_rows();
+            }
+            stale
+        });
+        if stale {
+            return;
+        }
+        *self.client.lock() = None;
+
+        let weak = Arc::downgrade(self);
+        let domain = self.domain.clone();
+        let agent_id = self.agent_id();
+        promise::spawn::spawn(async move {
+            let mut delay = RECONNECT_MIN_DELAY;
+            loop {
+                smol::Timer::after(delay).await;
+                let Some(pane) = weak.upgrade() else {
+                    return;
+                };
+                if pane.state.lock().dead {
+                    return;
+                }
+                if ensure_domain_client(&domain).await.is_ok() {
+                    pane.mutate(|state| state.reconnecting = false);
+                    pane.start(AgentSource {
+                        agent_id: agent_id.clone(),
+                        provider: None,
+                        cwd: None,
+                        prompt: None,
+                    });
+                    return;
+                }
+                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
             }
         })
         .detach();
@@ -4136,6 +4240,27 @@ pub struct AgentSource {
     pub prompt: Option<String>,
 }
 
+async fn fetch_hub(client: &PaseoClient) -> anyhow::Result<Vec<PickerGroup>> {
+    let agents = client.fetch_agents().await?;
+    let workspaces = client.fetch_workspaces().await?;
+    Ok(build_picker_groups(agents, workspaces))
+}
+
+async fn reconnect_domain(
+    domain: &Arc<dyn mux::domain::Domain>,
+    weak: &Weak<PaseoAgentPane>,
+) -> anyhow::Result<PaseoClient> {
+    if let Some(paseo) = domain.downcast_ref::<paseo_mux::PaseoDomain>() {
+        paseo.reset_client();
+    }
+    let client = ensure_domain_client(domain).await?;
+    if let Some(pane) = weak.upgrade() {
+        *pane.client.lock() = Some(client.clone());
+    }
+    let _ = client.subscribe_agents().await;
+    Ok(client)
+}
+
 async fn ensure_domain_client(
     domain: &Arc<dyn mux::domain::Domain>,
 ) -> anyhow::Result<PaseoClient> {
@@ -4731,6 +4856,7 @@ pub fn open_paseo_agent_pane(
             queued: Vec::new(),
             draining: false,
             show_controls: false,
+            reconnecting: false,
             spinner_frame: 0,
             spinner_ticking: false,
             tool_expand_overrides: HashMap::new(),

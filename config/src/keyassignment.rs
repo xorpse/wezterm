@@ -706,6 +706,18 @@ impl Default for ReviewDiffMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum ReviewDiffLayout {
+    SideBySide,
+    Unified,
+}
+
+impl Default for ReviewDiffLayout {
+    fn default() -> Self {
+        Self::Unified
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct ReviewPaneArgs {
     #[dynamic(default = "review_default_direction")]
@@ -714,6 +726,8 @@ pub struct ReviewPaneArgs {
     pub size: SplitSize,
     #[dynamic(default)]
     pub mode: ReviewDiffMode,
+    #[dynamic(default)]
+    pub layout: ReviewDiffLayout,
 }
 
 fn review_default_direction() -> PaneDirection {
@@ -726,6 +740,7 @@ impl Default for ReviewPaneArgs {
             direction: review_default_direction(),
             size: SplitSize::default(),
             mode: ReviewDiffMode::default(),
+            layout: ReviewDiffLayout::default(),
         }
     }
 }
@@ -747,6 +762,11 @@ pub enum ReviewModeAssignment {
     SendSelection,
     SendAll,
     ToggleFold,
+    ToggleLayout,
+    FocusOldSide,
+    FocusNewSide,
+    ScrollLeft,
+    ScrollRight,
     FindFile,
     CycleDiffMode,
     Refresh,

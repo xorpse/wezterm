@@ -39,6 +39,15 @@ config.keys = {
     * `{ MergeBase = 'main' }` - the working tree vs the merge base with the
       named branch, so both committed and uncommitted work on the branch is
       shown, including untracked files.
+* `layout` - how the diff is arranged:
+    * `'Unified'` (default) - one column, long lines wrap.
+    * `'SideBySide'` - old and new in two columns, long lines truncated with
+      `…` and read by scrolling horizontally. Panes narrower than 100 columns
+      fall back to the unified layout.
+
+Diff text is syntax highlighted when the file's language is recognised, with
+added and removed lines marked by a background tint. The theme follows the
+lightness of your configured background.
 
 ```lua
 config.keys = {
@@ -72,6 +81,9 @@ config.keys = {
 | `Enter` (on an uncommented line) | Send the selected diff lines (or the cursor line) to the originating pane |
 | `Shift+Enter` | Send all comments to the originating pane, grouped as `path:line: comment` |
 | `b` | Toggle the diff mode: uncommitted changes ⇄ uncommitted changes plus everything since the merge base with the parent branch (the branch's upstream, falling back to the repository's default branch) |
+| `s` | Toggle between the unified and side-by-side layouts |
+| `h` / `l`, left / right arrows | Focus the old / new column (side-by-side only). Comments, `e` and sends act on the focused column |
+| `<` / `>` | Scroll the columns horizontally (side-by-side only) |
 | `r` | Recompute the diff |
 | `q` / `Esc` | Close the review pane |
 

@@ -16,11 +16,21 @@ const TINT_MIX: f32 = 0.18;
 pub struct Span {
     pub len: usize,
     pub color: Option<SrgbaTuple>,
+    pub background: Option<SrgbaTuple>,
 }
 
 impl Span {
     pub fn plain(len: usize) -> Self {
-        Self { len, color: None }
+        Self {
+            len,
+            color: None,
+            background: None,
+        }
+    }
+
+    pub fn on(mut self, background: Option<SrgbaTuple>) -> Self {
+        self.background = background;
+        self
     }
 }
 
@@ -110,6 +120,7 @@ fn spans_for(styled: &[(syntect::highlighting::Style, &str)]) -> Vec<Span> {
             _ => spans.push(Span {
                 len,
                 color: Some(color),
+                background: None,
             }),
         }
     }
@@ -204,6 +215,7 @@ pub fn slice(spans: &[Span], start: usize, len: usize) -> Vec<Span> {
             out.push(Span {
                 len: take,
                 color: span.color,
+                background: span.background,
             });
             taken += take;
         }

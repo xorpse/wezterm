@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use paseo_client::PaseoClient;
 use portable_pty::CommandBuilder;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
 
@@ -28,8 +29,9 @@ pub struct PaseoDomain {
     domain_id: DomainId,
     name: String,
     target: ConnectTarget,
-    client: Mutex<Option<PaseoClient>>,
-    state: Mutex<DomainState>,
+    client: Arc<Mutex<Option<PaseoClient>>>,
+    state: Arc<Mutex<DomainState>>,
+    connection: Arc<AtomicU64>,
     attached_terminals: Mutex<HashSet<String>>,
     projects: Arc<Mutex<HashMap<String, String>>>,
     workspace_ids: Arc<Mutex<HashMap<String, String>>>,
@@ -41,8 +43,9 @@ impl PaseoDomain {
             domain_id: alloc_domain_id(),
             name: name.into(),
             target,
-            client: Mutex::new(None),
-            state: Mutex::new(DomainState::Detached),
+            client: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(DomainState::Detached)),
+            connection: Arc::new(AtomicU64::new(0)),
             attached_terminals: Mutex::new(HashSet::new()),
             projects: Arc::new(Mutex::new(HashMap::new())),
             workspace_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -70,6 +73,12 @@ impl PaseoDomain {
         self.client.lock().clone()
     }
 
+    pub fn reset_client(&self) {
+        self.connection.fetch_add(1, Ordering::SeqCst);
+        *self.client.lock() = None;
+        *self.state.lock() = DomainState::Detached;
+    }
+
     pub fn project_for_cwd(&self, cwd: &str) -> Option<String> {
         self.projects.lock().get(cwd).cloned()
     }
@@ -79,12 +88,20 @@ impl PaseoDomain {
             return Ok(client);
         }
         let client = self.connect().await?;
+        let connection = self.connection.fetch_add(1, Ordering::SeqCst) + 1;
         *self.client.lock() = Some(client.clone());
         *self.state.lock() = DomainState::Attached;
         {
             let client = client.clone();
+            let slot = self.client.clone();
+            let state = self.state.clone();
+            let generation = self.connection.clone();
             promise::spawn::spawn(async move {
                 let _ = client.run().await;
+                if generation.load(Ordering::SeqCst) == connection {
+                    *slot.lock() = None;
+                    *state.lock() = DomainState::Detached;
+                }
             })
             .detach();
         }

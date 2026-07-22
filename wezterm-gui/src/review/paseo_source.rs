@@ -114,11 +114,11 @@ pub async fn fetch(
     let diff = client
         .subscribe_checkout_diff(&cwd, mode_str, base_ref.as_deref())
         .await?;
-    let _ = client
-        .unsubscribe_checkout_diff(&diff.subscription_id)
-        .await;
 
     if let Some(error) = diff.error {
+        let _ = client
+            .unsubscribe_checkout_diff(&diff.subscription_id)
+            .await;
         anyhow::bail!("{}", error.message);
     }
 
@@ -126,6 +126,7 @@ pub async fn fetch(
         repo_root,
         branch,
         parent_branch,
+        subscription: Some(diff.subscription_id),
         data: convert(diff.files),
     })
 }
