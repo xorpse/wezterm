@@ -1268,7 +1268,6 @@ struct AgentState {
     selection: Option<AgentSelection>,
     queued: Vec<String>,
     draining: bool,
-    send_interrupts: bool,
     show_controls: bool,
     tool_expand_overrides: HashMap<String, bool>,
     tool_headers: HashMap<usize, String>,
@@ -1877,17 +1876,15 @@ impl AgentState {
                         });
                     }
                     footer.push(AgentRow {
-                        text: "↑/↓ select · tab/enter insert · esc dismiss".to_string(),
+                        text: "↑/↓ select · enter insert · esc dismiss".to_string(),
                         attrs: attr_dim(),
                         line: None,
                     });
                 }
-                let (marker, marker_attr) = if !is_active_status(&self.agent_status) {
-                    ("❯ ", attr_default())
-                } else if self.send_interrupts {
-                    ("» ", attr_bold_fg(AnsiColor::Fuchsia))
-                } else {
+                let (marker, marker_attr) = if is_active_status(&self.agent_status) {
                     ("◷ ", attr_bold_fg(AnsiColor::Olive))
+                } else {
+                    ("❯ ", attr_default())
                 };
                 let rows = self.composer_rows();
                 let mut rows = rows.iter();
@@ -1944,7 +1941,7 @@ impl AgentState {
                     footer.push(AgentRow::rendered(styled_line(vec![
                         ("typing", typing),
                         (
-                            " · shift-tab send-mode · shift-enter newline · esc cancel",
+                            " · ctrl+enter send now · shift-enter newline · esc cancel",
                             normal.clone(),
                         ),
                     ])));
@@ -2552,7 +2549,7 @@ impl PaseoAgentPane {
             })));
     }
 
-    fn submit_composer(&self) {
+    fn submit_composer(&self, interrupt: bool) {
         let text = {
             let mut state = self.state.lock();
             state.composer_cursor = 0;
@@ -2592,11 +2589,8 @@ impl PaseoAgentPane {
             return;
         }
 
-        let (running, interrupts) = {
-            let state = self.state.lock();
-            (is_active_status(&state.agent_status), state.send_interrupts)
-        };
-        if running && !interrupts {
+        let running = is_active_status(&self.state.lock().agent_status);
+        if running && !interrupt {
             self.mutate(|state| {
                 state.queued.push(text);
                 state.rebuild_rows();
@@ -4327,18 +4321,12 @@ impl Pane for PaseoAgentPane {
                     });
                     self.scroll_to_bottom();
                 }
-                KeyCode::Char('\t') | KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => self
-                    .mutate(|state| {
-                        state.send_interrupts = !state.send_interrupts;
-                        state.rebuild_rows();
-                    }),
                 KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.mutate(|state| {
                     state.composer.clear();
                     state.composer_cursor = 0;
                     state.slash_dismissed = false;
                     state.rebuild_rows();
                 }),
-                KeyCode::Char('\t') | KeyCode::Tab if self.slash_active() => self.slash_accept(),
                 KeyCode::Char('\r') | KeyCode::Enter if self.slash_active() => self.slash_accept(),
                 KeyCode::UpArrow if self.slash_active() => self.slash_move(-1),
                 KeyCode::DownArrow if self.slash_active() => self.slash_move(1),
@@ -4346,7 +4334,10 @@ impl Pane for PaseoAgentPane {
                     state.slash_dismissed = true;
                     state.rebuild_rows();
                 }),
-                KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(),
+                KeyCode::Char('\r') | KeyCode::Enter if mods.contains(KeyModifiers::CTRL) => {
+                    self.submit_composer(true)
+                }
+                KeyCode::Char('\r') | KeyCode::Enter => self.submit_composer(false),
                 KeyCode::Backspace => self.mutate(|state| {
                     state.composer_backspace();
                     state.rebuild_rows();
@@ -4620,7 +4611,6 @@ pub fn open_paseo_agent_pane(
             selection: None,
             queued: Vec::new(),
             draining: false,
-            send_interrupts: false,
             show_controls: false,
             tool_expand_overrides: HashMap::new(),
             tool_headers: HashMap::new(),
