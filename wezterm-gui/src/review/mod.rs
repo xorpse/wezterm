@@ -729,9 +729,8 @@ impl ReviewPane {
     }
 
     fn open_editor(&self) {
-        let (is_remote, repo_root, path_str, line) = {
+        let (repo_root, path_str, line) = {
             let s = self.state.lock();
-            let is_remote = matches!(s.source, DiffSource::Paseo { .. });
             let row = match s.rows.get(s.cursor) {
                 Some(r) => r,
                 None => return,
@@ -745,7 +744,6 @@ impl ReviewPane {
             };
             let path = std::path::Path::new(&s.repo_root).join(&anchor.file);
             (
-                is_remote,
                 PathBuf::from(&s.repo_root),
                 path.to_string_lossy().to_string(),
                 anchor.line,
@@ -757,19 +755,16 @@ impl ReviewPane {
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "nvim".to_string());
 
-        let args = if is_remote {
-            let quoted = format!("'{}'", path_str.replace('\'', "'\\''"));
-            let inner = format!("exec {editor} '+{line}' {quoted}");
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "exec \"${SHELL:-/bin/sh}\" -ilc \"$1\"".to_string(),
-                "sh".to_string(),
-                inner,
-            ]
-        } else {
-            vec![editor, format!("+{line}"), path_str]
-        };
+        let quoted_editor = format!("'{}'", editor.replace('\'', "'\\''"));
+        let quoted_path = format!("'{}'", path_str.replace('\'', "'\\''"));
+        let inner = format!("exec {quoted_editor} '+{line}' {quoted_path}");
+        let args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec \"${SHELL:-/bin/sh}\" -ilc \"$1\"".to_string(),
+            "sh".to_string(),
+            inner,
+        ];
 
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
