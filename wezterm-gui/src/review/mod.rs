@@ -328,7 +328,7 @@ impl ReviewState {
         let text = match &self.find {
             Some(find) if find.browsing => {
                 format!(
-                    "/{}    n/p: next/prev · Enter/Esc: done",
+                    "/{}    n/p next/prev · enter/esc done",
                     find.buffer.get_line()
                 )
             }
@@ -989,7 +989,7 @@ impl ReviewPane {
                 };
                 if find.browsing {
                     format!(
-                        "/{}    ({scope})  n/p: next/prev · Enter/Esc: done",
+                        "/{}    ({scope})  n/p next/prev · enter/esc done",
                         find.buffer.get_line()
                     )
                 } else {
@@ -1559,10 +1559,10 @@ fn build_rows(
                 Some(FileLoad::Failed(err)) => format!("  {err}"),
                 None => match file.status {
                     GitFileStatus::Untracked => {
-                        "  large untracked file — press o/Tab to load".to_string()
+                        "  large untracked file — press o/tab to load".to_string()
                     }
                     _ => format!(
-                        "  large diff (+{} -{}) — press o/Tab to load",
+                        "  large diff (+{} -{}) — press o/tab to load",
                         file.additions, file.deletions
                     ),
                 },

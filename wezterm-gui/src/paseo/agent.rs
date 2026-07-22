@@ -62,6 +62,22 @@ fn attr_bold_fg(color: AnsiColor) -> CellAttributes {
     a
 }
 
+fn attr_bold() -> CellAttributes {
+    let mut a = CellAttributes::default();
+    a.set_intensity(Intensity::Bold);
+    a
+}
+
+fn styled_line<'a>(segments: impl IntoIterator<Item = (&'a str, CellAttributes)>) -> Line {
+    let mut cells = Vec::new();
+    for (text, attrs) in segments {
+        for ch in text.chars() {
+            cells.push(Cell::new(ch, attrs.clone()));
+        }
+    }
+    Line::from_cells(cells, 0)
+}
+
 #[derive(Clone)]
 struct AgentRow {
     text: String,
@@ -304,14 +320,23 @@ fn push_wrapped(
     }
 }
 
-fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
+fn item_to_rows(
+    item: &TimelineItem,
+    cols: usize,
+    overrides: &HashMap<String, bool>,
+    out: &mut Vec<AgentRow>,
+) {
     let mut rows = Vec::new();
     let text = item.text.clone().unwrap_or_default();
     let trimmed = text.trim();
     match item.kind.as_str() {
         "user_message" => push_wrapped(&mut rows, "▸ ", trimmed, &attr_fg(AnsiColor::Teal), cols),
         "assistant_message" => rows.extend(markdown_to_lines(trimmed, cols)),
-        "reasoning" => push_wrapped(&mut rows, "  ", trimmed, &attr_dim(), cols),
+        "reasoning" => {
+            let mut attrs = attr_dim();
+            attrs.set_italic(true);
+            push_wrapped(&mut rows, "  ", trimmed, &attrs, cols);
+        }
         "error" => push_wrapped(
             &mut rows,
             "error: ",
@@ -319,7 +344,7 @@ fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
             &attr_fg(AnsiColor::Maroon),
             cols,
         ),
-        "tool_call" => tool_call_rows(item, cols, &mut rows),
+        "tool_call" => tool_call_rows(item, cols, overrides, &mut rows),
         "compaction" => push_wrapped(&mut rows, "— ", "context compacted", &attr_dim(), cols),
         _ => {
             if !text.is_empty() {
@@ -333,34 +358,99 @@ fn item_to_rows(item: &TimelineItem, cols: usize, out: &mut Vec<AgentRow>) {
     }
 }
 
-fn tool_call_rows(item: &TimelineItem, cols: usize, rows: &mut Vec<AgentRow>) {
-    let name = item.name.clone().unwrap_or_else(|| "tool".to_string());
-    let status = item.status.clone().unwrap_or_default();
-    let glyph = match status.as_str() {
-        "completed" => "✓",
-        "failed" => "✗",
-        "canceled" => "⊘",
-        _ => "•",
-    };
-    rows.push(AgentRow {
-        text: format!("{glyph} {name}"),
-        attrs: attr_bold_fg(AnsiColor::Blue),
-        line: None,
-    });
-    if let Some(detail) = &item.detail {
-        tool_detail_rows(detail, cols, rows);
+fn tool_running(status: &str) -> bool {
+    !matches!(status, "completed" | "failed" | "canceled")
+}
+
+fn agent_status_color(status: &str) -> AnsiColor {
+    match status {
+        "disconnected" => AnsiColor::Grey,
+        "error" => AnsiColor::Red,
+        "idle" => AnsiColor::Green,
+        "running" => AnsiColor::Yellow,
+        _ => AnsiColor::Teal,
     }
 }
 
-fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRow>) {
+fn tool_body_present(detail: &ToolCallDetail) -> bool {
+    match detail.kind.as_str() {
+        "edit" => detail.unified_diff.is_some(),
+        "plan" => detail.text.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        "read" | "write" | "search" | "fetch" | "sub_agent" => false,
+        "shell" => detail.output.is_some(),
+        _ => detail
+            .text
+            .as_ref()
+            .or(detail.content.as_ref())
+            .is_some_and(|t| !t.trim().is_empty()),
+    }
+}
+
+fn tool_is_collapsible(item: &TimelineItem) -> bool {
+    item.call_id.is_some() && item.detail.as_ref().is_some_and(tool_body_present)
+}
+
+fn tool_call_rows(
+    item: &TimelineItem,
+    cols: usize,
+    overrides: &HashMap<String, bool>,
+    rows: &mut Vec<AgentRow>,
+) {
+    let name = item.name.clone().unwrap_or_else(|| "tool".to_string());
+    let status = item.status.clone().unwrap_or_default();
+    let (dot_color, status_word) = match status.as_str() {
+        "completed" => (AnsiColor::Green, None),
+        "failed" => (AnsiColor::Red, Some("failed")),
+        "canceled" => (AnsiColor::Grey, Some("canceled")),
+        _ => (AnsiColor::Yellow, Some("running")),
+    };
+    let collapsible = tool_is_collapsible(item);
+    let expanded = if collapsible {
+        let call_id = item.call_id.as_deref().unwrap_or_default();
+        overrides
+            .get(call_id)
+            .copied()
+            .unwrap_or_else(|| tool_running(&status))
+    } else {
+        true
+    };
+    let mut segments = vec![
+        ("⏺ ", attr_bold_fg(dot_color)),
+        (name.as_str(), attr_bold()),
+    ];
+    if let Some(word) = status_word {
+        segments.push(("  ", attr_dim()));
+        segments.push((word, attr_dim()));
+    }
+    if collapsible {
+        segments.push((if expanded { "  ▾" } else { "  ▸" }, attr_dim()));
+    }
+    rows.push(AgentRow::rendered(styled_line(segments)));
+    if let Some(detail) = &item.detail {
+        tool_detail_rows(detail, cols, expanded, rows);
+    }
+}
+
+fn tool_detail_rows(
+    detail: &ToolCallDetail,
+    cols: usize,
+    expanded: bool,
+    rows: &mut Vec<AgentRow>,
+) {
     let target = attr_fg(AnsiColor::Silver);
     match detail.kind.as_str() {
         "shell" => {
             if let Some(command) = &detail.command {
-                push_wrapped(rows, "  $ ", command, &target, cols);
+                if expanded {
+                    push_wrapped(rows, "  $ ", command, &target, cols);
+                } else {
+                    push_wrapped(rows, "  $ ", &truncate_lines(command, 2), &target, cols);
+                }
             }
-            if let Some(output) = &detail.output {
-                push_wrapped(rows, "  ", &truncate_lines(output, 40), &attr_dim(), cols);
+            if expanded {
+                if let Some(output) = &detail.output {
+                    push_wrapped(rows, "  ", &truncate_lines(output, 40), &attr_dim(), cols);
+                }
             }
         }
         "read" => {
@@ -377,16 +467,18 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
             if let Some(path) = &detail.file_path {
                 push_wrapped(rows, "  edit ", path, &target, cols);
             }
-            if let Some(diff) = &detail.unified_diff {
-                for line in truncate_lines(diff, 60).split('\n') {
-                    let attrs = if line.starts_with('+') {
-                        attr_fg(AnsiColor::Green)
-                    } else if line.starts_with('-') {
-                        attr_fg(AnsiColor::Maroon)
-                    } else {
-                        attr_dim()
-                    };
-                    push_wrapped(rows, "  ", line, &attrs, cols);
+            if expanded {
+                if let Some(diff) = &detail.unified_diff {
+                    for line in truncate_lines(diff, 60).split('\n') {
+                        let attrs = if line.starts_with('+') {
+                            attr_fg(AnsiColor::Green)
+                        } else if line.starts_with('-') {
+                            attr_fg(AnsiColor::Maroon)
+                        } else {
+                            attr_dim()
+                        };
+                        push_wrapped(rows, "  ", line, &attrs, cols);
+                    }
                 }
             }
         }
@@ -407,7 +499,17 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
         }
         "plan" => {
             if let Some(text) = &detail.text {
-                rows.extend(markdown_to_lines(text.trim(), cols));
+                if expanded {
+                    rows.extend(markdown_to_lines(text.trim(), cols));
+                } else {
+                    push_wrapped(
+                        rows,
+                        "  ",
+                        &truncate_lines(text.trim(), 2),
+                        &attr_dim(),
+                        cols,
+                    );
+                }
             }
         }
         _ => {
@@ -415,7 +517,8 @@ fn tool_detail_rows(detail: &ToolCallDetail, cols: usize, rows: &mut Vec<AgentRo
                 push_wrapped(rows, "  ", path, &target, cols);
             }
             if let Some(text) = detail.text.as_ref().or(detail.content.as_ref()) {
-                push_wrapped(rows, "  ", &truncate_lines(text, 20), &attr_dim(), cols);
+                let max = if expanded { 20 } else { 2 };
+                push_wrapped(rows, "  ", &truncate_lines(text, max), &attr_dim(), cols);
             }
         }
     }
@@ -656,8 +759,23 @@ fn crumb_basename(path: &str) -> String {
 }
 
 struct PickerEntry {
+    dot: Option<(&'static str, AnsiColor)>,
+    indent: bool,
     label: String,
+    detail: Option<String>,
     action: PickerAction,
+}
+
+impl PickerEntry {
+    fn plain(label: impl Into<String>, action: PickerAction) -> Self {
+        Self {
+            dot: None,
+            indent: false,
+            label: label.into(),
+            detail: None,
+            action,
+        }
+    }
 }
 
 struct PickerGroup {
@@ -747,16 +865,6 @@ fn is_active_status(status: &str) -> bool {
     )
 }
 
-fn status_glyph(agent: &AgentSnapshot) -> &'static str {
-    if is_active_status(&agent.status) {
-        "●"
-    } else if agent.requires_attention {
-        "⚠"
-    } else {
-        "○"
-    }
-}
-
 fn session_title(agent: &AgentSnapshot) -> String {
     match agent.title.clone().filter(|t| !t.trim().is_empty()) {
         Some(title) => title.replace('\n', " ").trim().chars().take(80).collect(),
@@ -772,15 +880,39 @@ fn session_name(workspace_name: Option<&str>, agent: &AgentSnapshot) -> String {
         .unwrap_or_else(|| session_title(agent))
 }
 
-fn agent_row_label(
+fn agent_dot(agent: &AgentSnapshot) -> (&'static str, AnsiColor) {
+    if agent.requires_attention {
+        ("●", AnsiColor::Red)
+    } else if is_active_status(&agent.status) {
+        ("●", AnsiColor::Yellow)
+    } else {
+        ("○", AnsiColor::Grey)
+    }
+}
+
+fn agent_entry(
     agent: &AgentSnapshot,
     workspace_name: Option<&str>,
     context: Option<&str>,
-) -> String {
-    let primary = session_name(workspace_name, agent);
-    match context.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(context) => format!("{} {}  ·  {}", status_glyph(agent), primary, context),
-        None => format!("{} {}", status_glyph(agent), primary),
+    extra: usize,
+    indent: bool,
+    action: PickerAction,
+) -> PickerEntry {
+    let name = session_name(workspace_name, agent);
+    let label = if extra > 0 {
+        format!("{name}   (+{extra})")
+    } else {
+        name
+    };
+    PickerEntry {
+        dot: Some(agent_dot(agent)),
+        indent,
+        label,
+        detail: context
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+        action,
     }
 }
 
@@ -836,10 +968,10 @@ fn build_connection_groups() -> Vec<PickerGroup> {
     for domain in mux.iter_domains() {
         if domain.downcast_ref::<paseo_mux::PaseoDomain>().is_some() {
             let name = domain.domain_name().to_string();
-            daemons.push(PickerEntry {
-                label: format!("connect  {name}"),
-                action: PickerAction::ChooseDomain(name),
-            });
+            daemons.push(PickerEntry::plain(
+                format!("connect  {name}"),
+                PickerAction::ChooseDomain(name),
+            ));
         }
     }
     vec![
@@ -851,10 +983,10 @@ fn build_connection_groups() -> Vec<PickerGroup> {
         PickerGroup {
             label: "New".to_string(),
             collapsed: false,
-            entries: vec![PickerEntry {
-                label: "add connection  (relay URL or host:port)".to_string(),
-                action: PickerAction::AddConnection,
-            }],
+            entries: vec![PickerEntry::plain(
+                "add connection  (relay URL or host:port)",
+                PickerAction::AddConnection,
+            )],
         },
     ]
 }
@@ -908,18 +1040,12 @@ fn build_picker_groups(
         label: "Create".to_string(),
         collapsed: false,
         entries: vec![
-            PickerEntry {
-                label: "search for a directory + agent".to_string(),
-                action: PickerAction::SearchDirectory,
-            },
-            PickerEntry {
-                label: "new directory + agent".to_string(),
-                action: PickerAction::NewDirectory,
-            },
-            PickerEntry {
-                label: "clone GitHub repo + agent".to_string(),
-                action: PickerAction::CloneRepo,
-            },
+            PickerEntry::plain(
+                "search for a directory + agent",
+                PickerAction::SearchDirectory,
+            ),
+            PickerEntry::plain("new directory + agent", PickerAction::NewDirectory),
+            PickerEntry::plain("clone GitHub repo + agent", PickerAction::CloneRepo),
         ],
     }];
 
@@ -989,24 +1115,29 @@ fn build_picker_groups(
                 });
                 let primary = &ws_agents[0];
                 let extra = ws_agents.len() - 1;
-                let base = agent_row_label(primary, Some(&name), context.as_deref());
-                let main_label = if extra > 0 {
-                    format!("{base}   (+{extra})")
-                } else {
-                    base
-                };
-                let mut entries = vec![PickerEntry {
-                    label: main_label,
-                    action: PickerAction::OpenAgent(primary.id.clone()),
-                }];
+                let mut entries = vec![agent_entry(
+                    primary,
+                    Some(&name),
+                    context.as_deref(),
+                    extra,
+                    false,
+                    PickerAction::OpenAgent(primary.id.clone()),
+                )];
                 for agent in &ws_agents[1..] {
-                    entries.push(PickerEntry {
-                        label: format!("  {} {}", status_glyph(agent), session_title(agent)),
-                        action: PickerAction::OpenAgent(agent.id.clone()),
-                    });
+                    entries.push(agent_entry(
+                        agent,
+                        None,
+                        None,
+                        0,
+                        true,
+                        PickerAction::OpenAgent(agent.id.clone()),
+                    ));
                 }
                 entries.push(PickerEntry {
-                    label: "  ⊕ new agent".to_string(),
+                    dot: None,
+                    indent: true,
+                    label: "⊕ new agent".to_string(),
+                    detail: None,
                     action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
                 });
                 Unit {
@@ -1015,20 +1146,17 @@ fn build_picker_groups(
                     entries,
                 }
             }
-            None => {
-                let label = match &context {
-                    Some(context) => format!("⊕ {}  ·  {}", name, context),
-                    None => format!("⊕ {}", name),
-                };
-                Unit {
-                    rank: (9, 9),
-                    sort_key: name.to_lowercase(),
-                    entries: vec![PickerEntry {
-                        label,
-                        action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
-                    }],
-                }
-            }
+            None => Unit {
+                rank: (9, 9),
+                sort_key: name.to_lowercase(),
+                entries: vec![PickerEntry {
+                    dot: None,
+                    indent: false,
+                    label: format!("⊕ {name}"),
+                    detail: context.clone(),
+                    action: PickerAction::NewAgentInWorkspace(ws.cwd().to_string()),
+                }],
+            },
         };
         if let Some(proj) = index.get_mut(&key) {
             proj.units.push(unit);
@@ -1047,10 +1175,14 @@ fn build_picker_groups(
             proj.units.push(Unit {
                 rank: agent_rank(&agent),
                 sort_key: session_title(&agent).to_lowercase(),
-                entries: vec![PickerEntry {
-                    label: agent_row_label(&agent, None, None),
-                    action: PickerAction::OpenAgent(agent.id.clone()),
-                }],
+                entries: vec![agent_entry(
+                    &agent,
+                    None,
+                    None,
+                    0,
+                    false,
+                    PickerAction::OpenAgent(agent.id.clone()),
+                )],
             });
         }
     }
@@ -1137,6 +1269,9 @@ struct AgentState {
     queued: Vec<String>,
     draining: bool,
     send_interrupts: bool,
+    show_controls: bool,
+    tool_expand_overrides: HashMap<String, bool>,
+    tool_headers: HashMap<usize, String>,
 }
 
 /// Manual text selection over the transcript. Coordinates are `(transcript_row,
@@ -1293,12 +1428,8 @@ impl AgentState {
     fn composer_rows(&self) -> Vec<String> {
         let width = self.size.cols.saturating_sub(2).max(1);
         let mut out = Vec::new();
-        for (i, line) in self.composer.split('\n').enumerate() {
-            let head = if i == 0 { "❯ " } else { "  " };
-            for (ci, chunk) in wrap_chars(line, width).into_iter().enumerate() {
-                let prefix = if ci == 0 { head } else { "  " };
-                out.push(format!("{prefix}{chunk}"));
-            }
+        for line in self.composer.split('\n') {
+            out.extend(wrap_chars(line, width));
         }
         out
     }
@@ -1375,6 +1506,7 @@ impl AgentState {
 impl AgentState {
     fn rebuild_rows(&mut self) {
         let cols = self.size.cols;
+        self.tool_headers.clear();
 
         if let Some(picker) = &self.picker {
             if let PickerStage::Input {
@@ -1417,9 +1549,9 @@ impl AgentState {
                     });
                 }
                 let hint = if kind.autocompletes() {
-                    "type to search · ↑/↓ pick · Enter select · Esc back"
+                    "type to search · ↑/↓ pick · enter select · esc back"
                 } else {
-                    "Enter to confirm · Esc back"
+                    "enter confirm · esc back"
                 };
                 self.transcript = transcript;
                 self.footer = vec![
@@ -1454,6 +1586,11 @@ impl AgentState {
                     line: None,
                 });
             }
+            transcript.push(AgentRow {
+                text: "─".repeat(cols),
+                attrs: attr_dim(),
+                line: None,
+            });
             transcript.push(blank_row());
             if picker.groups.is_empty() {
                 push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
@@ -1464,51 +1601,70 @@ impl AgentState {
                 if active {
                     sel_row = transcript.len();
                 }
-                let (prefix, label, attrs) = match row {
+                match row {
                     PickerRow::Header(gi) => {
                         let group = &picker.groups[*gi];
                         let glyph = if group.collapsed { "▸" } else { "▾" };
                         let marker = if active { "❯ " } else { "  " };
-                        (
-                            format!("{marker}{glyph} "),
-                            format!("{}  ({})", group.label, group.entries.len()),
-                            attr_bold_fg(AnsiColor::Teal),
-                        )
+                        let text =
+                            format!("{marker}{glyph} {}  ({})", group.label, group.entries.len());
+                        transcript.push(AgentRow {
+                            text: truncate_to(&text, cols),
+                            attrs: attr_bold_fg(AnsiColor::Teal),
+                            line: None,
+                        });
                     }
                     PickerRow::Entry(gi, ei) => {
                         let entry = &picker.groups[*gi].entries[*ei];
-                        let marker = if active { "❯   " } else { "    " };
-                        let attrs = if active {
-                            attr_bold_fg(AnsiColor::Silver)
+                        let marker: &str = if active { "❯   " } else { "    " };
+                        let marker_attr = if active {
+                            attr_bold_fg(AnsiColor::Teal)
                         } else {
-                            attr_default()
+                            attr_dim()
                         };
-                        (marker.to_string(), entry.label.clone(), attrs)
+                        let name_attr = if active { attr_bold() } else { attr_default() };
+                        let mut used = marker.chars().count() + if entry.indent { 2 } else { 0 };
+                        if entry.dot.is_some() {
+                            used += 2;
+                        }
+                        used += entry.label.chars().count();
+                        let detail = entry
+                            .detail
+                            .as_ref()
+                            .map(|d| truncate_to(d, cols.saturating_sub(used + 5)));
+                        let mut segments: Vec<(&str, CellAttributes)> = vec![(marker, marker_attr)];
+                        if entry.indent {
+                            segments.push(("  ", attr_default()));
+                        }
+                        if let Some((glyph, color)) = entry.dot {
+                            segments.push((glyph, attr_bold_fg(color)));
+                            segments.push((" ", attr_default()));
+                        }
+                        segments.push((entry.label.as_str(), name_attr));
+                        if let Some(detail) = &detail {
+                            segments.push(("  ·  ", attr_dim()));
+                            segments.push((detail.as_str(), attr_dim()));
+                        }
+                        transcript.push(AgentRow::rendered(styled_line(segments)));
                     }
-                };
-                let budget = cols.saturating_sub(prefix.chars().count());
-                transcript.push(AgentRow {
-                    text: format!("{prefix}{}", truncate_to(&label, budget)),
-                    attrs,
-                    line: None,
-                });
+                }
             }
             self.transcript = transcript;
             self.footer = vec![if picker.pending_delete {
                 AgentRow {
-                    text: "d again: archive agent  ·  any other key: cancel".to_string(),
+                    text: "d again archive · any other key cancel".to_string(),
                     attrs: attr_fg(AnsiColor::Yellow),
                     line: None,
                 }
             } else {
                 let tail = if picker.crumbs.is_empty() {
-                    "dd:archive · o:fold · r:refresh · q: close"
+                    "dd archive · o fold · r refresh · q close"
                 } else {
-                    "Enter select · Esc back"
+                    "enter select · esc back"
                 };
                 AgentRow {
                     text: format!(
-                        "❯ {}/{}  ·  j/k · {tail}",
+                        "❯ {}/{} · j/k · {tail}",
                         (selected + 1).min(count.max(1)),
                         count
                     ),
@@ -1528,13 +1684,19 @@ impl AgentState {
         }
 
         let mut transcript = Vec::new();
+        let mut tool_headers = HashMap::new();
         if self.items.is_empty() {
             if let Some(message) = &self.status_message {
                 push_wrapped(&mut transcript, "", message, &attr_dim(), cols);
             }
         } else {
             for item in &self.items {
-                item_to_rows(item, cols, &mut transcript);
+                if tool_is_collapsible(item) {
+                    if let Some(call_id) = &item.call_id {
+                        tool_headers.insert(transcript.len(), call_id.clone());
+                    }
+                }
+                item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
             }
         }
         let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
@@ -1555,13 +1717,33 @@ impl AgentState {
             }
         }
         self.transcript = transcript;
+        self.tool_headers = tool_headers;
 
         let mut footer = Vec::new();
+        if !self.queued.is_empty() {
+            footer.push(AgentRow {
+                text: format!("◷ {} queued · sends when idle", self.queued.len()),
+                attrs: attr_fg(AnsiColor::Olive),
+                line: None,
+            });
+            for (i, msg) in self.queued.iter().enumerate() {
+                let first = msg.lines().next().unwrap_or("");
+                footer.push(AgentRow {
+                    text: truncate_to(&format!("  {}. {first}", i + 1), cols),
+                    attrs: attr_dim(),
+                    line: None,
+                });
+            }
+        }
+        footer.push(AgentRow {
+            text: "─".repeat(cols),
+            attrs: attr_dim(),
+            line: None,
+        });
         if let Some(request) = &self.pending {
             if question_pending {
                 footer.push(AgentRow {
-                    text: "⚠ question — [1-9]: pick · i: type your own · n/Esc: dismiss"
-                        .to_string(),
+                    text: "⚠ question — [1-9] pick · i type your own · n/esc dismiss".to_string(),
                     attrs: attr_fg(AnsiColor::Yellow),
                     line: None,
                 });
@@ -1614,7 +1796,45 @@ impl AgentState {
             }
         }
         if !self.agent_status.is_empty() || self.model.is_some() {
-            let model = self.model.clone().unwrap_or_else(|| "—".to_string());
+            let model = self
+                .model
+                .clone()
+                .unwrap_or_else(|| "—".to_string())
+                .to_lowercase();
+            let provider = provider_display(&self.provider).to_lowercase();
+            let mode = self.mode_label().to_lowercase();
+            let effort = self.effort_label().to_lowercase();
+            let status_attr = attr_bold_fg(agent_status_color(&self.agent_status));
+            let dim = attr_dim();
+            let value = attr_default();
+            let active_toggles: Vec<String> = self
+                .features
+                .iter()
+                .filter(|feature| feature.is_toggle() && feature.toggle_value())
+                .map(|feature| feature.label.to_lowercase())
+                .collect();
+            let toggles_text = if active_toggles.is_empty() {
+                String::new()
+            } else {
+                format!("   ({})", active_toggles.join(", "))
+            };
+            let mut status_segments: Vec<(&str, CellAttributes)> = vec![
+                ("● ", status_attr.clone()),
+                (self.agent_status.as_str(), status_attr),
+                ("   ", dim.clone()),
+                (provider.as_str(), attr_bold()),
+                ("  ·  model:", dim.clone()),
+                (model.as_str(), value.clone()),
+                ("  ·  mode:", dim.clone()),
+                (mode.as_str(), value.clone()),
+                ("  ·  effort:", dim.clone()),
+                (effort.as_str(), value),
+            ];
+            if !toggles_text.is_empty() {
+                status_segments.push((toggles_text.as_str(), attr_fg(AnsiColor::Fuchsia)));
+            }
+            footer.push(AgentRow::rendered(styled_line(status_segments)));
+
             let location = match self.workspace_name.as_deref() {
                 Some(ws) if !ws.is_empty() && !self.cwd.is_empty() => {
                     format!("{ws}  ·  {}", self.cwd)
@@ -1624,68 +1844,8 @@ impl AgentState {
             };
             if !location.is_empty() {
                 footer.push(AgentRow {
-                    text: truncate_to(&location, cols),
-                    attrs: attr_dim(),
-                    line: None,
-                });
-            }
-            footer.push(AgentRow {
-                text: format!(
-                    "[{}]  {}  ·  model:{}  ·  mode:{}  ·  effort:{}",
-                    self.agent_status,
-                    provider_display(&self.provider),
-                    model,
-                    self.mode_label(),
-                    self.effort_label()
-                ),
-                attrs: attr_fg(AnsiColor::Teal),
-                line: None,
-            });
-            let feature_keys = self.feature_keys();
-            if !feature_keys.is_empty() {
-                let chips: Vec<String> = feature_keys
-                    .iter()
-                    .filter_map(|(ch, idx)| {
-                        self.features.get(*idx).map(|feature| {
-                            if feature.is_toggle() {
-                                let mark = if feature.toggle_value() { "●" } else { "○" };
-                                format!("{mark} [{ch}]{}", feature.label)
-                            } else {
-                                format!(
-                                    "[{ch}]{}:{}",
-                                    feature.label,
-                                    feature.select_value().unwrap_or("—")
-                                )
-                            }
-                        })
-                    })
-                    .collect();
-                footer.push(AgentRow {
-                    text: chips.join("   "),
-                    attrs: attr_fg(AnsiColor::Fuchsia),
-                    line: None,
-                });
-            }
-            footer.push(AgentRow {
-                text: "d:diff  t:terminal  ·  m:mode  M:model  e:effort  x:stop".to_string(),
-                attrs: attr_dim(),
-                line: None,
-            });
-        }
-        if !self.queued.is_empty() {
-            footer.push(AgentRow {
-                text: format!(
-                    "⏳ {} queued · sends when the agent is idle",
-                    self.queued.len()
-                ),
-                attrs: attr_fg(AnsiColor::Olive),
-                line: None,
-            });
-            for (i, msg) in self.queued.iter().enumerate() {
-                let first = msg.lines().next().unwrap_or("");
-                footer.push(AgentRow {
-                    text: truncate_to(&format!("  {}. {first}", i + 1), cols),
-                    attrs: attr_dim(),
+                    text: format!("◇ {}", truncate_to(&location, cols.saturating_sub(2))),
+                    attrs: dim,
                     line: None,
                 });
             }
@@ -1717,55 +1877,90 @@ impl AgentState {
                         });
                     }
                     footer.push(AgentRow {
-                        text: "↑/↓ select  ·  Tab/Enter insert  ·  Esc dismiss".to_string(),
-                        attrs: attr_dim(),
-                        line: None,
-                    });
-                } else if is_active_status(&self.agent_status) {
-                    let (chip, color) = if self.send_interrupts {
-                        (
-                            "send mode: INTERRUPT (Enter sends now · Shift-Tab: queue)",
-                            AnsiColor::Fuchsia,
-                        )
-                    } else {
-                        (
-                            "send mode: QUEUE (Enter queues · Shift-Tab: interrupt)",
-                            AnsiColor::Olive,
-                        )
-                    };
-                    footer.push(AgentRow {
-                        text: chip.to_string(),
-                        attrs: attr_fg(color),
-                        line: None,
-                    });
-                    footer.push(AgentRow {
-                        text: "Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel".to_string(),
-                        attrs: attr_dim(),
-                        line: None,
-                    });
-                } else {
-                    footer.push(AgentRow {
-                        text:
-                            "Enter: send  ·  Shift-Enter: newline  ·  Ctrl-C: clear  ·  Esc: cancel"
-                                .to_string(),
+                        text: "↑/↓ select · tab/enter insert · esc dismiss".to_string(),
                         attrs: attr_dim(),
                         line: None,
                     });
                 }
-                for text in self.composer_rows() {
+                let (marker, marker_attr) = if !is_active_status(&self.agent_status) {
+                    ("❯ ", attr_default())
+                } else if self.send_interrupts {
+                    ("» ", attr_bold_fg(AnsiColor::Fuchsia))
+                } else {
+                    ("◷ ", attr_bold_fg(AnsiColor::Olive))
+                };
+                let rows = self.composer_rows();
+                let mut rows = rows.iter();
+                if let Some(first) = rows.next() {
+                    footer.push(AgentRow::rendered(styled_line(vec![
+                        (marker, marker_attr),
+                        (first.as_str(), attr_default()),
+                    ])));
+                }
+                for text in rows {
                     footer.push(AgentRow {
-                        text,
+                        text: format!("  {text}"),
                         attrs: attr_default(),
                         line: None,
                     });
                 }
             }
-            Mode::Scroll => footer.push(AgentRow {
-                text: "❯ (i: type · j/k · Ctrl-d/u · g/G · d: review · t: terminal · q/Esc: close)"
-                    .to_string(),
-                attrs: attr_dim(),
-                line: None,
-            }),
+            Mode::Scroll => {
+                if self.show_controls {
+                    footer.push(AgentRow {
+                        text: "─".repeat(cols),
+                        attrs: attr_dim(),
+                        line: None,
+                    });
+                    let normal = attr_default();
+                    footer.push(AgentRow {
+                        text: "i type · j/k scroll · ctrl-d/u page · g/G top/bottom".to_string(),
+                        attrs: normal.clone(),
+                        line: None,
+                    });
+                    let feature_hint = self
+                        .feature_keys()
+                        .iter()
+                        .filter_map(|(ch, idx)| {
+                            self.features
+                                .get(*idx)
+                                .map(|feature| format!("{ch} {}", feature.label.to_lowercase()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    let mut actions =
+                        "d diff · t terminal · m mode · M model · e effort · x stop".to_string();
+                    if !feature_hint.is_empty() {
+                        actions.push_str(" · ");
+                        actions.push_str(&feature_hint);
+                    }
+                    footer.push(AgentRow {
+                        text: actions,
+                        attrs: normal.clone(),
+                        line: None,
+                    });
+                    let mut typing = normal.clone();
+                    typing.set_italic(true);
+                    footer.push(AgentRow::rendered(styled_line(vec![
+                        ("typing", typing),
+                        (
+                            " · shift-tab send-mode · shift-enter newline · esc cancel",
+                            normal.clone(),
+                        ),
+                    ])));
+                    footer.push(AgentRow {
+                        text: "q/esc close · ? hide controls".to_string(),
+                        attrs: normal,
+                        line: None,
+                    });
+                } else {
+                    footer.push(AgentRow {
+                        text: "❯ i type · ? controls".to_string(),
+                        attrs: attr_dim(),
+                        line: None,
+                    });
+                }
+            }
         }
         self.footer = footer;
 
@@ -1907,14 +2102,16 @@ impl PaseoAgentPane {
 }
 
 impl PaseoAgentPane {
-    fn mutate<F: FnOnce(&mut AgentState)>(&self, f: F) {
-        {
+    fn mutate<T, F: FnOnce(&mut AgentState) -> T>(&self, f: F) -> T {
+        let value = {
             let mut state = self.state.lock();
-            f(&mut state);
+            let value = f(&mut state);
             state.rows_version += 1;
             state.seqno += 1;
-        }
+            value
+        };
         self.window.invalidate();
+        value
     }
 
     fn set_timeline(&self, items: &[TimelineItem]) {
@@ -1941,25 +2138,32 @@ impl PaseoAgentPane {
             "turn_started" => {
                 self.mutate(|state| {
                     state.agent_status = "running".to_string();
-                    state.draining = false;
                     state.rebuild_rows();
                 });
                 return;
             }
             "turn_completed" | "turn_canceled" => {
-                self.mutate(|state| {
+                let stopped = self.mutate(|state| {
+                    let was_active = is_active_status(&state.agent_status);
                     state.agent_status = "idle".to_string();
                     state.rebuild_rows();
+                    was_active
                 });
-                self.maybe_drain_queue();
+                if stopped {
+                    self.maybe_drain_queue();
+                }
                 return;
             }
             "turn_failed" => {
-                self.mutate(|state| {
+                let stopped = self.mutate(|state| {
+                    let was_active = is_active_status(&state.agent_status);
                     state.agent_status = "error".to_string();
                     state.rebuild_rows();
+                    was_active
                 });
-                self.maybe_drain_queue();
+                if stopped {
+                    self.maybe_drain_queue();
+                }
                 return;
             }
             "timeline" => {}
@@ -1983,14 +2187,12 @@ impl PaseoAgentPane {
     }
 
     fn set_snapshot(&self, snapshot: &AgentSnapshot) {
-        self.mutate(|state| {
+        let stopped = self.mutate(|state| {
+            let was_active = is_active_status(&state.agent_status);
             state.cwd = snapshot.cwd.clone();
             state.title = session_name(state.workspace_name.as_deref(), snapshot);
             state.provider = snapshot.provider.clone();
             state.agent_status = snapshot.status.clone();
-            if is_active_status(&state.agent_status) {
-                state.draining = false;
-            }
             state.model = snapshot.model.clone();
             state.current_mode_id = snapshot.current_mode_id.clone();
             state.available_modes = snapshot.available_modes.clone();
@@ -2001,8 +2203,11 @@ impl PaseoAgentPane {
                 state.pending = snapshot.pending_permissions.first().cloned();
             }
             state.rebuild_rows();
+            was_active && !is_active_status(&state.agent_status)
         });
-        self.maybe_drain_queue();
+        if stopped {
+            self.maybe_drain_queue();
+        }
     }
 
     fn set_models(&self, models: Vec<ModelDefinition>) {
@@ -2276,6 +2481,7 @@ impl PaseoAgentPane {
 
     fn selection_finish(&self) {
         let mut text = String::new();
+        let mut toggle = None;
         self.mutate(|state| {
             let Some(mut sel) = state.selection else {
                 return;
@@ -2285,15 +2491,38 @@ impl PaseoAgentPane {
             }
             sel.dragging = false;
             if sel.is_empty() {
+                toggle = state.tool_headers.get(&sel.anchor.0).cloned();
                 state.selection = None;
                 return;
             }
             state.selection = Some(sel);
             text = state.selected_text();
         });
-        if !text.is_empty() {
+        if let Some(call_id) = toggle {
+            self.toggle_tool(&call_id);
+        } else if !text.is_empty() {
             self.window.set_clipboard(Clipboard::Clipboard, text);
         }
+    }
+
+    fn toggle_tool(&self, call_id: &str) {
+        self.mutate(|state| {
+            let running = state
+                .items
+                .iter()
+                .find(|item| item.call_id.as_deref() == Some(call_id))
+                .map(|item| tool_running(item.status.as_deref().unwrap_or_default()))
+                .unwrap_or(false);
+            let expanded = state
+                .tool_expand_overrides
+                .get(call_id)
+                .copied()
+                .unwrap_or(running);
+            state
+                .tool_expand_overrides
+                .insert(call_id.to_string(), !expanded);
+            state.rebuild_rows();
+        });
     }
 
     fn scroll_to_top(&self) {
@@ -2390,6 +2619,12 @@ impl PaseoAgentPane {
     }
 
     fn maybe_drain_queue(&self) {
+        let Some(agent_id) = self.agent_id() else {
+            return;
+        };
+        let Some(client) = self.client() else {
+            return;
+        };
         let next = {
             let mut state = self.state.lock();
             if state.draining || is_active_status(&state.agent_status) || state.queued.is_empty() {
@@ -2399,9 +2634,30 @@ impl PaseoAgentPane {
                 Some(state.queued.remove(0))
             }
         };
-        if let Some(text) = next {
-            self.send_now(text);
-            self.mutate(|state| state.rebuild_rows());
+        let Some(text) = next else {
+            return;
+        };
+        self.mutate(|state| state.rebuild_rows());
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let failed = client.send_agent_message(&agent_id, &text).await.is_err();
+            if let Some(pane) = weak.upgrade() {
+                pane.finish_drain(text, failed);
+            }
+        })
+        .detach();
+    }
+
+    fn finish_drain(&self, text: String, failed: bool) {
+        self.mutate(|state| {
+            state.draining = false;
+            if failed {
+                state.queued.insert(0, text);
+            }
+            state.rebuild_rows();
+        });
+        if failed {
+            log::error!("paseo: failed to send queued agent message; re-queued");
         }
     }
 
@@ -2736,9 +2992,11 @@ impl PaseoAgentPane {
                 _ => {
                     let entries = providers
                         .into_iter()
-                        .map(|id| PickerEntry {
-                            label: provider_display(&id),
-                            action: PickerAction::SelectProvider(id),
+                        .map(|id| {
+                            PickerEntry::plain(
+                                provider_display(&id).to_lowercase(),
+                                PickerAction::SelectProvider(id),
+                            )
                         })
                         .collect();
                     let groups = vec![PickerGroup {
@@ -2871,18 +3129,18 @@ impl PaseoAgentPane {
             label: "New agent".to_string(),
             collapsed: false,
             entries: vec![
-                PickerEntry {
-                    label: "in this checkout".to_string(),
-                    action: PickerAction::WorktreeInPlace(cwd.clone()),
-                },
-                PickerEntry {
-                    label: "new branch in a worktree".to_string(),
-                    action: PickerAction::WorktreeNewBranch(cwd.clone()),
-                },
-                PickerEntry {
-                    label: "existing branch in a worktree".to_string(),
-                    action: PickerAction::WorktreeCheckoutBranch(cwd),
-                },
+                PickerEntry::plain(
+                    "in this checkout",
+                    PickerAction::WorktreeInPlace(cwd.clone()),
+                ),
+                PickerEntry::plain(
+                    "new branch in a worktree",
+                    PickerAction::WorktreeNewBranch(cwd.clone()),
+                ),
+                PickerEntry::plain(
+                    "existing branch in a worktree",
+                    PickerAction::WorktreeCheckoutBranch(cwd),
+                ),
             ],
         }];
         let selected = first_entry_row(&groups);
@@ -2904,9 +3162,11 @@ impl PaseoAgentPane {
     ) {
         let entries = providers
             .into_iter()
-            .map(|id| PickerEntry {
-                label: provider_display(&id),
-                action: PickerAction::SelectProvider(id),
+            .map(|id| {
+                PickerEntry::plain(
+                    provider_display(&id).to_lowercase(),
+                    PickerAction::SelectProvider(id),
+                )
             })
             .collect();
         let groups = vec![PickerGroup {
@@ -4158,6 +4418,10 @@ impl Pane for PaseoAgentPane {
                 KeyCode::PageUp => self.scroll_page(-1),
                 KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_lines(3),
                 KeyCode::Char('k') | KeyCode::UpArrow => self.scroll_lines(-3),
+                KeyCode::Char('?') => self.mutate(|state| {
+                    state.show_controls = !state.show_controls;
+                    state.rebuild_rows();
+                }),
                 KeyCode::Char(c) if !mods.contains(KeyModifiers::CTRL) => {
                     let idx = self
                         .state
@@ -4357,6 +4621,9 @@ pub fn open_paseo_agent_pane(
             queued: Vec::new(),
             draining: false,
             send_interrupts: false,
+            show_controls: false,
+            tool_expand_overrides: HashMap::new(),
+            tool_headers: HashMap::new(),
         }),
     });
 
