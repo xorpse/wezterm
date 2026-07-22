@@ -18,9 +18,12 @@ use paseo_client::{
 };
 use rangeset::RangeSet;
 use serde_json::Value;
+use similar::{ChangeTag, TextDiff};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use termwiz::cell::{Cell, CellAttributes, Intensity, Underline};
 use termwiz::color::{AnsiColor, ColorAttribute, SrgbaTuple};
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
@@ -28,6 +31,9 @@ use url::Url;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{unicode_column_width, KeyCode, KeyModifiers, StableRowIndex, TerminalSize};
 use window::{Clipboard, Window, WindowOps};
+
+const SPINNER_FRAMES: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(90);
 
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
     let width = unicode_column_width(text, None);
@@ -372,11 +378,50 @@ fn agent_status_color(status: &str) -> AnsiColor {
     }
 }
 
+fn edit_diff_text(detail: &ToolCallDetail) -> Option<Cow<'_, str>> {
+    if let Some(diff) = &detail.unified_diff {
+        return Some(Cow::Borrowed(diff.as_str()));
+    }
+    let old = detail.old_string.as_deref();
+    let new = detail.new_string.as_deref();
+    if old.is_none() && new.is_none() {
+        return None;
+    }
+    let mut text = String::new();
+    for change in
+        TextDiff::from_lines(old.unwrap_or_default(), new.unwrap_or_default()).iter_all_changes()
+    {
+        text.push(match change.tag() {
+            ChangeTag::Delete => '-',
+            ChangeTag::Insert => '+',
+            ChangeTag::Equal => ' ',
+        });
+        text.push_str(change.value().trim_end_matches('\n'));
+        text.push('\n');
+    }
+    Some(Cow::Owned(text))
+}
+
 fn tool_body_present(detail: &ToolCallDetail) -> bool {
     match detail.kind.as_str() {
-        "edit" => detail.unified_diff.is_some(),
+        "edit" => {
+            detail.unified_diff.is_some()
+                || detail.old_string.is_some()
+                || detail.new_string.is_some()
+        }
         "plan" => detail.text.as_deref().is_some_and(|t| !t.trim().is_empty()),
-        "read" | "write" | "search" | "fetch" | "sub_agent" => false,
+        "write" => detail
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty()),
+        "search" => {
+            detail
+                .content
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+                || detail.file_paths.as_ref().is_some_and(|p| !p.is_empty())
+        }
+        "read" | "fetch" | "sub_agent" => false,
         "shell" => detail.output.is_some(),
         _ => detail
             .text
@@ -462,14 +507,19 @@ fn tool_detail_rows(
             if let Some(path) = &detail.file_path {
                 push_wrapped(rows, "  write ", path, &target, cols);
             }
+            if expanded {
+                if let Some(content) = &detail.content {
+                    push_wrapped(rows, "  ", &truncate_lines(content, 60), &attr_dim(), cols);
+                }
+            }
         }
         "edit" => {
             if let Some(path) = &detail.file_path {
                 push_wrapped(rows, "  edit ", path, &target, cols);
             }
             if expanded {
-                if let Some(diff) = &detail.unified_diff {
-                    for line in truncate_lines(diff, 60).split('\n') {
+                if let Some(diff) = edit_diff_text(detail) {
+                    for line in truncate_lines(&diff, 60).split('\n') {
                         let attrs = if line.starts_with('+') {
                             attr_fg(AnsiColor::Green)
                         } else if line.starts_with('-') {
@@ -485,6 +535,25 @@ fn tool_detail_rows(
         "search" => {
             if let Some(query) = &detail.query {
                 push_wrapped(rows, "  search ", query, &target, cols);
+            }
+            if expanded {
+                if let Some(content) = &detail.content {
+                    push_wrapped(rows, "  ", &truncate_lines(content, 40), &attr_dim(), cols);
+                }
+                if let Some(paths) = &detail.file_paths {
+                    for path in paths.iter().take(40) {
+                        push_wrapped(rows, "  ", path, &attr_dim(), cols);
+                    }
+                    if paths.len() > 40 {
+                        push_wrapped(
+                            rows,
+                            "  ",
+                            &format!("… {} more", paths.len() - 40),
+                            &attr_dim(),
+                            cols,
+                        );
+                    }
+                }
             }
         }
         "fetch" => {
@@ -1269,6 +1338,8 @@ struct AgentState {
     queued: Vec<String>,
     draining: bool,
     show_controls: bool,
+    spinner_frame: usize,
+    spinner_ticking: bool,
     tool_expand_overrides: HashMap<String, bool>,
     tool_headers: HashMap<usize, String>,
 }
@@ -1698,7 +1769,6 @@ impl AgentState {
                 item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
             }
         }
-        let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
         if let Some(request) = self.pending.as_ref().filter(|r| pending_is_question(r)) {
             transcript.extend(question_rows(request, cols));
         } else if let Some(text) = self.pending.as_ref().and_then(plan_text) {
@@ -1717,6 +1787,17 @@ impl AgentState {
         }
         self.transcript = transcript;
         self.tool_headers = tool_headers;
+
+        self.rebuild_footer();
+
+        if !self.selection.map(|s| s.dragging).unwrap_or(false) {
+            self.selection = None;
+        }
+    }
+
+    fn rebuild_footer(&mut self) {
+        let cols = self.size.cols;
+        let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
 
         let mut footer = Vec::new();
         if !self.queued.is_empty() {
@@ -1882,7 +1963,10 @@ impl AgentState {
                     });
                 }
                 let (marker, marker_attr) = if is_active_status(&self.agent_status) {
-                    ("◷ ", attr_bold_fg(AnsiColor::Olive))
+                    (
+                        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()],
+                        attr_bold_fg(AnsiColor::Olive),
+                    )
                 } else {
                     ("❯ ", attr_default())
                 };
@@ -1960,12 +2044,17 @@ impl AgentState {
             }
         }
         self.footer = footer;
-
-        if !self.selection.map(|s| s.dragging).unwrap_or(false) {
-            self.selection = None;
-        }
-
         self.clamp_scroll();
+    }
+
+    fn tick_spinner(&mut self) -> bool {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        if self.mode != Mode::Compose || self.picker.is_some() {
+            return false;
+        }
+        self.rebuild_footer();
+        self.seqno += 1;
+        true
     }
 
     fn view_rows(&self) -> usize {
@@ -2111,6 +2200,34 @@ impl PaseoAgentPane {
         value
     }
 
+    fn sync_spinner(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.spinner_ticking || !is_active_status(&state.agent_status) {
+                return;
+            }
+            state.spinner_ticking = true;
+        }
+        let weak = self.weak.lock().clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(SPINNER_INTERVAL);
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            let repaint = {
+                let mut state = pane.state.lock();
+                if state.dead || !is_active_status(&state.agent_status) {
+                    state.spinner_ticking = false;
+                    return;
+                }
+                state.tick_spinner()
+            };
+            if repaint {
+                pane.window.invalidate();
+            }
+        });
+    }
+
     fn set_timeline(&self, items: &[TimelineItem]) {
         self.mutate(|state| {
             state.status_message = None;
@@ -2137,6 +2254,7 @@ impl PaseoAgentPane {
                     state.agent_status = "running".to_string();
                     state.rebuild_rows();
                 });
+                self.sync_spinner();
                 return;
             }
             "turn_completed" | "turn_canceled" => {
@@ -2205,6 +2323,7 @@ impl PaseoAgentPane {
         if stopped {
             self.maybe_drain_queue();
         }
+        self.sync_spinner();
     }
 
     fn set_models(&self, models: Vec<ModelDefinition>) {
@@ -4612,6 +4731,8 @@ pub fn open_paseo_agent_pane(
             queued: Vec::new(),
             draining: false,
             show_controls: false,
+            spinner_frame: 0,
+            spinner_ticking: false,
             tool_expand_overrides: HashMap::new(),
             tool_headers: HashMap::new(),
         }),

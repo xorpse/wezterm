@@ -143,6 +143,33 @@ pub fn current_branch(host: &Host, repo: &str) -> Option<String> {
     }
 }
 
+pub fn parent_branch(host: &Host, repo: &str) -> Option<String> {
+    let upstream = run_git(
+        host,
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()
+    .map(|out| out.trim().to_string())
+    .filter(|name| !name.is_empty());
+    if upstream.is_some() {
+        return upstream;
+    }
+    run_git(
+        host,
+        repo,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .map(|out| out.trim().to_string())
+    .filter(|name| !name.is_empty())
+}
+
 fn diff_args(host: &Host, repo: &str, mode: &DiffMode) -> Result<Vec<String>> {
     let mut args: Vec<String> = vec![
         "diff".into(),
@@ -153,7 +180,6 @@ fn diff_args(host: &Host, repo: &str, mode: &DiffMode) -> Result<Vec<String>> {
     ];
     match mode {
         DiffMode::WorkingTree => args.push("HEAD".into()),
-        DiffMode::Staged => args.push("--cached".into()),
         DiffMode::Branch(b) => args.push(b.clone()),
         DiffMode::MergeBase(b) => {
             let base = run_git(host, repo, &["merge-base", "HEAD", b])?
@@ -278,7 +304,7 @@ pub fn compute_diff(host: &Host, repo: &str, mode: &DiffMode, limits: &DiffLimit
         .map(|f| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>())
         .sum();
 
-    if matches!(mode, DiffMode::WorkingTree) && host.is_local() {
+    if matches!(mode, DiffMode::WorkingTree | DiffMode::MergeBase(_)) && host.is_local() {
         let others = run_git(host, repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
         for path in others.split('\0').filter(|s| !s.is_empty()) {
             files.push(synth_untracked(repo, path, limits, &mut retained_total));

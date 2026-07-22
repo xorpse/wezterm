@@ -5,12 +5,15 @@ use config::keyassignment::{
     SpawnCommand, SpawnTabDomain, SplitSize as ConfigSplitSize,
 };
 use git_review::{
-    compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, DiffLimits,
-    DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
+    compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, parent_branch,
+    DiffLimits, DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
 use paseo_client::PaseoClient;
 
+mod highlight;
 mod paseo_source;
+
+use highlight::{DiffTints, FileHighlight, Span};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
@@ -28,8 +31,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use termwiz::cell::{CellAttributes, Intensity};
-use termwiz::color::AnsiColor;
+use termwiz::cell::{Cell, CellAttributes, Intensity};
+use termwiz::color::{AnsiColor, ColorAttribute, SrgbaTuple};
 use termwiz::lineedit::{LineEditBuffer, Movement};
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
 use url::Url;
@@ -57,6 +60,14 @@ enum RowKind {
 const NOTE_TEXT_COL: usize = 10;
 const NOTE_PREFIX: &str = "        ▎ ";
 const EDIT_PREFIX: &str = "        ┃ ";
+const HEADER_ROWS: usize = 3;
+
+#[derive(Hash)]
+enum ViewRow {
+    Doc(usize),
+    FindBar,
+    Header(usize),
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct LineAnchor {
@@ -78,6 +89,7 @@ struct RenderRow {
     payload: Option<String>,
     file: Option<String>,
     commented: bool,
+    spans: Vec<Span>,
 }
 
 impl RenderRow {
@@ -89,7 +101,40 @@ impl RenderRow {
             payload: None,
             file: None,
             commented: false,
+            spans: Vec::new(),
         }
+    }
+
+    fn to_line(&self, attrs: &CellAttributes, cols: usize, syntax: bool) -> Line {
+        if self.spans.is_empty() || !syntax {
+            return make_line(&self.text, attrs, 0, cols);
+        }
+        let mut chars = self.text.chars();
+        let mut segments: Vec<(String, CellAttributes)> = Vec::new();
+        for span in &self.spans {
+            let text: String = chars.by_ref().take(span.len).collect();
+            if text.is_empty() {
+                continue;
+            }
+            let mut attrs = attrs.clone();
+            if let Some(color) = span.color {
+                attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(color));
+            }
+            segments.push((text, attrs));
+        }
+        let rest: String = chars.collect();
+        let width = unicode_column_width(&self.text, None);
+        if !rest.is_empty() {
+            segments.push((rest, attrs.clone()));
+        }
+        if width < cols {
+            segments.push((" ".repeat(cols - width), attrs.clone()));
+        }
+        styled_line(
+            segments
+                .iter()
+                .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+        )
     }
 }
 
@@ -215,6 +260,7 @@ impl EditState {
     }
 }
 
+#[derive(Hash)]
 enum LoadStatus {
     Loading,
     Ready,
@@ -238,14 +284,24 @@ impl DiffSource {
     }
 }
 
+struct ComputedDiff {
+    repo_root: String,
+    branch: Option<String>,
+    parent_branch: Option<String>,
+    data: GitDiffData,
+}
+
 struct ReviewState {
     status: LoadStatus,
     mode: DiffMode,
     source: DiffSource,
     repo_root: String,
     branch: Option<String>,
+    parent_branch: Option<String>,
     data: Option<GitDiffData>,
     cache: HashMap<DiffMode, GitDiffData>,
+    highlights: HashMap<String, FileHighlight>,
+    tints: DiffTints,
     file_loads: HashMap<String, FileLoad>,
     compute_seq: u64,
     compute_started: Option<Instant>,
@@ -324,6 +380,91 @@ impl ReviewState {
         self.annotations = new_map;
     }
 
+    fn header_rows(&self) -> usize {
+        HEADER_ROWS.min(self.size.rows.saturating_sub(1))
+    }
+
+    fn view_rows(&self) -> usize {
+        self.size.rows.saturating_sub(self.header_rows()).max(1)
+    }
+
+    fn view_row(&self, screen_row: usize) -> ViewRow {
+        let header = self.header_rows();
+        if screen_row < header {
+            return ViewRow::Header(screen_row);
+        }
+        if self.find.is_some() && screen_row + 1 == self.size.rows {
+            return ViewRow::FindBar;
+        }
+        ViewRow::Doc(self.scroll + screen_row - header)
+    }
+
+    fn header_line(&self, row: usize) -> Line {
+        let cols = self.size.cols;
+        let dim = {
+            let mut a = CellAttributes::default();
+            a.set_intensity(Intensity::Half);
+            a
+        };
+        match row {
+            0 => {
+                let color = match &self.status {
+                    LoadStatus::Loading => AnsiColor::Yellow,
+                    LoadStatus::Error(_) => AnsiColor::Red,
+                    LoadStatus::Ready => AnsiColor::Green,
+                };
+                let mut status_attr = CellAttributes::default();
+                status_attr.set_intensity(Intensity::Bold);
+                status_attr.set_foreground(color);
+                let mut mode_attr = CellAttributes::default();
+                mode_attr.set_intensity(Intensity::Bold);
+                mode_attr.set_foreground(AnsiColor::Teal);
+
+                let mode = self.mode.label();
+                let mut segments = vec![
+                    ("● ", status_attr),
+                    ("diff:", dim.clone()),
+                    (mode.as_str(), mode_attr),
+                ];
+                let counts = self.data.as_ref().map(|data| {
+                    (
+                        data.files.len().to_string(),
+                        format!("+{}", data.total_additions),
+                        format!("−{}", data.total_deletions),
+                    )
+                });
+                if let Some((files, additions, deletions)) = &counts {
+                    let mut added = CellAttributes::default();
+                    added.set_foreground(AnsiColor::Green);
+                    let mut removed = CellAttributes::default();
+                    removed.set_foreground(AnsiColor::Maroon);
+                    segments.push(("  ·  files:", dim.clone()));
+                    segments.push((files.as_str(), CellAttributes::default()));
+                    segments.push(("  ·  ", dim.clone()));
+                    segments.push((additions.as_str(), added));
+                    segments.push((" ", dim));
+                    segments.push((deletions.as_str(), removed));
+                }
+                styled_line(segments)
+            }
+            1 => {
+                let prefix = match &self.branch {
+                    Some(branch) => format!("◇ {branch}  ·  "),
+                    None => "◇ ".to_string(),
+                };
+                let width = cols.saturating_sub(prefix.chars().count());
+                let root: String = if self.repo_root.chars().count() > width {
+                    let skip = self.repo_root.chars().count() - width.saturating_sub(1);
+                    format!("…{}", self.repo_root.chars().skip(skip).collect::<String>())
+                } else {
+                    self.repo_root.clone()
+                };
+                make_line(&format!("{prefix}{root}"), &dim, 0, cols)
+            }
+            _ => make_line(&"─".repeat(cols), &dim, 0, cols),
+        }
+    }
+
     fn find_bar_line(&self) -> Line {
         let text = match &self.find {
             Some(find) if find.browsing => {
@@ -341,38 +482,55 @@ impl ReviewState {
         make_line(&text, &a, 0, self.size.cols)
     }
 
-    fn row_key(&self, doc: usize, is_bar: bool) -> u64 {
+    fn row_key(&self, row: &ViewRow) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.rows_version.hash(&mut h);
-        is_bar.hash(&mut h);
-        if is_bar {
-            if let Some(find) = &self.find {
-                find.buffer.get_line().hash(&mut h);
-                find.browsing.hash(&mut h);
+        row.hash(&mut h);
+        match row {
+            ViewRow::Header(_) => {
+                self.mode.hash(&mut h);
+                self.branch.hash(&mut h);
+                self.repo_root.hash(&mut h);
+                self.status.hash(&mut h);
+                if let Some(data) = &self.data {
+                    data.files.len().hash(&mut h);
+                    data.total_additions.hash(&mut h);
+                    data.total_deletions.hash(&mut h);
+                }
             }
-        } else {
-            doc.hash(&mut h);
-            (doc == self.cursor).hash(&mut h);
-            self.is_selected(doc).hash(&mut h);
+            ViewRow::FindBar => {
+                if let Some(find) = &self.find {
+                    find.buffer.get_line().hash(&mut h);
+                    find.browsing.hash(&mut h);
+                }
+            }
+            ViewRow::Doc(doc) => {
+                (*doc == self.cursor).hash(&mut h);
+                self.is_selected(*doc).hash(&mut h);
+            }
         }
         h.finish()
     }
 
-    fn build_view_line(&self, doc: usize, is_bar: bool) -> Line {
-        if is_bar {
-            return self.find_bar_line();
-        }
+    fn build_view_line(&self, row: &ViewRow) -> Line {
         let cols = self.size.cols;
+        let doc = match row {
+            ViewRow::Header(index) => return self.header_line(*index),
+            ViewRow::FindBar => return self.find_bar_line(),
+            ViewRow::Doc(doc) => *doc,
+        };
         match self.rows.get(doc) {
             Some(row) => {
+                let cursor = doc == self.cursor;
                 let attrs = attrs_for(
                     row.kind,
-                    doc == self.cursor,
+                    cursor,
                     self.is_selected(doc),
                     row.commented,
+                    &self.tints,
                 );
-                make_line(&row.text, &attrs, 0, cols)
+                row.to_line(&attrs, cols, !cursor)
             }
             None => make_line("", &CellAttributes::default(), 0, cols),
         }
@@ -386,13 +544,11 @@ impl ReviewState {
                 .collect();
             self.rendered_keys = vec![u64::MAX; h];
         }
-        let bar_row = h.saturating_sub(1);
         for r in 0..h {
-            let is_bar = self.find.is_some() && r == bar_row;
-            let doc = self.scroll + r;
-            let key = self.row_key(doc, is_bar);
+            let row = self.view_row(r);
+            let key = self.row_key(&row);
             if self.rendered_keys[r] != key {
-                self.rendered[r] = self.build_view_line(doc, is_bar);
+                self.rendered[r] = self.build_view_line(&row);
                 self.rendered_keys[r] = key;
             }
         }
@@ -420,12 +576,29 @@ impl ReviewState {
 
     fn rebuild_rows(&mut self) {
         self.rows_version = self.rows_version.wrapping_add(1);
+        let dark = dark_background();
+        self.tints = highlight::tints(dark);
+        let mut fresh = Vec::new();
+        if let Some(data) = &self.data {
+            for file in &data.files {
+                if !self.collapsed.contains(&file.file_path)
+                    && !self.highlights.contains_key(&file.file_path)
+                {
+                    fresh.push((
+                        file.file_path.clone(),
+                        highlight::highlight_file(file, dark),
+                    ));
+                }
+            }
+        }
+        self.highlights.extend(fresh);
         if let Some(data) = &self.data {
             self.rows = build_rows(
                 data,
                 &self.annotations,
                 &self.collapsed,
                 &self.file_loads,
+                &self.highlights,
                 self.editing.as_ref(),
                 self.size.cols,
             );
@@ -449,7 +622,7 @@ impl ReviewState {
 
 impl ReviewState {
     fn ensure_visible(&mut self) {
-        let h = self.size.rows.max(1);
+        let h = self.view_rows();
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
         } else if self.cursor >= self.scroll + h {
@@ -472,7 +645,7 @@ impl ReviewState {
     }
 
     fn page(&mut self, dir: isize) {
-        let h = self.size.rows.max(1) as isize;
+        let h = self.view_rows() as isize;
         self.move_cursor(dir * h);
     }
 
@@ -634,9 +807,10 @@ impl ReviewPane {
     fn cycle_diff_mode(&self) {
         {
             let mut s = self.state.lock();
-            s.mode = s.mode.cycle();
+            s.mode = s.mode.cycle(s.parent_branch.as_deref());
             if let Some(data) = s.cache.get(&s.mode).cloned() {
                 s.collapsed = data.files.iter().map(|f| f.file_path.clone()).collect();
+                s.highlights.clear();
                 s.file_loads.clear();
                 s.data = Some(data);
                 s.status = LoadStatus::Ready;
@@ -1005,13 +1179,15 @@ impl ReviewPane {
             return make_line("", &CellAttributes::default(), state.seqno, cols);
         }
         let row = &state.rows[doc];
+        let cursor = doc == state.cursor;
         let attrs = attrs_for(
             row.kind,
-            doc == state.cursor,
+            cursor,
             state.is_selected(doc),
             row.commented,
+            &state.tints,
         );
-        make_line(&row.text, &attrs, state.seqno, cols)
+        row.to_line(&attrs, cols, !cursor)
     }
 
     fn spawn_compute(pane: Arc<ReviewPane>, reset_view: bool) {
@@ -1041,8 +1217,14 @@ impl ReviewPane {
                     let result = (|| {
                         let root = find_repo_root(&host, &start)?;
                         let branch = current_branch(&host, &root);
+                        let parent = parent_branch(&host, &root);
                         let data = compute_diff(&host, &root, &mode, &DiffLimits::default())?;
-                        Ok::<_, anyhow::Error>((root, branch, data))
+                        Ok::<_, anyhow::Error>(ComputedDiff {
+                            repo_root: root,
+                            branch,
+                            parent_branch: parent,
+                            data,
+                        })
                     })();
                     let message = match (&result, &host) {
                         (Err(_), Host::Ssh(remote)) => Some(format!(
@@ -1068,7 +1250,7 @@ impl ReviewPane {
         seq: u64,
         reset_view: bool,
         mode: DiffMode,
-        result: anyhow::Result<(String, Option<String>, GitDiffData)>,
+        result: anyhow::Result<ComputedDiff>,
         error_override: Option<String>,
     ) {
         {
@@ -1077,9 +1259,16 @@ impl ReviewPane {
                 return;
             }
             match result {
-                Ok((root, branch, data)) => {
-                    state.repo_root = root;
+                Ok(ComputedDiff {
+                    repo_root,
+                    branch,
+                    parent_branch,
+                    data,
+                }) => {
+                    state.repo_root = repo_root;
                     state.branch = branch;
+                    state.parent_branch = parent_branch;
+                    state.highlights.clear();
                     state.cache.insert(mode.clone(), data.clone());
                     if reset_view {
                         state.collapsed = data.files.iter().map(|f| f.file_path.clone()).collect();
@@ -1177,6 +1366,7 @@ impl ReviewPane {
                 match result {
                     Ok(file) => {
                         let still_oversized = file.oversized;
+                        s.highlights.remove(&path);
                         if let Some(data) = &mut s.data {
                             if let Some(slot) = data.files.iter_mut().find(|f| f.file_path == path)
                             {
@@ -1206,6 +1396,16 @@ impl ReviewPane {
     }
 }
 
+fn styled_line<'a>(segments: impl IntoIterator<Item = (&'a str, CellAttributes)>) -> Line {
+    let mut cells = Vec::new();
+    for (text, attrs) in segments {
+        for ch in text.chars() {
+            cells.push(Cell::new(ch, attrs.clone()));
+        }
+    }
+    Line::from_cells(cells, 0)
+}
+
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
     let width = unicode_column_width(text, None);
     let padded = if width < cols {
@@ -1216,14 +1416,20 @@ fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize)
     Line::from_text(&padded, attrs, seqno, None)
 }
 
-fn attrs_for(kind: RowKind, cursor: bool, selected: bool, commented: bool) -> CellAttributes {
+fn attrs_for(
+    kind: RowKind,
+    cursor: bool,
+    selected: bool,
+    commented: bool,
+    tints: &DiffTints,
+) -> CellAttributes {
     let mut a = CellAttributes::default();
     match kind {
         RowKind::Add => {
-            a.set_foreground(AnsiColor::Green);
+            a.set_background(ColorAttribute::TrueColorWithDefaultFallback(tints.add));
         }
         RowKind::Delete => {
-            a.set_foreground(AnsiColor::Maroon);
+            a.set_background(ColorAttribute::TrueColorWithDefaultFallback(tints.delete));
         }
         RowKind::HunkHeader => {
             a.set_foreground(AnsiColor::Teal);
@@ -1367,6 +1573,7 @@ fn note_row(text: String, kind: RowKind, anchor: &LineAnchor) -> RenderRow {
         payload: None,
         file: None,
         commented: false,
+        spans: Vec::new(),
     }
 }
 
@@ -1492,11 +1699,20 @@ fn wrap_note_lines(prefix: &str, text: &str, cols: usize) -> Vec<String> {
     out
 }
 
+fn dark_background() -> bool {
+    let palette = config::configuration().resolved_palette.clone();
+    palette.background.map_or(true, |color| {
+        let (r, g, b, _) = SrgbaTuple::from(color).to_tuple_rgba();
+        0.299 * r + 0.587 * g + 0.114 * b < 0.5
+    })
+}
+
 fn build_rows(
     data: &GitDiffData,
     annotations: &HashMap<LineAnchor, Comment>,
     collapsed: &HashSet<String>,
     file_loads: &HashMap<String, FileLoad>,
+    highlights: &HashMap<String, FileHighlight>,
     editing: Option<&EditState>,
     cols: usize,
 ) -> Vec<RenderRow> {
@@ -1536,6 +1752,7 @@ fn build_rows(
             payload: None,
             file: Some(file.file_path.clone()),
             commented: comment_count > 0,
+            spans: Vec::new(),
         });
 
         if folded {
@@ -1573,6 +1790,7 @@ fn build_rows(
                     ));
                 }
                 rows.push(RenderRow::plain(hunk.header_text(), RowKind::HunkHeader));
+                let file_highlight = highlights.get(&file.file_path);
                 for line in &hunk.lines {
                     let old = line
                         .old_line_number
@@ -1594,8 +1812,19 @@ fn build_rows(
                     let content = format!("{}{}", line.marker(), line.text);
                     let width = cols.saturating_sub(gutter.chars().count()).max(1);
                     let indent = " ".repeat(gutter.chars().count());
+                    let line_spans = file_highlight.map_or(&[][..], |h| h.spans(line));
                     for (ci, chunk) in edit_wrap_chunks(&content, width).into_iter().enumerate() {
                         let prefix = if ci == 0 { &gutter } else { &indent };
+                        let spans = if line_spans.is_empty() {
+                            Vec::new()
+                        } else {
+                            let marker_len = usize::from(ci == 0);
+                            let text_start = (ci * width).saturating_sub(1);
+                            let text_len = chunk.chars().count().saturating_sub(marker_len);
+                            let mut spans = vec![Span::plain(prefix.chars().count() + marker_len)];
+                            spans.extend(highlight::slice(line_spans, text_start, text_len));
+                            spans
+                        };
                         rows.push(RenderRow {
                             text: format!("{prefix}{chunk}"),
                             kind,
@@ -1603,6 +1832,7 @@ fn build_rows(
                             payload: if ci == 0 { Some(content.clone()) } else { None },
                             file: Some(file.file_path.clone()),
                             commented: false,
+                            spans,
                         });
                     }
                     if let Some(a) = &anchor {
@@ -1628,10 +1858,9 @@ fn build_rows(
 
 fn config_mode_to_diff(mode: &ReviewDiffMode) -> DiffMode {
     match mode {
-        ReviewDiffMode::WorkingTree => DiffMode::WorkingTree,
-        ReviewDiffMode::Staged => DiffMode::Staged,
         ReviewDiffMode::Branch(b) => DiffMode::Branch(b.clone()),
         ReviewDiffMode::MergeBase(b) => DiffMode::MergeBase(b.clone()),
+        ReviewDiffMode::WorkingTree => DiffMode::WorkingTree,
     }
 }
 
@@ -1695,8 +1924,11 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
             source: diff_source,
             repo_root: start_path,
             branch: None,
+            parent_branch: None,
             data: None,
             cache: HashMap::new(),
+            highlights: HashMap::new(),
+            tints: highlight::tints(dark_background()),
             file_loads: HashMap::new(),
             compute_seq: 0,
             compute_started: None,
@@ -1815,7 +2047,8 @@ impl Pane for ReviewPane {
         if let (Some(edit), Some(first)) = (&state.editing, state.edit_first_row) {
             let width = state.size.cols.saturating_sub(NOTE_TEXT_COL).max(1);
             let (row_offset, display_col) = edit.display_pos(width);
-            let y = (first + row_offset).saturating_sub(state.scroll) as StableRowIndex;
+            let y = ((first + row_offset).saturating_sub(state.scroll) + state.header_rows())
+                as StableRowIndex;
             return StableCursorPosition {
                 x: NOTE_TEXT_COL + display_col,
                 y,
@@ -1834,7 +2067,7 @@ impl Pane for ReviewPane {
                 };
             }
         }
-        let y = state.cursor.saturating_sub(state.scroll) as StableRowIndex;
+        let y = (state.cursor.saturating_sub(state.scroll) + state.header_rows()) as StableRowIndex;
         StableCursorPosition {
             x: 0,
             y,
@@ -1865,14 +2098,12 @@ impl Pane for ReviewPane {
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let state = self.state.lock();
         let start = lines.start.max(0);
-        let bar_row = state.size.rows.saturating_sub(1);
         let mut out = Vec::new();
         for r in start..lines.end.max(start) {
-            if state.find.is_some() && r as usize == bar_row {
-                out.push(self.render_find_bar(&state));
-            } else {
-                let doc = state.scroll + r as usize;
-                out.push(self.render_doc_row(&state, doc));
+            match state.view_row(r as usize) {
+                ViewRow::Header(index) => out.push(state.header_line(index)),
+                ViewRow::FindBar => out.push(self.render_find_bar(&state)),
+                ViewRow::Doc(doc) => out.push(self.render_doc_row(&state, doc)),
             }
         }
         (start, out)
@@ -2053,9 +2284,9 @@ impl Pane for ReviewPane {
             (MouseButton::WheelUp(n), _) => self.mutate(|s| s.move_cursor(-(n as isize))),
             (MouseButton::WheelDown(n), _) => self.mutate(|s| s.move_cursor(n as isize)),
             (MouseButton::Left, MouseEventKind::Press) => {
-                let doc = {
-                    let s = self.state.lock();
-                    s.scroll + event.y.max(0) as usize
+                let doc = match self.state.lock().view_row(event.y.max(0) as usize) {
+                    ViewRow::Doc(doc) => doc,
+                    ViewRow::Header(_) | ViewRow::FindBar => return Ok(()),
                 };
                 let now = Instant::now();
                 let double = {
@@ -2103,7 +2334,8 @@ impl Pane for ReviewPane {
             (MouseButton::Left, MouseEventKind::Move) => {
                 self.mutate(|s| {
                     if let Some(anchor) = s.drag_anchor {
-                        let doc = (s.scroll + event.y.max(0) as usize)
+                        let row = event.y.max(0) as usize;
+                        let doc = (s.scroll + row.saturating_sub(s.header_rows()))
                             .min(s.rows.len().saturating_sub(1));
                         s.cursor = doc;
                         s.select_start = Some(anchor);
@@ -2225,6 +2457,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2275,6 +2508,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             cols,
         );
@@ -2290,6 +2524,64 @@ mod tests {
             with_payload[0].payload.as_deref(),
             Some(format!("+{long}").as_str())
         );
+    }
+
+    #[test]
+    fn syntax_spans_cover_every_wrapped_row() {
+        let code = format!("let value = \"{}\";", "x".repeat(80));
+        let hunk = DiffHunk {
+            old_start_line: 1,
+            old_line_count: 1,
+            new_start_line: 1,
+            new_line_count: 1,
+            lines: vec![
+                dline(DiffLineType::Context, Some(1), Some(1), "fn main() {"),
+                dline(DiffLineType::Add, None, Some(2), &code),
+                dline(DiffLineType::Delete, Some(2), None, "    let value = 1;"),
+            ],
+        };
+        let file = FileDiff {
+            file_path: "src/foo.rs".to_string(),
+            status: GitFileStatus::Modified,
+            hunks: vec![hunk],
+            is_binary: false,
+            oversized: false,
+            additions: 1,
+            deletions: 1,
+        };
+        let data = GitDiffData {
+            files: vec![file],
+            total_additions: 1,
+            total_deletions: 1,
+        };
+        let mut highlights = HashMap::new();
+        highlights.insert(
+            "src/foo.rs".to_string(),
+            highlight::highlight_file(&data.files[0], true),
+        );
+
+        let rows = build_rows(
+            &data,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &highlights,
+            None,
+            40,
+        );
+        let highlighted: Vec<&RenderRow> = rows.iter().filter(|r| !r.spans.is_empty()).collect();
+        assert!(
+            highlighted.len() > 3,
+            "the wrapped add line should produce several highlighted rows"
+        );
+        for row in highlighted {
+            assert_eq!(
+                row.spans.iter().map(|s| s.len).sum::<usize>(),
+                row.text.chars().count(),
+                "spans must cover the row exactly: {:?}",
+                row.text
+            );
+        }
     }
 
     #[test]
@@ -2312,6 +2604,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2323,6 +2616,7 @@ mod tests {
             &GitDiffData::default(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,
@@ -2350,6 +2644,7 @@ mod tests {
             &data,
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,
@@ -2396,6 +2691,7 @@ mod tests {
             &ann,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2408,6 +2704,7 @@ mod tests {
             &data,
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,
@@ -2454,6 +2751,7 @@ mod tests {
             &ann,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2493,6 +2791,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2510,6 +2809,7 @@ mod tests {
             &data,
             &HashMap::new(),
             &collapsed,
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,
@@ -2589,6 +2889,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             Some(&edit),
             usize::MAX,
         );
@@ -2639,6 +2940,7 @@ mod tests {
             &ann,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2650,6 +2952,7 @@ mod tests {
             &data,
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,
@@ -2723,6 +3026,7 @@ mod tests {
             &ann,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             usize::MAX,
         );
@@ -2740,6 +3044,7 @@ mod tests {
             &data,
             &ann,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             usize::MAX,

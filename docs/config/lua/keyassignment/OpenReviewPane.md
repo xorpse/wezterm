@@ -35,10 +35,10 @@ config.keys = {
 * `mode` - what to diff against:
     * `'WorkingTree'` (default) - uncommitted changes vs `HEAD`, including
       untracked files.
-    * `'Staged'` - staged changes only (`git diff --cached`).
     * `{ Branch = 'main' }` - the working tree vs the tip of the named branch.
     * `{ MergeBase = 'main' }` - the working tree vs the merge base with the
-      named branch.
+      named branch, so both committed and uncommitted work on the branch is
+      shown, including untracked files.
 
 ```lua
 config.keys = {
@@ -71,7 +71,7 @@ config.keys = {
 | `Space` / `v` | Start or clear a selection anchored at the cursor |
 | `Enter` (on an uncommented line) | Send the selected diff lines (or the cursor line) to the originating pane |
 | `Shift+Enter` | Send all comments to the originating pane, grouped as `path:line: comment` |
-| `b` | Cycle the diff base (working tree ⇄ staged) |
+| `b` | Toggle the diff mode: uncommitted changes ⇄ uncommitted changes plus everything since the merge base with the parent branch (the branch's upstream, falling back to the repository's default branch) |
 | `r` | Recompute the diff |
 | `q` / `Esc` | Close the review pane |
 

@@ -82,7 +82,9 @@ regex.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 shlex.workspace = true
+similar.workspace = true
 smol.workspace = true
+syntect.workspace = true
 tabout.workspace = true
 tempfile.workspace = true
 terminfo.workspace = true

@@ -1,9 +1,8 @@
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DiffMode {
-    WorkingTree,
-    Staged,
     Branch(String),
     MergeBase(String),
+    WorkingTree,
 }
 
 impl Default for DiffMode {
@@ -15,17 +14,19 @@ impl Default for DiffMode {
 impl DiffMode {
     pub fn label(&self) -> String {
         match self {
-            Self::WorkingTree => "working tree".to_string(),
-            Self::Staged => "staged".to_string(),
             Self::Branch(b) => format!("vs {b}"),
-            Self::MergeBase(b) => format!("merge-base {b}"),
+            Self::MergeBase(b) => format!("uncommitted + {b}"),
+            Self::WorkingTree => "uncommitted".to_string(),
         }
     }
 
-    pub fn cycle(&self) -> DiffMode {
+    pub fn cycle(&self, parent: Option<&str>) -> DiffMode {
         match self {
-            Self::WorkingTree => Self::Staged,
-            Self::Staged => Self::WorkingTree,
+            Self::MergeBase(_) => Self::WorkingTree,
+            Self::WorkingTree => match parent {
+                Some(parent) => Self::MergeBase(parent.to_string()),
+                None => Self::WorkingTree,
+            },
             other => other.clone(),
         }
     }

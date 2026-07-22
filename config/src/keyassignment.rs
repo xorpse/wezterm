@@ -695,10 +695,9 @@ impl_lua_conversion_dynamic!(PaseoAgentArgs);
 
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum ReviewDiffMode {
-    WorkingTree,
-    Staged,
     Branch(String),
     MergeBase(String),
+    WorkingTree,
 }
 
 impl Default for ReviewDiffMode {

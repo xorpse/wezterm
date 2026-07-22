@@ -1,3 +1,4 @@
+use super::ComputedDiff;
 use git_review::{
     DiffHunk, DiffLine, DiffLineType, DiffMode, FileDiff, GitDiffData, GitFileStatus,
 };
@@ -5,8 +6,8 @@ use paseo_client::{DiffFile, PaseoClient};
 
 pub fn paseo_compare(mode: &DiffMode) -> (&'static str, Option<String>) {
     match mode {
-        DiffMode::WorkingTree | DiffMode::Staged => ("uncommitted", None),
         DiffMode::Branch(base) | DiffMode::MergeBase(base) => ("base", Some(base.clone())),
+        DiffMode::WorkingTree => ("uncommitted", None),
     }
 }
 
@@ -93,7 +94,7 @@ pub async fn fetch(
     client: PaseoClient,
     cwd: String,
     mode: DiffMode,
-) -> anyhow::Result<(String, Option<String>, GitDiffData)> {
+) -> anyhow::Result<ComputedDiff> {
     let (mode_str, base_ref) = paseo_compare(&mode);
     let status = client.checkout_status(&cwd).await.ok();
     let repo_root = status
@@ -104,6 +105,10 @@ pub async fn fetch(
     let branch = status
         .as_ref()
         .and_then(|s| s.current_branch.clone())
+        .filter(|b| !b.is_empty());
+    let parent_branch = status
+        .as_ref()
+        .and_then(|s| s.base_ref.clone())
         .filter(|b| !b.is_empty());
 
     let diff = client
@@ -117,5 +122,10 @@ pub async fn fetch(
         anyhow::bail!("{}", error.message);
     }
 
-    Ok((repo_root, branch, convert(diff.files)))
+    Ok(ComputedDiff {
+        repo_root,
+        branch,
+        parent_branch,
+        data: convert(diff.files),
+    })
 }

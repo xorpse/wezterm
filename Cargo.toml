@@ -202,6 +202,7 @@ shared_library = "0.1"
 shell-words = "1.1"
 shlex = "1.1"
 signal-hook = "0.3"
+similar = {version="2.7", default-features=false, features = ["text"]}
 siphasher = "1.0.1"
 smithay-client-toolkit = {version = "0.19", default-features=false}
 smol = "2.0"
@@ -214,6 +215,7 @@ ssh2 = "0.9.3"
 starship-battery = "0.10"
 strsim = "0.11"
 syn = "1.0"
+syntect = {version="5.2", default-features=false, features = ["default-fancy"]}
 tabout = { path = "tabout" }
 tar = "0.4"
 tempfile = "3.20"

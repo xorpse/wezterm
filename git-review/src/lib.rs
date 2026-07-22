@@ -5,7 +5,9 @@ pub mod model;
 pub mod parse;
 
 pub use collapse::calculate_hidden_lines;
-pub use git::{compute_diff, compute_file_diff, current_branch, find_repo_root, Host};
+pub use git::{
+    compute_diff, compute_file_diff, current_branch, find_repo_root, parent_branch, Host,
+};
 pub use mode::DiffMode;
 pub use model::{
     count_changes, hunk_gap, hunk_new_range, DiffHunk, DiffLimits, DiffLine, DiffLineType, FileDiff,
