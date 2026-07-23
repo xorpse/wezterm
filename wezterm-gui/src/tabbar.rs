@@ -626,7 +626,33 @@ impl TabBarState {
         let mut last_project: Option<u64> = None;
         let mut project_collapsed = false;
 
-        for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
+        let mut render_order: Vec<usize> = (0..tab_titles.len()).collect();
+        if group_by_domain {
+            let mut domains: Vec<Option<mux::domain::DomainId>> = Vec::new();
+            let mut projects: Vec<(Option<mux::domain::DomainId>, Option<u64>)> = Vec::new();
+            let ranks: Vec<(usize, usize)> = tab_info
+                .iter()
+                .map(|tab| {
+                    let project = (tab.domain_id, tab.project.as_deref().map(project_hash));
+                    let domain_rank = domains.iter().position(|d| *d == tab.domain_id);
+                    let project_rank = projects.iter().position(|p| *p == project);
+                    (
+                        domain_rank.unwrap_or_else(|| {
+                            domains.push(tab.domain_id);
+                            domains.len() - 1
+                        }),
+                        project_rank.unwrap_or_else(|| {
+                            projects.push(project);
+                            projects.len() - 1
+                        }),
+                    )
+                })
+                .collect();
+            render_order.sort_by_key(|tab_idx| ranks[*tab_idx]);
+        }
+
+        for tab_idx in render_order {
+            let tab_title = &tab_titles[tab_idx];
             if group_by_domain {
                 if let Some(domain_id) = tab_info[tab_idx].domain_id {
                     if last_domain != Some(domain_id) {

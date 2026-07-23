@@ -680,57 +680,89 @@ fn parse_questions(input: &Value) -> Vec<Question> {
         .collect()
 }
 
-fn pending_is_question(request: &PermissionRequest) -> bool {
-    request.kind == "question"
-        && request
+struct PendingRequest {
+    request: PermissionRequest,
+    questions: Vec<Question>,
+    answers: Vec<String>,
+}
+
+impl PendingRequest {
+    fn new(request: PermissionRequest) -> Self {
+        let questions = if request.kind == "question" {
+            request
+                .input
+                .as_ref()
+                .map(parse_questions)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self {
+            request,
+            questions,
+            answers: Vec::new(),
+        }
+    }
+
+    fn current_question(&self) -> Option<&Question> {
+        self.questions.get(self.answers.len())
+    }
+
+    fn answer(&mut self, answer: String) -> Option<PermissionResponse> {
+        self.answers.push(answer);
+        if self.answers.len() < self.questions.len() {
+            return None;
+        }
+        let mut answers = serde_json::Map::new();
+        for (question, answer) in self.questions.iter().zip(&self.answers) {
+            answers.insert(question.header.clone(), Value::from(answer.as_str()));
+        }
+        let mut updated = self
+            .request
             .input
             .as_ref()
-            .map(|input| !parse_questions(input).is_empty())
-            .unwrap_or(false)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        updated.insert("answers".to_string(), Value::Object(answers));
+        Some(PermissionResponse::Allow {
+            selected_action_id: None,
+            updated_input: Some(Value::Object(updated)),
+        })
+    }
+
+    fn question_progress(&self) -> Option<String> {
+        (self.questions.len() > 1)
+            .then(|| format!("{}/{}", self.answers.len() + 1, self.questions.len()))
+    }
 }
 
-fn build_question_response(
-    request: &PermissionRequest,
-    answer: String,
-) -> Option<PermissionResponse> {
-    let input = request.input.clone().unwrap_or_default();
-    let header = parse_questions(&input).into_iter().next()?.header;
-    let mut answers = serde_json::Map::new();
-    answers.insert(header, Value::from(answer));
-    let mut updated = input.as_object().cloned().unwrap_or_default();
-    updated.insert("answers".to_string(), Value::Object(answers));
-    Some(PermissionResponse::Allow {
-        selected_action_id: None,
-        updated_input: Some(Value::Object(updated)),
-    })
-}
-
-fn question_rows(request: &PermissionRequest, cols: usize) -> Vec<AgentRow> {
+fn question_rows(pending: &PendingRequest, cols: usize) -> Vec<AgentRow> {
     let mut rows = vec![blank_row()];
-    let questions = request
-        .input
-        .as_ref()
-        .map(parse_questions)
-        .unwrap_or_default();
-    for question in &questions {
+    let Some(question) = pending.current_question() else {
+        return rows;
+    };
+    let prefix = match pending.question_progress() {
+        Some(progress) => format!("⚠ ({progress}) "),
+        None => "⚠ ".to_string(),
+    };
+    push_wrapped(
+        &mut rows,
+        &prefix,
+        &question.prompt,
+        &attr_bold_fg(AnsiColor::Yellow),
+        cols,
+    );
+    for (i, option) in question.options.iter().enumerate().take(9) {
         push_wrapped(
             &mut rows,
-            "⚠ ",
-            &question.prompt,
-            &attr_bold_fg(AnsiColor::Yellow),
+            "  ",
+            &format!("[{}] {}", i + 1, option.label),
+            &attr_fg(AnsiColor::Yellow),
             cols,
         );
-        for (i, option) in question.options.iter().enumerate().take(9) {
-            push_wrapped(
-                &mut rows,
-                "  ",
-                &format!("[{}] {}", i + 1, option.label),
-                &attr_fg(AnsiColor::Yellow),
-                cols,
-            );
-            if let Some(description) = &option.description {
-                push_wrapped(&mut rows, "      ", description, &attr_dim(), cols);
-            }
+        if let Some(description) = &option.description {
+            push_wrapped(&mut rows, "      ", description, &attr_dim(), cols);
         }
     }
     rows
@@ -1318,7 +1350,7 @@ struct AgentState {
     title: String,
     status_message: Option<String>,
     items: Vec<TimelineItem>,
-    pending: Option<PermissionRequest>,
+    pending: Option<PendingRequest>,
     picker: Option<PickerState>,
     cwd: String,
     workspace_name: Option<String>,
@@ -1824,9 +1856,13 @@ impl AgentState {
                 item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
             }
         }
-        if let Some(request) = self.pending.as_ref().filter(|r| pending_is_question(r)) {
-            transcript.extend(question_rows(request, cols));
-        } else if let Some(text) = self.pending.as_ref().and_then(plan_text) {
+        if let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|pending| pending.current_question().is_some())
+        {
+            transcript.extend(question_rows(pending, cols));
+        } else if let Some(text) = self.pending.as_ref().and_then(|p| plan_text(&p.request)) {
             let already_shown = self.items.iter().any(|item| {
                 item.kind == "tool_call"
                     && item
@@ -1852,7 +1888,6 @@ impl AgentState {
 
     fn rebuild_footer(&mut self) {
         let cols = self.size.cols;
-        let question_pending = self.pending.as_ref().is_some_and(pending_is_question);
 
         let mut footer = Vec::new();
         if !self.queued.is_empty() {
@@ -1897,14 +1932,21 @@ impl AgentState {
             attrs: attr_dim(),
             line: None,
         });
-        if let Some(request) = &self.pending {
-            if question_pending {
+        if let Some(pending) = &self.pending {
+            if pending.current_question().is_some() {
+                let progress = match pending.question_progress() {
+                    Some(progress) => format!(" {progress}"),
+                    None => String::new(),
+                };
                 footer.push(AgentRow {
-                    text: "⚠ question — [1-9] pick · i type your own · n/esc dismiss".to_string(),
+                    text: format!(
+                        "⚠ question{progress} — [1-9] pick · i type your own · n/esc dismiss"
+                    ),
                     attrs: attr_fg(AnsiColor::Yellow),
                     line: None,
                 });
             } else {
+                let request = &pending.request;
                 let title = request
                     .title
                     .clone()
@@ -2559,7 +2601,7 @@ impl PaseoAgentPane {
 
     fn set_pending(&self, request: PermissionRequest) {
         self.mutate(|state| {
-            state.pending = Some(request);
+            state.pending = Some(PendingRequest::new(request));
             state.rebuild_rows();
         });
     }
@@ -2578,7 +2620,11 @@ impl PaseoAgentPane {
             state.features = snapshot.features.clone();
             state.requires_attention = snapshot.requires_attention;
             if state.pending.is_none() {
-                state.pending = snapshot.pending_permissions.first().cloned();
+                state.pending = snapshot
+                    .pending_permissions
+                    .first()
+                    .cloned()
+                    .map(PendingRequest::new);
             }
             state.rebuild_rows();
             was_active && !is_active_status(&state.agent_status)
@@ -2945,32 +2991,25 @@ impl PaseoAgentPane {
             return;
         }
 
-        let question_response = {
-            let state = self.state.lock();
-            state
-                .pending
-                .as_ref()
-                .filter(|r| pending_is_question(r))
-                .and_then(|request| {
-                    build_question_response(request, text.clone())
-                        .map(|response| (request.id.clone(), response))
-                })
-        };
-
-        if let Some((request_id, response)) = question_response {
-            if let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) {
-                promise::spawn::spawn(async move {
-                    let _ = client
-                        .respond_permission(&agent_id, &request_id, response)
-                        .await;
-                })
-                .detach();
+        let answered = self.mutate(|state| {
+            let pending = state.pending.as_mut()?;
+            if pending.current_question().is_none() {
+                return None;
             }
-            self.mutate(|state| {
+            let request_id = pending.request.id.clone();
+            let response = pending.answer(text.clone());
+            if response.is_some() {
                 state.pending = None;
-                state.mode = Mode::Scroll;
-                state.rebuild_rows();
-            });
+            }
+            state.mode = Mode::Scroll;
+            state.rebuild_rows();
+            Some((request_id, response))
+        });
+
+        if let Some((request_id, response)) = answered {
+            if let Some(response) = response {
+                self.send_permission_response(request_id, response);
+            }
             return;
         }
 
@@ -3080,24 +3119,30 @@ impl PaseoAgentPane {
         }
     }
 
-    fn respond_permission(&self, allow: bool) {
-        let (agent_id, request_id, action_id) = {
-            let state = self.state.lock();
-            let Some(request) = &state.pending else {
-                return;
-            };
-            let behavior = if allow { "allow" } else { "deny" };
-            let action_id = request
-                .actions
-                .iter()
-                .find(|a| a.behavior == behavior)
-                .map(|a| a.id.clone());
-            (self.agent_id.lock().clone(), request.id.clone(), action_id)
+    fn send_permission_response(&self, request_id: String, response: PermissionResponse) {
+        let (Some(agent_id), Some(client)) = (self.agent_id.lock().clone(), self.client()) else {
+            return;
         };
-        if let (Some(agent_id), Some(client)) = (agent_id, self.client()) {
+        promise::spawn::spawn(async move {
+            let _ = client
+                .respond_permission(&agent_id, &request_id, response)
+                .await;
+        })
+        .detach();
+    }
+
+    fn respond_permission(&self, allow: bool) {
+        let sending = self.mutate(|state| {
+            let pending = state.pending.take()?;
+            let behavior = if allow { "allow" } else { "deny" };
             let response = if allow {
                 PermissionResponse::Allow {
-                    selected_action_id: action_id,
+                    selected_action_id: pending
+                        .request
+                        .actions
+                        .iter()
+                        .find(|a| a.behavior == behavior)
+                        .map(|a| a.id.clone()),
                     updated_input: None,
                 }
             } else {
@@ -3106,43 +3151,27 @@ impl PaseoAgentPane {
                     interrupt: false,
                 }
             };
-            promise::spawn::spawn(async move {
-                let _ = client
-                    .respond_permission(&agent_id, &request_id, response)
-                    .await;
-            })
-            .detach();
-        }
-        self.mutate(|state| {
-            state.pending = None;
             state.rebuild_rows();
+            Some((pending.request.id, response))
         });
+        if let Some((request_id, response)) = sending {
+            self.send_permission_response(request_id, response);
+        }
     }
 
     fn respond_action(&self, index: usize) {
-        let (agent_id, request_id, response) = {
-            let state = self.state.lock();
-            let Some(request) = &state.pending else {
-                return;
-            };
-            let response = if pending_is_question(request) {
-                let input = request.input.clone().unwrap_or_default();
-                let label = parse_questions(&input)
-                    .into_iter()
-                    .next()
-                    .and_then(|q| q.options.into_iter().nth(index))
-                    .map(|option| option.label);
-                let Some(response) =
-                    label.and_then(|label| build_question_response(request, label))
-                else {
-                    return;
-                };
-                response
+        let sending = self.mutate(|state| {
+            let pending = state.pending.as_mut()?;
+            let request_id = pending.request.id.clone();
+            let response = if pending.current_question().is_some() {
+                let label = pending
+                    .current_question()
+                    .and_then(|question| question.options.get(index))
+                    .map(|option| option.label.clone())?;
+                pending.answer(label)
             } else {
-                let Some(action) = request.actions.get(index) else {
-                    return;
-                };
-                if action.behavior == "deny" {
+                let action = pending.request.actions.get(index)?;
+                Some(if action.behavior == "deny" {
                     PermissionResponse::Deny {
                         message: None,
                         interrupt: false,
@@ -3152,22 +3181,17 @@ impl PaseoAgentPane {
                         selected_action_id: Some(action.id.clone()),
                         updated_input: None,
                     }
-                }
+                })
             };
-            (self.agent_id.lock().clone(), request.id.clone(), response)
-        };
-        if let (Some(agent_id), Some(client)) = (agent_id, self.client()) {
-            promise::spawn::spawn(async move {
-                let _ = client
-                    .respond_permission(&agent_id, &request_id, response)
-                    .await;
-            })
-            .detach();
-        }
-        self.mutate(|state| {
-            state.pending = None;
+            if response.is_some() {
+                state.pending = None;
+            }
             state.rebuild_rows();
+            Some((request_id, response?))
         });
+        if let Some((request_id, response)) = sending {
+            self.send_permission_response(request_id, response);
+        }
     }
 
     pub fn start(self: &Arc<Self>, source: AgentSource) {

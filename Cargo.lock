@@ -4327,7 +4327,7 @@ dependencies = [
 [[package]]
 name = "paseo-client"
 version = "0.1.0"
-source = "git+ssh://git@github.com/xorpse/paseo-client.git?branch=dev#2f064566d35ad7e1ff8c82f7519bac552d397c39"
+source = "git+ssh://git@github.com/xorpse/paseo-client.git?branch=dev#3f9908afc67a83e8fb61678e726c82f8f014294c"
 dependencies = [
  "anyhow",
  "async-broadcast",
