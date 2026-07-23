@@ -13,8 +13,8 @@ use mux::Mux;
 use parking_lot::Mutex;
 use paseo_client::{
     AgentFeature, AgentListEntry, AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent,
-    ModelDefinition, PaseoClient, PermissionRequest, PermissionResponse, SlashCommand,
-    TimelineItem, ToolCallDetail, Workspace,
+    ModelDefinition, PaseoClient, PermissionRequest, PermissionResponse, ProviderSubagent,
+    SlashCommand, SubagentUpdate, TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
 use serde_json::Value;
@@ -784,6 +784,7 @@ enum PickerAction {
     ChooseDomain(String),
     AddConnection,
     SelectProvider(String),
+    OpenSubagent(String),
 }
 
 #[derive(Clone)]
@@ -899,9 +900,17 @@ enum PickerStage {
 
 #[derive(Clone, Copy, PartialEq)]
 enum PickerKind {
-    Hub,
     Connections,
+    Hub,
     Providers,
+    Subagents,
+}
+
+struct SubagentView {
+    id: String,
+    label: String,
+    status: String,
+    items: Vec<TimelineItem>,
 }
 
 struct PickerState {
@@ -1342,6 +1351,8 @@ struct AgentState {
     draining: bool,
     show_controls: bool,
     reconnecting: bool,
+    subagents: Vec<ProviderSubagent>,
+    viewing: Option<SubagentView>,
     spinner_frame: usize,
     spinner_ticking: bool,
     tool_expand_overrides: HashMap<String, bool>,
@@ -1401,6 +1412,7 @@ fn is_core_agent_key(ch: char) -> bool {
             | 'k'
             | 'o'
             | 'r'
+            | 's'
     )
 }
 
@@ -1757,6 +1769,45 @@ impl AgentState {
             return;
         }
 
+        if let Some(view) = &self.viewing {
+            let mut transcript = Vec::new();
+            let mut tool_headers = HashMap::new();
+            transcript.push(AgentRow::rendered(styled_line(vec![
+                ("◀ sub-agent: ", attr_dim()),
+                (view.label.as_str(), attr_bold()),
+                ("  ·  ", attr_dim()),
+                (
+                    view.status.as_str(),
+                    attr_fg(agent_status_color(&view.status)),
+                ),
+            ])));
+            transcript.push(blank_row());
+            for item in &view.items {
+                if tool_is_collapsible(item) {
+                    if let Some(call_id) = &item.call_id {
+                        tool_headers.insert(transcript.len(), call_id.clone());
+                    }
+                }
+                item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
+            }
+            self.transcript = transcript;
+            self.tool_headers = tool_headers;
+            self.footer = vec![
+                AgentRow {
+                    text: "─".repeat(cols),
+                    attrs: attr_dim(),
+                    line: None,
+                },
+                AgentRow {
+                    text: "esc back to the agent · j/k scroll · read-only".to_string(),
+                    attrs: attr_dim(),
+                    line: None,
+                },
+            ];
+            self.clamp_scroll();
+            return;
+        }
+
         let mut transcript = Vec::new();
         let mut tool_headers = HashMap::new();
         if self.items.is_empty() {
@@ -1821,6 +1872,25 @@ impl AgentState {
                     line: None,
                 });
             }
+        }
+        if !self.subagents.is_empty() {
+            let total = self.subagents.len();
+            let running = self
+                .subagents
+                .iter()
+                .filter(|subagent| subagent.is_running())
+                .count();
+            let noun = if total == 1 { "subagent" } else { "subagents" };
+            let text = if running > 0 {
+                format!("› {total} {noun} · {running} running")
+            } else {
+                format!("› {total} {noun}")
+            };
+            footer.push(AgentRow {
+                text,
+                attrs: attr_dim(),
+                line: None,
+            });
         }
         footer.push(AgentRow {
             text: "─".repeat(cols),
@@ -2017,7 +2087,8 @@ impl AgentState {
                         .collect::<Vec<_>>()
                         .join(" · ");
                     let mut actions =
-                        "d diff · t terminal · m mode · M model · e effort · x stop".to_string();
+                        "d diff · t terminal · s sub-agents · m mode · M model · e effort · x stop"
+                            .to_string();
                     if !feature_hint.is_empty() {
                         actions.push_str(" · ");
                         actions.push_str(&feature_hint);
@@ -2037,7 +2108,7 @@ impl AgentState {
                         ),
                     ])));
                     footer.push(AgentRow {
-                        text: "q/esc close · ? hide controls".to_string(),
+                        text: "q close · ? hide controls".to_string(),
                         attrs: normal,
                         line: None,
                     });
@@ -2134,41 +2205,90 @@ impl AgentState {
     }
 
     fn apply_live_item(&mut self, item: TimelineItem) {
-        if item.kind == "tool_call" {
-            if let Some(call_id) = item.call_id.clone() {
-                if let Some(existing) = self
-                    .items
-                    .iter_mut()
-                    .find(|it| it.call_id.as_deref() == Some(call_id.as_str()))
-                {
-                    *existing = item;
-                    return;
-                }
-            }
-            self.items.push(item);
-            return;
-        }
-
-        if is_message(&item.kind) {
-            if let Some(last) = self.items.last_mut() {
-                if last.kind == item.kind
-                    && last.message_id.is_some()
-                    && last.message_id == item.message_id
-                {
-                    let old = last.text.clone().unwrap_or_default();
-                    let new = item.text.clone().unwrap_or_default();
-                    last.text = Some(if new.starts_with(&old) {
-                        new
-                    } else {
-                        format!("{old}{new}")
-                    });
-                    return;
-                }
-            }
-        }
-
-        self.items.push(item);
+        merge_live_item(&mut self.items, item);
     }
+
+    fn replace_subagents(&mut self, subagents: Vec<ProviderSubagent>) {
+        self.subagents = subagents;
+        self.sort_subagents();
+    }
+
+    fn upsert_subagent(&mut self, subagent: ProviderSubagent) {
+        match self
+            .subagents
+            .iter_mut()
+            .find(|entry| entry.id == subagent.id)
+        {
+            Some(existing) => *existing = subagent,
+            None => self.subagents.push(subagent),
+        }
+        self.sort_subagents();
+    }
+
+    fn sort_subagents(&mut self) {
+        self.subagents
+            .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    }
+
+    fn subagent_groups(&self) -> Vec<PickerGroup> {
+        let entries = self
+            .subagents
+            .iter()
+            .map(|subagent| {
+                let dot = if subagent.is_running() { '●' } else { '○' };
+                PickerEntry::plain(
+                    format!("{dot} {}  ·  {}", subagent.label(), subagent.status),
+                    PickerAction::OpenSubagent(subagent.id.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let label = if entries.is_empty() {
+            "Sub-agents  ·  none yet".to_string()
+        } else {
+            "Sub-agents".to_string()
+        };
+        vec![PickerGroup {
+            label,
+            collapsed: false,
+            entries,
+        }]
+    }
+}
+
+fn merge_live_item(items: &mut Vec<TimelineItem>, item: TimelineItem) {
+    if item.kind == "tool_call" {
+        if let Some(call_id) = item.call_id.clone() {
+            if let Some(existing) = items
+                .iter_mut()
+                .find(|it| it.call_id.as_deref() == Some(call_id.as_str()))
+            {
+                *existing = item;
+                return;
+            }
+        }
+        items.push(item);
+        return;
+    }
+
+    if is_message(&item.kind) {
+        if let Some(last) = items.last_mut() {
+            if last.kind == item.kind
+                && last.message_id.is_some()
+                && last.message_id == item.message_id
+            {
+                let old = last.text.clone().unwrap_or_default();
+                let new = item.text.clone().unwrap_or_default();
+                last.text = Some(if new.starts_with(&old) {
+                    new
+                } else {
+                    format!("{old}{new}")
+                });
+                return;
+            }
+        }
+    }
+
+    items.push(item);
 }
 
 pub struct PaseoAgentPane {
@@ -2205,6 +2325,142 @@ impl PaseoAgentPane {
         };
         self.window.invalidate();
         value
+    }
+
+    fn start_subagent_picker(self: &Arc<Self>) {
+        let Some(agent_id) = self.agent_id() else {
+            return;
+        };
+        let Some(client) = self.client() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        promise::spawn::spawn(async move {
+            let listed = client.list_provider_subagents(&agent_id).await;
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            if let Ok(subagents) = listed {
+                pane.mutate(|state| state.replace_subagents(subagents));
+            }
+            let groups = pane.state.lock().subagent_groups();
+            pane.enter_picker(
+                "Sub-agents".to_string(),
+                PickerKind::Subagents,
+                groups,
+                None,
+                0,
+            );
+        })
+        .detach();
+    }
+
+    fn open_subagent(self: &Arc<Self>, subagent_id: String) {
+        let Some(agent_id) = self.agent_id() else {
+            return;
+        };
+        let Some(client) = self.client() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        promise::spawn::spawn(async move {
+            let items = client
+                .fetch_provider_subagent_timeline(&agent_id, &subagent_id, "tail", 400)
+                .await;
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            match items {
+                Ok(items) => pane.mutate(|state| {
+                    let descriptor = state
+                        .subagents
+                        .iter()
+                        .find(|subagent| subagent.id == subagent_id);
+                    state.viewing = Some(SubagentView {
+                        label: descriptor
+                            .map(|subagent| subagent.label().to_string())
+                            .unwrap_or_else(|| subagent_id.clone()),
+                        status: descriptor
+                            .map(|subagent| subagent.status.clone())
+                            .unwrap_or_default(),
+                        id: subagent_id.clone(),
+                        items: coalesce_messages(items),
+                    });
+                    state.picker = None;
+                    state.mode = Mode::Scroll;
+                    state.follow = true;
+                    state.rebuild_rows();
+                    state.scroll = state.max_scroll();
+                }),
+                Err(err) => pane.mutate(|state| {
+                    state.picker = None;
+                    state.status_message = Some(format!("sub-agent transcript failed: {err}"));
+                    state.rebuild_rows();
+                }),
+            }
+        })
+        .detach();
+    }
+
+    fn dismiss_picker(&self) {
+        self.mutate(|state| {
+            state.picker = None;
+            state.rebuild_rows();
+        });
+    }
+
+    fn close_subagent(&self) {
+        self.mutate(|state| {
+            state.viewing = None;
+            state.follow = true;
+            state.rebuild_rows();
+            state.scroll = state.max_scroll();
+        });
+    }
+
+    fn apply_subagent_update(&self, update: &SubagentUpdate, agent_id: &str) {
+        self.mutate(|state| {
+            match update {
+                SubagentUpdate::Upsert(subagent) => {
+                    if subagent.parent_agent_id != agent_id {
+                        return;
+                    }
+                    if let Some(view) = &mut state.viewing {
+                        if view.id == subagent.id {
+                            view.label = subagent.label().to_string();
+                            view.status = subagent.status.clone();
+                        }
+                    }
+                    state.upsert_subagent(subagent.as_ref().clone());
+                }
+                SubagentUpdate::Timeline {
+                    parent_agent_id,
+                    subagent_id,
+                    item,
+                } => {
+                    if parent_agent_id != agent_id {
+                        return;
+                    }
+                    let Some(view) = &mut state.viewing else {
+                        return;
+                    };
+                    if &view.id != subagent_id {
+                        return;
+                    }
+                    merge_live_item(&mut view.items, item.as_ref().clone());
+                }
+                SubagentUpdate::Remove {
+                    parent_agent_id,
+                    subagent_id,
+                } => {
+                    if parent_agent_id != agent_id {
+                        return;
+                    }
+                    state.subagents.retain(|entry| &entry.id != subagent_id);
+                }
+            }
+            state.rebuild_rows();
+        });
     }
 
     fn sync_spinner(&self) {
@@ -3032,6 +3288,23 @@ impl PaseoAgentPane {
                 .detach();
             }
 
+            {
+                let client = client.clone();
+                let agent_id = agent_id.clone();
+                let weak = weak.clone();
+                promise::spawn::spawn(async move {
+                    if let Ok(subagents) = client.list_provider_subagents(&agent_id).await {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.mutate(|state| {
+                                state.replace_subagents(subagents);
+                                state.rebuild_rows();
+                            });
+                        }
+                    }
+                })
+                .detach();
+            }
+
             let _ = client
                 .set_timeline_subscription(std::slice::from_ref(&agent_id))
                 .await;
@@ -3072,6 +3345,9 @@ impl PaseoAgentPane {
                     }
                     DaemonEvent::AgentUpsert(snapshot) if snapshot.id == agent_id => {
                         pane.set_snapshot(&snapshot);
+                    }
+                    DaemonEvent::Subagent(update) => {
+                        pane.apply_subagent_update(&update, &agent_id);
                     }
                     DaemonEvent::Disconnected => break,
                     _ => {}
@@ -3935,6 +4211,7 @@ impl PaseoAgentPane {
             ToggleGroup(usize),
             ChooseDomain(String),
             SelectProvider(String),
+            OpenSubagent(String),
         }
         let chosen = {
             let state = self.state.lock();
@@ -3998,6 +4275,7 @@ impl PaseoAgentPane {
                                 PickerAction::SelectProvider(id) => {
                                     Chosen::SelectProvider(id.clone())
                                 }
+                                PickerAction::OpenSubagent(id) => Chosen::OpenSubagent(id.clone()),
                             }),
                         None => None,
                     }
@@ -4103,6 +4381,7 @@ impl PaseoAgentPane {
                 }
             }
             Some(Chosen::ChooseDomain(name)) => self.open_domain_picker(name),
+            Some(Chosen::OpenSubagent(id)) => self.open_subagent(id),
             Some(Chosen::SelectProvider(provider)) => {
                 let pending = self
                     .state
@@ -4547,6 +4826,16 @@ impl Pane for PaseoAgentPane {
                             pane.wizard_back();
                         }
                     }
+                    KeyCode::Escape
+                        if self
+                            .state
+                            .lock()
+                            .picker
+                            .as_ref()
+                            .is_some_and(|picker| matches!(picker.kind, PickerKind::Subagents)) =>
+                    {
+                        self.dismiss_picker()
+                    }
                     KeyCode::Char('q') | KeyCode::Escape => self.close(),
                     _ => {}
                 }
@@ -4623,6 +4912,23 @@ impl Pane for PaseoAgentPane {
                     }),
                 _ => {}
             },
+            Mode::Scroll if self.state.lock().viewing.is_some() => match key {
+                KeyCode::Char('q') | KeyCode::Escape => self.close_subagent(),
+                KeyCode::Char('s') => {
+                    if let Some(pane) = self.arc() {
+                        pane.start_subagent_picker();
+                    }
+                }
+                KeyCode::Char('d') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(1),
+                KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
+                KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_lines(3),
+                KeyCode::Char('k') | KeyCode::UpArrow => self.scroll_lines(-3),
+                KeyCode::Char('g') | KeyCode::Home => self.scroll_to_top(),
+                KeyCode::Char('G') | KeyCode::End => self.scroll_to_bottom(),
+                KeyCode::PageDown => self.scroll_page(1),
+                KeyCode::PageUp => self.scroll_page(-1),
+                _ => {}
+            },
             Mode::Scroll => match key {
                 KeyCode::Char('i') | KeyCode::Char('\r') | KeyCode::Enter => {
                     self.mutate(|state| {
@@ -4636,7 +4942,12 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
                 KeyCode::Char('d') => self.open_review(),
                 KeyCode::Char('t') => self.open_terminal(),
-                KeyCode::Char('q') | KeyCode::Escape => self.close(),
+                KeyCode::Char('s') => {
+                    if let Some(pane) = self.arc() {
+                        pane.start_subagent_picker();
+                    }
+                }
+                KeyCode::Char('q') => self.close(),
                 KeyCode::Char(c @ '1'..='9') if self.state.lock().pending.is_some() => {
                     self.respond_action(c as usize - '1' as usize)
                 }
@@ -4857,6 +5168,8 @@ pub fn open_paseo_agent_pane(
             draining: false,
             show_controls: false,
             reconnecting: false,
+            subagents: Vec::new(),
+            viewing: None,
             spinner_frame: 0,
             spinner_ticking: false,
             tool_expand_overrides: HashMap::new(),

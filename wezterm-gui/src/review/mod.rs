@@ -480,13 +480,19 @@ impl ReviewState {
                     segments.push((" ", dim.clone()));
                     segments.push((deletions.as_str(), removed));
                 }
-                let scrolled = format!("  ·  col:{}", self.h_scroll + 1);
-                if self.effective_layout() == ReviewDiffLayout::SideBySide {
-                    segments.push(("  ·  ", dim.clone()));
-                    segments.push(("side-by-side", dim.clone()));
-                    if self.h_scroll > 0 {
-                        segments.push((scrolled.as_str(), dim));
+                let split = self.effective_layout() == ReviewDiffLayout::SideBySide;
+                let layout = match (self.layout, split) {
+                    (ReviewDiffLayout::SideBySide, false) => {
+                        format!("unified — side-by-side needs {MIN_SPLIT_COLS} cols")
                     }
+                    (_, true) => "side-by-side".to_string(),
+                    _ => "unified".to_string(),
+                };
+                let scrolled = format!("  ·  col:{}", self.h_scroll + 1);
+                segments.push(("  ·  ", dim.clone()));
+                segments.push((layout.as_str(), dim.clone()));
+                if split && self.h_scroll > 0 {
+                    segments.push((scrolled.as_str(), dim));
                 }
                 styled_line(segments)
             }
@@ -536,6 +542,7 @@ impl ReviewState {
                 self.branch.hash(&mut h);
                 self.repo_root.hash(&mut h);
                 self.status.hash(&mut h);
+                self.layout.hash(&mut h);
                 self.effective_layout().hash(&mut h);
                 self.h_scroll.hash(&mut h);
                 if let Some(data) = &self.data {
