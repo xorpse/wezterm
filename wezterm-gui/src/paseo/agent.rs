@@ -5117,7 +5117,7 @@ pub fn open_paseo_agent_pane(
     }
 
     let (insertion, pane_size) = if args.new_tab {
-        (Insertion::NewTab, tab.get_size())
+        (Insertion::NewTab, term_window.terminal_size())
     } else {
         let pane_index = tab
             .iter_panes_ignoring_zoom()

@@ -3463,6 +3463,10 @@ impl TermWindow {
         }
     }
 
+    pub fn terminal_size(&self) -> TerminalSize {
+        self.terminal_size
+    }
+
     pub fn get_viewport(&self, pane_id: PaneId) -> Option<StableRowIndex> {
         self.pane_state(pane_id).viewport
     }
