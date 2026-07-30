@@ -2129,7 +2129,7 @@ impl AgentState {
                         .collect::<Vec<_>>()
                         .join(" · ");
                     let mut actions =
-                        "d diff · t terminal · s sub-agents · m mode · M model · e effort · x stop"
+                        "d diff · t terminal · c agents · s sub-agents · m mode · M model · e effort · x stop"
                             .to_string();
                     if !feature_hint.is_empty() {
                         actions.push_str(" · ");
@@ -3784,6 +3784,23 @@ impl PaseoAgentPane {
         .detach();
     }
 
+    fn open_hub_tab(&self) {
+        let domain = self.domain.domain_name().to_string();
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let args = KeyAssignment::OpenPaseoAgentPane(PaseoAgentArgs {
+                    domain: domain.clone(),
+                    ..Default::default()
+                });
+                if let Some(pane) = Mux::get()
+                    .get_active_tab_for_window(term_window.mux_window_id)
+                    .and_then(|tab| tab.get_active_pane())
+                {
+                    let _ = term_window.perform_key_assignment(&pane, &args);
+                }
+            })));
+    }
+
     fn create_worktree_agent(
         self: &Arc<Self>,
         cwd: String,
@@ -4979,6 +4996,7 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('n') => self.respond_permission(false),
                 KeyCode::Char('x') => self.stop(),
                 KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.stop(),
+                KeyCode::Char('c') => self.open_hub_tab(),
                 KeyCode::Char('m') => self.cycle_mode(),
                 KeyCode::Char('M') => self.cycle_model(),
                 KeyCode::Char('e') => self.cycle_effort(),
