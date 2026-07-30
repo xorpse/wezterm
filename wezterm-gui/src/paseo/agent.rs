@@ -1,7 +1,7 @@
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use anyhow::anyhow;
 use config::keyassignment::{KeyAssignment, PaseoAgentArgs};
-use mux::domain::DomainId;
+use mux::domain::{DomainId, SplitSource};
 use mux::pane::{
     alloc_pane_id, impl_for_each_logical_line_via_get_logical_lines,
     impl_get_logical_lines_via_get_lines, CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane,
@@ -802,6 +802,12 @@ fn plan_rows(text: &str, cols: usize) -> Vec<AgentRow> {
 enum Mode {
     Scroll,
     Compose,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalPlacement {
+    Split,
+    Tab,
 }
 
 enum PickerAction {
@@ -2129,7 +2135,7 @@ impl AgentState {
                         .collect::<Vec<_>>()
                         .join(" · ");
                     let mut actions =
-                        "d diff · t terminal · c agents · s sub-agents · m mode · M model · e effort · x stop"
+                        "d diff · t terminal · T split · c agents · s sub-agents · m mode · M model · e effort · x stop"
                             .to_string();
                     if !feature_hint.is_empty() {
                         actions.push_str(" · ");
@@ -2702,7 +2708,7 @@ impl PaseoAgentPane {
             })));
     }
 
-    fn open_terminal(&self) {
+    fn open_terminal(&self, placement: TerminalPlacement) {
         let (cwd, size) = {
             let state = self.state.lock();
             (state.cwd.clone(), state.size)
@@ -2710,12 +2716,31 @@ impl PaseoAgentPane {
         if cwd.is_empty() {
             return;
         }
-        let Some((_, window_id, _)) = Mux::get().resolve_pane_id(self.pane_id) else {
+        let Some((_, window_id, tab_id)) = Mux::get().resolve_pane_id(self.pane_id) else {
             return;
         };
         let domain = self.domain.clone();
+        let pane_id = self.pane_id;
         promise::spawn::spawn(async move {
-            if let Err(err) = domain.spawn(size, None, Some(cwd), window_id).await {
+            let result = match placement {
+                TerminalPlacement::Tab => domain
+                    .spawn(size, None, Some(cwd), window_id)
+                    .await
+                    .map(|_| ()),
+                TerminalPlacement::Split => domain
+                    .split_pane(
+                        SplitSource::Spawn {
+                            command: None,
+                            command_dir: Some(cwd),
+                        },
+                        tab_id,
+                        pane_id,
+                        SplitRequest::default(),
+                    )
+                    .await
+                    .map(|_| ()),
+            };
+            if let Err(err) = result {
                 log::error!("paseo: failed to open terminal: {err:#}");
             }
         })
@@ -4982,7 +5007,8 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('d') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(1),
                 KeyCode::Char('u') if mods.contains(KeyModifiers::CTRL) => self.scroll_page(-1),
                 KeyCode::Char('d') => self.open_review(),
-                KeyCode::Char('t') => self.open_terminal(),
+                KeyCode::Char('t') => self.open_terminal(TerminalPlacement::Tab),
+                KeyCode::Char('T') => self.open_terminal(TerminalPlacement::Split),
                 KeyCode::Char('s') => {
                     if let Some(pane) = self.arc() {
                         pane.start_subagent_picker();
