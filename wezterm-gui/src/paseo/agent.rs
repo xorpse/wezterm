@@ -36,6 +36,7 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴
 const SPINNER_INTERVAL: Duration = Duration::from_millis(90);
 const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
     let width = unicode_column_width(text, None);
@@ -237,7 +238,19 @@ fn markdown_to_lines(md: &str, cols: usize) -> Vec<AgentRow> {
     let ansi = markdown_terminal::render_with(&events, &markdown_terminal::Theme::default(), width);
     let mut result: Vec<AgentRow> = ansi
         .split('\n')
-        .map(|raw| AgentRow::rendered(ansi_line_to_line(raw, 0)))
+        .map(|raw| {
+            let line = ansi_line_to_line(raw, 0);
+            let is_rule = {
+                let text = line.as_str();
+                let trimmed = text.trim();
+                trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
+            };
+            if is_rule {
+                hr_row(cols)
+            } else {
+                AgentRow::rendered(line)
+            }
+        })
         .collect();
     while result.len() > 1
         && result
@@ -263,6 +276,18 @@ fn blank_row() -> AgentRow {
         attrs: attr_default(),
         line: None,
     }
+}
+
+fn hr_row(cols: usize) -> AgentRow {
+    AgentRow {
+        text: "─".repeat(cols),
+        attrs: attr_fg(AnsiColor::Grey),
+        line: None,
+    }
+}
+
+fn is_rule_row(row: &AgentRow) -> bool {
+    row.line.is_none() && row.text.starts_with('─')
 }
 
 fn truncate_to(text: &str, max: usize) -> String {
@@ -1710,11 +1735,7 @@ impl AgentState {
                     line: None,
                 });
             }
-            transcript.push(AgentRow {
-                text: "─".repeat(cols),
-                attrs: attr_dim(),
-                line: None,
-            });
+            transcript.push(hr_row(cols));
             transcript.push(blank_row());
             if picker.groups.is_empty() {
                 push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
@@ -1820,22 +1841,25 @@ impl AgentState {
                 ),
             ])));
             transcript.push(blank_row());
+            let mut seen_message = false;
             for item in &view.items {
                 if tool_is_collapsible(item) {
                     if let Some(call_id) = &item.call_id {
                         tool_headers.insert(transcript.len(), call_id.clone());
                     }
                 }
+                let message = is_message(&item.kind);
+                if message && seen_message {
+                    transcript.push(hr_row(cols));
+                }
                 item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
+                seen_message |= message;
             }
+            transcript.dedup_by(|a, b| is_rule_row(a) && is_rule_row(b));
             self.transcript = transcript;
             self.tool_headers = tool_headers;
             self.footer = vec![
-                AgentRow {
-                    text: "─".repeat(cols),
-                    attrs: attr_dim(),
-                    line: None,
-                },
+                hr_row(cols),
                 AgentRow {
                     text: "esc back to the agent · j/k scroll · read-only".to_string(),
                     attrs: attr_dim(),
@@ -1853,13 +1877,19 @@ impl AgentState {
                 push_wrapped(&mut transcript, "", message, &attr_dim(), cols);
             }
         } else {
+            let mut seen_message = false;
             for item in &self.items {
                 if tool_is_collapsible(item) {
                     if let Some(call_id) = &item.call_id {
                         tool_headers.insert(transcript.len(), call_id.clone());
                     }
                 }
+                let message = is_message(&item.kind);
+                if message && seen_message {
+                    transcript.push(hr_row(cols));
+                }
                 item_to_rows(item, cols, &self.tool_expand_overrides, &mut transcript);
+                seen_message |= message;
             }
         }
         if let Some(pending) = self
@@ -1882,6 +1912,7 @@ impl AgentState {
                 transcript.extend(plan_rows(&text, cols));
             }
         }
+        transcript.dedup_by(|a, b| is_rule_row(a) && is_rule_row(b));
         self.transcript = transcript;
         self.tool_headers = tool_headers;
 
@@ -2625,7 +2656,13 @@ impl PaseoAgentPane {
             state.thinking_option_id = snapshot.thinking_option_id.clone();
             state.features = snapshot.features.clone();
             state.requires_attention = snapshot.requires_attention;
-            if state.pending.is_none() {
+            let keep = state.pending.as_ref().is_some_and(|pending| {
+                snapshot
+                    .pending_permissions
+                    .iter()
+                    .any(|p| p.id == pending.request.id)
+            });
+            if !keep {
                 state.pending = snapshot
                     .pending_permissions
                     .first()
@@ -3239,7 +3276,30 @@ impl PaseoAgentPane {
                 *pane.client.lock() = Some(client.clone());
             }
 
-            let _ = client.subscribe_agents().await;
+            let alive = smol::future::or(
+                async { client.subscribe_agents().await.is_ok() },
+                async {
+                    smol::Timer::after(CONNECT_PROBE_TIMEOUT).await;
+                    false
+                },
+            )
+            .await;
+            let client = if alive {
+                client
+            } else {
+                match reconnect_domain(&domain, &weak).await {
+                    Ok(fresh) => fresh,
+                    Err(err) => {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.set_status(
+                                "Agent (error)".to_string(),
+                                Some(format!("connect failed: {err}")),
+                            );
+                        }
+                        return;
+                    }
+                }
+            };
 
             if source.agent_id.is_none() && source.provider.is_none() {
                 let hub = match fetch_hub(&client).await {
