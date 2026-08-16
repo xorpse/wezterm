@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use paseo_client::{
     AgentFeature, AgentListEntry, AgentMode, AgentSnapshot, AgentStreamEvent, DaemonEvent,
     ModelDefinition, PaseoClient, PermissionRequest, PermissionResponse, ProviderSubagent,
-    SlashCommand, SubagentUpdate, TimelineItem, ToolCallDetail, Workspace,
+    SlashCommand, SubagentUpdate, TextAttachment, TimelineItem, ToolCallDetail, Workspace,
 };
 use rangeset::RangeSet;
 use serde_json::Value;
@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termwiz::cell::{Cell, CellAttributes, Intensity, Underline};
 use termwiz::color::{AnsiColor, ColorAttribute, SrgbaTuple};
 use termwiz::surface::{CursorVisibility, Line, SequenceNo};
@@ -827,6 +827,7 @@ fn plan_rows(text: &str, cols: usize) -> Vec<AgentRow> {
 enum Mode {
     Scroll,
     Compose,
+    Handoff,
 }
 
 #[derive(Clone, Copy)]
@@ -856,7 +857,8 @@ enum PendingCreate {
     WorktreeBranchOff { cwd: String, base_branch: String },
     WorktreeCheckout { cwd: String, ref_name: String },
     NewDirectory(String),
-    CloneRepo(String),
+    CloneRepo { repo: String, target_dir: String },
+    Migrate { cwd: String, attachment: TextAttachment },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -932,6 +934,7 @@ enum InputKind {
     CheckoutBranch,
     NewDirectory,
     CloneRepo,
+    CloneTarget,
     AddConnection,
 }
 
@@ -939,7 +942,10 @@ impl InputKind {
     fn autocompletes(self) -> bool {
         matches!(
             self,
-            InputKind::SearchDirectory | InputKind::BranchOff | InputKind::CheckoutBranch
+            InputKind::SearchDirectory
+                | InputKind::BranchOff
+                | InputKind::CheckoutBranch
+                | InputKind::CloneTarget
         )
     }
 
@@ -1413,6 +1419,7 @@ struct AgentState {
     queued: Vec<String>,
     draining: bool,
     show_controls: bool,
+    handoff_context: bool,
     reconnecting: bool,
     subagents: Vec<ProviderSubagent>,
     viewing: Option<SubagentView>,
@@ -2087,9 +2094,9 @@ impl AgentState {
             }
         }
         match self.mode {
-            Mode::Compose => {
+            Mode::Compose | Mode::Handoff => {
                 let filtered = self.filtered_slash();
-                if !filtered.is_empty() {
+                if self.mode == Mode::Compose && !filtered.is_empty() {
                     let selected = self.slash_selected.min(filtered.len() - 1);
                     for (row, &cmd_idx) in filtered.iter().enumerate().take(8) {
                         let cmd = &self.slash_commands[cmd_idx];
@@ -2166,7 +2173,7 @@ impl AgentState {
                         .collect::<Vec<_>>()
                         .join(" · ");
                     let mut actions =
-                        "d diff · t terminal · T split · c agents · s sub-agents · m mode · M model · e effort · x stop"
+                        "d diff · t terminal · T split · c agents · h handoff · H handoff+ctx · f migrate · s sub-agents · m mode · M model · e effort · x stop"
                             .to_string();
                     if !feature_hint.is_empty() {
                         actions.push_str(" · ");
@@ -3505,6 +3512,7 @@ impl PaseoAgentPane {
                         provider: None,
                         cwd: None,
                         prompt: None,
+                        attachment: None,
                     });
                     return;
                 }
@@ -3630,12 +3638,224 @@ impl PaseoAgentPane {
                 self.create_worktree_agent(cwd, "checkout", Some(ref_name), None, provider)
             }
             PendingCreate::NewDirectory(value) => {
-                self.run_project_creation(InputKind::NewDirectory, value, provider)
+                self.run_project_creation(InputKind::NewDirectory, value, None, provider)
             }
-            PendingCreate::CloneRepo(value) => {
-                self.run_project_creation(InputKind::CloneRepo, value, provider)
+            PendingCreate::CloneRepo { repo, target_dir } => {
+                self.run_project_creation(InputKind::CloneRepo, repo, Some(target_dir), provider)
+            }
+            PendingCreate::Migrate { cwd, attachment } => {
+                self.launch_migrated_agent(cwd, attachment, provider)
             }
         }
+    }
+
+    fn launch_migrated_agent(&self, cwd: String, attachment: TextAttachment, provider: String) {
+        self.mutate(|state| {
+            state.picker = None;
+            state.status_message = None;
+            state.rebuild_rows();
+        });
+        let domain = self.domain.domain_name().to_string();
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if let Err(err) = spawn_agent_pane(
+                    term_window,
+                    &domain,
+                    AgentSource {
+                        agent_id: None,
+                        provider: Some(provider.clone()),
+                        cwd: Some(cwd.clone()),
+                        prompt: None,
+                        attachment: Some(attachment.clone()),
+                    },
+                ) {
+                    log::error!("paseo: migrate launch failed: {err}");
+                }
+            })));
+    }
+
+    fn latest_assistant_text(&self) -> Option<String> {
+        self.state
+            .lock()
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "assistant_message")
+            .and_then(|item| item.text.clone())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    fn start_handoff(&self, include_context: bool) {
+        if self.state.lock().provider.is_empty() {
+            self.set_status("Handoff".into(), Some("agent still loading".into()));
+            return;
+        }
+        let prefill = self.latest_assistant_text().unwrap_or_default();
+        self.mutate(|state| {
+            state.composer = prefill;
+            state.composer_cursor = state.composer_char_len();
+            state.mode = Mode::Handoff;
+            state.handoff_context = include_context;
+            state.status_message = Some(
+                if include_context {
+                    "handoff (+context) — edit the task, Enter to launch, Esc to cancel"
+                } else {
+                    "handoff — edit the task, Enter to launch, Esc to cancel"
+                }
+                .into(),
+            );
+            state.rebuild_rows();
+        });
+        self.scroll_to_bottom();
+    }
+
+    fn submit_handoff(&self) {
+        let (task, provider, cwd, include_context) = {
+            let mut state = self.state.lock();
+            state.composer_cursor = 0;
+            let task = std::mem::take(&mut state.composer).trim().to_string();
+            state.mode = Mode::Scroll;
+            state.status_message = None;
+            let include_context = std::mem::take(&mut state.handoff_context);
+            (
+                task,
+                state.provider.clone(),
+                state.cwd.clone(),
+                include_context,
+            )
+        };
+        if task.is_empty() || provider.is_empty() || cwd.is_empty() {
+            self.mutate(|state| state.rebuild_rows());
+            return;
+        }
+        if include_context {
+            self.launch_handoff_with_context(task, provider, cwd);
+        } else {
+            self.launch_handoff(task, provider, cwd);
+        }
+        self.mutate(|state| state.rebuild_rows());
+    }
+
+    fn launch_handoff(&self, task: String, provider: String, cwd: String) {
+        let domain = self.domain.domain_name().to_string();
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let args = KeyAssignment::OpenPaseoAgentPane(PaseoAgentArgs {
+                    domain: domain.clone(),
+                    provider: Some(provider.clone()),
+                    cwd: Some(cwd.clone()),
+                    prompt: Some(task.clone()),
+                    ..Default::default()
+                });
+                if let Some(pane) = Mux::get()
+                    .get_active_tab_for_window(term_window.mux_window_id)
+                    .and_then(|tab| tab.get_active_pane())
+                {
+                    let _ = term_window.perform_key_assignment(&pane, &args);
+                }
+            })));
+    }
+
+    fn launch_handoff_with_context(&self, task: String, provider: String, cwd: String) {
+        let (Some(client), Some(agent_id)) = (self.client(), self.agent_id()) else {
+            self.launch_handoff(task, provider, cwd);
+            return;
+        };
+        if !client.feature_enabled("agentForkContext") {
+            self.launch_handoff(task, provider, cwd);
+            return;
+        }
+        self.mutate(|state| {
+            state.status_message = Some("⟳ preparing handoff context…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            let transcript = client
+                .fork_context(&agent_id, None)
+                .await
+                .ok()
+                .and_then(|context| context.attachment)
+                .map(|attachment| attachment.text);
+            let prompt = match transcript {
+                Some(transcript) => {
+                    let stamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or(0);
+                    let name = format!("handoff-{}-{stamp}.md", short_id(&agent_id));
+                    match client.write_text_file(&cwd, ".paseo", &name, &transcript).await {
+                        Ok(path) => format!(
+                            "{task}\n\n(Context from the previous agent's conversation is saved at {path} — read it if you need background.)"
+                        ),
+                        Err(_) => task,
+                    }
+                }
+                None => task,
+            };
+            if let Some(pane) = weak.upgrade() {
+                pane.mutate(|state| {
+                    state.status_message = None;
+                    state.rebuild_rows();
+                });
+                pane.launch_handoff(prompt, provider, cwd);
+            }
+        })
+        .detach();
+    }
+
+    fn start_migration(&self) {
+        let Some(client) = self.client() else {
+            self.set_status("Migrate".into(), Some("not connected".into()));
+            return;
+        };
+        if !client.feature_enabled("agentForkContext") {
+            self.set_status(
+                "Migrate".into(),
+                Some("daemon does not support agent forking".into()),
+            );
+            return;
+        }
+        let Some(agent_id) = self.agent_id() else {
+            self.set_status("Migrate".into(), Some("no agent to migrate".into()));
+            return;
+        };
+        let cwd = self.state.lock().cwd.clone();
+        if cwd.is_empty() {
+            self.set_status("Migrate".into(), Some("agent still loading".into()));
+            return;
+        }
+        self.mutate(|state| {
+            state.status_message = Some("⟳ preparing migration…".to_string());
+            state.rebuild_rows();
+        });
+        let weak = self.weak.lock().clone();
+        promise::spawn::spawn(async move {
+            match client.fork_context(&agent_id, None).await {
+                Ok(context) => {
+                    let Some(pane) = weak.upgrade() else {
+                        return;
+                    };
+                    match context.attachment {
+                        Some(attachment) => pane.wizard_to_provider(
+                            PendingCreate::Migrate { cwd, attachment },
+                            vec!["migrate".to_string()],
+                        ),
+                        None => pane.set_status(
+                            "Migrate".into(),
+                            Some("no conversation to migrate".into()),
+                        ),
+                    }
+                }
+                Err(err) => {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.set_status("Migrate".into(), Some(format!("fork context: {err}")));
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn wizard_active(&self) -> bool {
@@ -3675,7 +3895,11 @@ impl PaseoAgentPane {
             state.create_stack.is_empty()
         };
         if empty {
-            self.open_hub();
+            if self.agent_id().is_some() {
+                self.dismiss_picker();
+            } else {
+                self.open_hub();
+            }
         } else {
             self.wizard_render();
         }
@@ -3918,7 +4142,7 @@ impl PaseoAgentPane {
             match created {
                 Ok(workspace) => {
                     match client
-                        .create_agent(&provider, &workspace.cwd, Some(&workspace.id), None)
+                        .create_agent(&provider, &workspace.cwd, Some(&workspace.id), None, &[])
                         .await
                     {
                         Ok(snapshot) => {
@@ -4281,7 +4505,7 @@ impl PaseoAgentPane {
         promise::spawn::spawn(async move {
             let workspace = client.open_project(&cwd).await.ok();
             match client
-                .create_agent(&provider, &cwd, workspace.as_deref(), None)
+                .create_agent(&provider, &cwd, workspace.as_deref(), None, &[])
                 .await
             {
                 Ok(snapshot) => {
@@ -4502,7 +4726,31 @@ impl PaseoAgentPane {
                         InputKind::NewDirectory => {
                             self.begin_create(PendingCreate::NewDirectory(value))
                         }
-                        InputKind::CloneRepo => self.begin_create(PendingCreate::CloneRepo(value)),
+                        InputKind::CloneRepo => {
+                            let crumbs = self
+                                .state
+                                .lock()
+                                .picker
+                                .as_ref()
+                                .map(|picker| picker.crumbs.clone())
+                                .unwrap_or_default();
+                            self.set_input_stage(
+                                InputKind::CloneTarget,
+                                "Clone into which directory?".to_string(),
+                                "~/".to_string(),
+                                Some(value),
+                                crumbs,
+                            );
+                            self.refresh_suggestions();
+                        }
+                        InputKind::CloneTarget => {
+                            if let Some(repo) = context {
+                                self.begin_create(PendingCreate::CloneRepo {
+                                    repo,
+                                    target_dir: value,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -4568,7 +4816,13 @@ impl PaseoAgentPane {
         self.open_domain_picker(name);
     }
 
-    fn run_project_creation(self: &Arc<Self>, kind: InputKind, value: String, provider: String) {
+    fn run_project_creation(
+        self: &Arc<Self>,
+        kind: InputKind,
+        value: String,
+        target_dir: Option<String>,
+        provider: String,
+    ) {
         let Some(client) = self.client() else {
             return;
         };
@@ -4599,17 +4853,26 @@ impl PaseoAgentPane {
                     };
                     client.project_create_directory(&parent, &name).await
                 }
-                InputKind::CloneRepo => client.project_github_clone(&value, "https").await,
+                InputKind::CloneRepo => {
+                    client
+                        .project_github_clone(
+                            &value,
+                            "https",
+                            target_dir.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                }
                 InputKind::SearchDirectory
                 | InputKind::BranchOff
                 | InputKind::CheckoutBranch
+                | InputKind::CloneTarget
                 | InputKind::AddConnection => return,
             };
             match cwd {
                 Ok(cwd) => {
                     let workspace = client.open_project(&cwd).await.ok();
                     match client
-                        .create_agent(&provider, &cwd, workspace.as_deref(), None)
+                        .create_agent(&provider, &cwd, workspace.as_deref(), None, &[])
                         .await
                     {
                         Ok(snapshot) => {
@@ -4643,6 +4906,7 @@ pub struct AgentSource {
     pub provider: Option<String>,
     pub cwd: Option<String>,
     pub prompt: Option<String>,
+    pub attachment: Option<TextAttachment>,
 }
 
 async fn fetch_hub(client: &PaseoClient) -> anyhow::Result<Vec<PickerGroup>> {
@@ -4682,7 +4946,13 @@ async fn resolve_or_create(
     if let (Some(provider), Some(cwd)) = (source.provider.as_ref(), source.cwd.as_ref()) {
         let workspace = client.open_project(cwd).await?;
         return client
-            .create_agent(provider, cwd, Some(&workspace), source.prompt.as_deref())
+            .create_agent(
+                provider,
+                cwd,
+                Some(&workspace),
+                source.prompt.as_deref(),
+                source.attachment.as_slice(),
+            )
             .await
             .map_err(anyhow::Error::from);
     }
@@ -4962,7 +5232,14 @@ impl Pane for PaseoAgentPane {
                     {
                         self.dismiss_picker()
                     }
-                    KeyCode::Char('q') | KeyCode::Escape => self.close(),
+                    KeyCode::Char('q') | KeyCode::Escape => {
+                        if self.agent_id().is_some() {
+                            self.wizard_reset();
+                            self.dismiss_picker();
+                        } else {
+                            self.close();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4970,7 +5247,7 @@ impl Pane for PaseoAgentPane {
         }
         let mode = self.state.lock().mode;
         match mode {
-            Mode::Compose => match key {
+            Mode::Compose | Mode::Handoff => match key {
                 KeyCode::Char('\r') | KeyCode::Enter
                     if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT) =>
                 {
@@ -4986,13 +5263,26 @@ impl Pane for PaseoAgentPane {
                     state.slash_dismissed = false;
                     state.rebuild_rows();
                 }),
-                KeyCode::Char('\r') | KeyCode::Enter if self.slash_active() => self.slash_accept(),
-                KeyCode::UpArrow if self.slash_active() => self.slash_move(-1),
-                KeyCode::DownArrow if self.slash_active() => self.slash_move(1),
-                KeyCode::Escape if self.slash_active() => self.mutate(|state| {
-                    state.slash_dismissed = true;
-                    state.rebuild_rows();
-                }),
+                KeyCode::Char('\r') | KeyCode::Enter
+                    if mode == Mode::Compose && self.slash_active() =>
+                {
+                    self.slash_accept()
+                }
+                KeyCode::UpArrow if mode == Mode::Compose && self.slash_active() => {
+                    self.slash_move(-1)
+                }
+                KeyCode::DownArrow if mode == Mode::Compose && self.slash_active() => {
+                    self.slash_move(1)
+                }
+                KeyCode::Escape if mode == Mode::Compose && self.slash_active() => {
+                    self.mutate(|state| {
+                        state.slash_dismissed = true;
+                        state.rebuild_rows();
+                    })
+                }
+                KeyCode::Char('\r') | KeyCode::Enter if mode == Mode::Handoff => {
+                    self.submit_handoff()
+                }
                 KeyCode::Char('\r') | KeyCode::Enter if mods.contains(KeyModifiers::CTRL) => {
                     self.submit_composer(true)
                 }
@@ -5083,6 +5373,9 @@ impl Pane for PaseoAgentPane {
                 KeyCode::Char('x') => self.stop(),
                 KeyCode::Char('c') if mods.contains(KeyModifiers::CTRL) => self.stop(),
                 KeyCode::Char('c') => self.open_hub_tab(),
+                KeyCode::Char('h') => self.start_handoff(false),
+                KeyCode::Char('H') => self.start_handoff(true),
+                KeyCode::Char('f') => self.start_migration(),
                 KeyCode::Char('m') => self.cycle_mode(),
                 KeyCode::Char('M') => self.cycle_model(),
                 KeyCode::Char('e') => self.cycle_effort(),
@@ -5171,6 +5464,98 @@ impl Pane for PaseoAgentPane {
     }
 }
 
+impl PaseoAgentPane {
+    fn new_loading(
+        domain: Arc<dyn mux::domain::Domain>,
+        window: Window,
+        size: TerminalSize,
+    ) -> Arc<Self> {
+        let pane = Arc::new(PaseoAgentPane {
+            pane_id: alloc_pane_id(),
+            domain_id: domain.domain_id(),
+            agent_id: Mutex::new(None),
+            domain,
+            client: Mutex::new(None),
+            writer: Mutex::new(Vec::new()),
+            window,
+            weak: Mutex::new(Weak::new()),
+            state: Mutex::new(AgentState {
+                title: "Agent (loading…)".to_string(),
+                status_message: Some("⟳ loading agent…".to_string()),
+                items: Vec::new(),
+                pending: None,
+                picker: None,
+                cwd: String::new(),
+                workspace_name: None,
+                mode: Mode::Scroll,
+                composer: String::new(),
+                composer_cursor: 0,
+                slash_selected: 0,
+                slash_dismissed: false,
+                provider: String::new(),
+                agent_status: String::new(),
+                requires_attention: false,
+                model: None,
+                current_mode_id: None,
+                available_modes: Vec::new(),
+                thinking_option_id: None,
+                features: Vec::new(),
+                slash_commands: Vec::new(),
+                models: Vec::new(),
+                transcript: Vec::new(),
+                footer: Vec::new(),
+                scroll: 0,
+                follow: true,
+                rows_version: 0,
+                size,
+                seqno: 1,
+                dead: false,
+                create_stack: Vec::new(),
+                selection: None,
+                queued: Vec::new(),
+                draining: false,
+                show_controls: false,
+                handoff_context: false,
+                reconnecting: false,
+                subagents: Vec::new(),
+                viewing: None,
+                spinner_frame: 0,
+                spinner_ticking: false,
+                tool_expand_overrides: HashMap::new(),
+                tool_headers: HashMap::new(),
+            }),
+        });
+        pane.mutate(|state| state.rebuild_rows());
+        *pane.weak.lock() = Arc::downgrade(&pane);
+        pane
+    }
+}
+
+fn spawn_agent_pane(
+    term_window: &mut TermWindow,
+    domain_name: &str,
+    source: AgentSource,
+) -> anyhow::Result<()> {
+    let mux = Mux::get();
+    let window_id = term_window.mux_window_id;
+    let domain = mux
+        .get_domain_by_name(domain_name)
+        .ok_or_else(|| anyhow!("paseo domain {domain_name} not found"))?;
+    let window = term_window
+        .window
+        .clone()
+        .ok_or_else(|| anyhow!("no window handle"))?;
+    let pane_size = term_window.terminal_size();
+    let pane = PaseoAgentPane::new_loading(domain, window, pane_size);
+    let pane_dyn: Arc<dyn Pane> = pane.clone();
+    let new_tab = Arc::new(MuxTab::new(&pane_size));
+    new_tab.assign_pane(&pane_dyn);
+    mux.add_tab_and_active_pane(&new_tab)?;
+    mux.add_tab_to_window(&new_tab, window_id)?;
+    pane.start(source);
+    Ok(())
+}
+
 pub fn open_paseo_agent_pane(
     term_window: &mut TermWindow,
     args: &PaseoAgentArgs,
@@ -5250,63 +5635,7 @@ pub fn open_paseo_agent_pane(
         )
     };
 
-    let pane = Arc::new(PaseoAgentPane {
-        pane_id: alloc_pane_id(),
-        domain_id: domain.domain_id(),
-        agent_id: Mutex::new(None),
-        domain: domain.clone(),
-        client: Mutex::new(None),
-        writer: Mutex::new(Vec::new()),
-        window,
-        weak: Mutex::new(Weak::new()),
-        state: Mutex::new(AgentState {
-            title: "Agent (loading…)".to_string(),
-            status_message: Some("⟳ loading agent…".to_string()),
-            items: Vec::new(),
-            pending: None,
-            picker: None,
-            cwd: String::new(),
-            workspace_name: None,
-            mode: Mode::Scroll,
-            composer: String::new(),
-            composer_cursor: 0,
-            slash_selected: 0,
-            slash_dismissed: false,
-            provider: String::new(),
-            agent_status: String::new(),
-            requires_attention: false,
-            model: None,
-            current_mode_id: None,
-            available_modes: Vec::new(),
-            thinking_option_id: None,
-            features: Vec::new(),
-            slash_commands: Vec::new(),
-            models: Vec::new(),
-            transcript: Vec::new(),
-            footer: Vec::new(),
-            scroll: 0,
-            follow: true,
-            rows_version: 0,
-            size: pane_size,
-            seqno: 1,
-            dead: false,
-            create_stack: Vec::new(),
-            selection: None,
-            queued: Vec::new(),
-            draining: false,
-            show_controls: false,
-            reconnecting: false,
-            subagents: Vec::new(),
-            viewing: None,
-            spinner_frame: 0,
-            spinner_ticking: false,
-            tool_expand_overrides: HashMap::new(),
-            tool_headers: HashMap::new(),
-        }),
-    });
-
-    pane.mutate(|state| state.rebuild_rows());
-    *pane.weak.lock() = Arc::downgrade(&pane);
+    let pane = PaseoAgentPane::new_loading(domain, window, pane_size);
 
     let pane_dyn: Arc<dyn Pane> = pane.clone();
     let created_tab = match insertion {
@@ -5335,6 +5664,7 @@ pub fn open_paseo_agent_pane(
             provider: args.provider.clone(),
             cwd: args.cwd.clone(),
             prompt: args.prompt.clone(),
+            attachment: None,
         });
     }
 
