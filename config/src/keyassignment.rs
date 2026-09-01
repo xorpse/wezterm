@@ -651,9 +651,30 @@ pub enum KeyAssignment {
     OpenReviewPane(ReviewPaneArgs),
     ReviewMode(ReviewModeAssignment),
 
+    OpenOrcaHub(OrcaHubArgs),
     OpenPaseoAgentPane(PaseoAgentArgs),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct OrcaHubArgs {
+    #[dynamic(default)]
+    pub domain: String,
+    #[dynamic(default = "crate::default_true")]
+    pub new_tab: bool,
+    #[dynamic(default)]
+    pub size: SplitSize,
+}
+impl Default for OrcaHubArgs {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            new_tab: true,
+            size: SplitSize::default(),
+        }
+    }
+}
+impl_lua_conversion_dynamic!(OrcaHubArgs);
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct PaseoAgentArgs {

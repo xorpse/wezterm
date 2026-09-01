@@ -1,22 +1,26 @@
-use mux::domain::{DomainId, DomainState};
-use mux::localpane::PaneNotifHandler;
-use mux::pane::{
-    impl_get_lines_via_with_lines, impl_get_logical_lines_via_get_lines, CachePolicy,
-    ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, WithPaneLines,
-};
-use mux::renderable::{
-    terminal_for_each_logical_line_in_stable_range_mut, terminal_get_cursor_position,
-    terminal_get_dimensions, terminal_get_dirty_lines, terminal_with_lines_mut,
-    RenderableDimensions, StableCursorPosition,
-};
-use mux::{Mux, MuxNotification};
-use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
-use paseo_client::{PaseoClient, TerminalHandle, TerminalStreamEvent, TerminalWriter};
-use rangeset::RangeSet;
+use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+
+use mux::domain::{DomainId, DomainState};
+use mux::localpane::PaneNotifHandler;
+use mux::pane::{
+    CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, WithPaneLines,
+    impl_get_lines_via_with_lines, impl_get_logical_lines_via_get_lines,
+};
+use mux::renderable::{
+    RenderableDimensions, StableCursorPosition, terminal_for_each_logical_line_in_stable_range_mut,
+    terminal_get_cursor_position, terminal_get_dimensions, terminal_get_dirty_lines,
+    terminal_with_lines_mut,
+};
+use mux::{Mux, MuxNotification};
+use orca_client::{
+    OrcaClient, TerminalHandle, TerminalStreamEvent, TerminalSummary, TerminalWriter, id_selector,
+};
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use rangeset::RangeSet;
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use url::Url;
@@ -25,6 +29,8 @@ use wezterm_term::{
     KeyCode, KeyModifiers, MouseEvent, StableRowIndex, Terminal, TerminalConfiguration,
     TerminalSize,
 };
+
+use crate::domain::OrcaDomain;
 
 struct ChannelWriter {
     tx: flume::Sender<Vec<u8>>,
@@ -41,52 +47,72 @@ impl Write for ChannelWriter {
     }
 }
 
-enum StreamOutcome {
-    Disconnected,
-    Ended,
+pub struct TerminalBinding {
+    pub terminal: String,
+    pub worktree_selector: String,
+    pub worktree_path: String,
+    pub parent_tab_id: String,
+    pub leaf_id: String,
 }
 
-pub struct PaseoTerminalPane {
+impl TerminalBinding {
+    pub fn from_summary(summary: &TerminalSummary) -> TerminalBinding {
+        TerminalBinding {
+            terminal: summary.handle.clone(),
+            worktree_selector: id_selector(&summary.worktree_id),
+            worktree_path: summary.worktree_path.clone(),
+            parent_tab_id: summary.tab_id.clone(),
+            leaf_id: summary.leaf_id.clone(),
+        }
+    }
+
+    pub fn session_tab_id(&self) -> String {
+        format!("{}::{}", self.parent_tab_id, self.leaf_id)
+    }
+}
+
+pub struct OrcaTerminalPane {
     pane_id: PaneId,
     domain_id: DomainId,
-    remote_terminal_id: String,
+    binding: TerminalBinding,
     terminal: Mutex<Terminal>,
     writer: Mutex<Box<dyn Write + Send>>,
     remote: Mutex<TerminalWriter>,
-    client: PaseoClient,
-    me: Mutex<Weak<PaseoTerminalPane>>,
+    client: OrcaClient,
+    me: Mutex<Weak<OrcaTerminalPane>>,
     io_generation: AtomicU64,
     last_size: Mutex<TerminalSize>,
+    agent_state: Mutex<Option<String>>,
     held: AtomicBool,
     killed: AtomicBool,
     dead: AtomicBool,
 }
 
-impl PaseoTerminalPane {
+impl OrcaTerminalPane {
     pub fn new(
         pane_id: PaneId,
         domain_id: DomainId,
-        remote_terminal_id: String,
+        binding: TerminalBinding,
         size: TerminalSize,
         remote: TerminalWriter,
-        client: PaseoClient,
-    ) -> (Arc<PaseoTerminalPane>, flume::Receiver<Vec<u8>>) {
+        client: OrcaClient,
+    ) -> (Arc<OrcaTerminalPane>, flume::Receiver<Vec<u8>>) {
         let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
         let term_config = Arc::new(config::TermConfig::new());
         let mut terminal = Terminal::new(
             size,
             term_config,
-            "paseo",
+            "orca",
             "1.0",
             Box::new(ChannelWriter {
                 tx: input_tx.clone(),
             }),
         );
         terminal.set_notification_handler(Box::new(PaneNotifHandler::new(pane_id)));
-        let pane = Arc::new(PaseoTerminalPane {
+        let pane = Arc::new(OrcaTerminalPane {
             pane_id,
             domain_id,
-            remote_terminal_id,
+            binding,
             terminal: Mutex::new(terminal),
             writer: Mutex::new(Box::new(ChannelWriter { tx: input_tx })),
             remote: Mutex::new(remote),
@@ -94,6 +120,7 @@ impl PaseoTerminalPane {
             me: Mutex::new(Weak::new()),
             io_generation: AtomicU64::new(0),
             last_size: Mutex::new(size),
+            agent_state: Mutex::new(None),
             held: AtomicBool::new(false),
             killed: AtomicBool::new(false),
             dead: AtomicBool::new(false),
@@ -102,30 +129,64 @@ impl PaseoTerminalPane {
         (pane, input_rx)
     }
 
-    fn kill_remote(&self) {
-        if self.killed.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        let client = self.client.clone();
-        let terminal_id = self.remote_terminal_id.clone();
-        promise::spawn::spawn(async move {
-            let _ = client.kill_terminal(&terminal_id).await;
-        })
-        .detach();
-    }
-
-    pub fn remote_terminal_id(&self) -> &str {
-        &self.remote_terminal_id
+    pub(crate) fn size(&self) -> TerminalSize {
+        *self.last_size.lock()
     }
 
     pub fn is_held(&self) -> bool {
         self.held.load(Ordering::Relaxed) && !self.dead.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn set_agent_state(&self, state: Option<String>) -> bool {
+        let mut slot = self.agent_state.lock();
+        if *slot == state {
+            return false;
+        }
+        *slot = state;
+        true
+    }
+
+    pub fn binding(&self) -> &TerminalBinding {
+        &self.binding
+    }
+
+    fn kill_remote(&self) {
+        if self.killed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let client = self.client.clone();
+        let terminal = self.binding.terminal.clone();
+        let worktree = self.binding.worktree_selector.clone();
+        let session_tab_id = self.binding.session_tab_id();
+        promise::spawn::spawn(async move {
+            if client.close_terminal(&terminal).await.is_ok() {
+                return;
+            }
+            let _ = client.close_session_tab(&worktree, &session_tab_id).await;
+        })
+        .detach();
+    }
+
+    pub fn start_io(&self, handle: TerminalHandle, input_rx: flume::Receiver<Vec<u8>>) {
+        self.spawn_output(handle);
+
+        let weak = self.me.lock().clone();
+        promise::spawn::spawn(async move {
+            while let Ok(bytes) = input_rx.recv_async().await {
+                let Some(pane) = weak.upgrade() else {
+                    break;
+                };
+                let remote = pane.remote.lock().clone();
+                drop(pane);
+                let _ = remote.input(&bytes).await;
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn resume(&self, handle: TerminalHandle) {
         *self.remote.lock() = handle.writer();
         self.held.store(false, Ordering::Relaxed);
-        self.terminal.lock().advance_bytes(b"\x1bc");
         self.spawn_output(handle);
 
         let remote = self.remote.lock().clone();
@@ -137,14 +198,69 @@ impl PaseoTerminalPane {
         Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
     }
 
+    fn spawn_output(&self, handle: TerminalHandle) {
+        let generation = self.io_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let weak = self.me.lock().clone();
+        let output_rx = handle.output();
+        promise::spawn::spawn_into_main_thread(async move {
+            let mut outcome = StreamOutcome::Disconnected;
+            while let Ok(event) = output_rx.recv_async().await {
+                let Some(pane) = weak.upgrade() else {
+                    return;
+                };
+                if pane.io_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                match event {
+                    TerminalStreamEvent::Output(bytes) => {
+                        pane.terminal.lock().advance_bytes(&bytes);
+                        Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
+                    }
+                    TerminalStreamEvent::SnapshotStart(_) => {
+                        pane.terminal.lock().advance_bytes(b"\x1bc");
+                    }
+                    TerminalStreamEvent::SnapshotChunk(bytes) => {
+                        pane.terminal.lock().advance_bytes(&bytes);
+                    }
+                    TerminalStreamEvent::SnapshotEnd => {
+                        Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
+                    }
+                    TerminalStreamEvent::Resized { .. } => {}
+                    TerminalStreamEvent::Error(message) => {
+                        log::warn!("orca terminal stream error: {message}");
+                    }
+                    TerminalStreamEvent::Disconnected => break,
+                    TerminalStreamEvent::End => {
+                        outcome = StreamOutcome::Ended;
+                        break;
+                    }
+                }
+            }
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            if pane.io_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            match outcome {
+                StreamOutcome::Disconnected => {
+                    pane.held.store(true, Ordering::Relaxed);
+                    Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
+                }
+                StreamOutcome::Ended => pane.declare_dead(),
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn declare_dead(&self) {
         self.dead.store(true, Ordering::Relaxed);
         let pane_id = self.pane_id;
         Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane_id));
         let mux = Mux::get();
         if let Some(domain) = mux.get_domain(self.domain_id) {
-            if let Some(paseo) = domain.downcast_ref::<crate::domain::PaseoDomain>() {
-                paseo.forget_terminal(&self.remote_terminal_id);
+            if let Some(orca) = domain.downcast_ref::<OrcaDomain>() {
+                orca.forget_terminal(&self.binding.terminal);
             }
         }
         match config::configuration().exit_behavior {
@@ -155,69 +271,14 @@ impl PaseoTerminalPane {
             }
         }
     }
-
-    fn spawn_output(&self, handle: TerminalHandle) {
-        let generation = self.io_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let weak = self.me.lock().clone();
-        let output_rx = handle.output();
-        promise::spawn::spawn_into_main_thread(async move {
-            let mut outcome = StreamOutcome::Ended;
-            while let Ok(event) = output_rx.recv_async().await {
-                let Some(pane) = weak.upgrade() else {
-                    return;
-                };
-                if pane.io_generation.load(Ordering::SeqCst) != generation {
-                    return;
-                }
-                match event {
-                    TerminalStreamEvent::Disconnected => {
-                        outcome = StreamOutcome::Disconnected;
-                        break;
-                    }
-                    TerminalStreamEvent::Output(bytes) | TerminalStreamEvent::Restore(bytes) => {
-                        pane.terminal.lock().advance_bytes(&bytes);
-                        Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
-                    }
-                    TerminalStreamEvent::Snapshot(_) => {}
-                }
-            }
-            let Some(pane) = weak.upgrade() else {
-                return;
-            };
-            if pane.io_generation.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            if let StreamOutcome::Disconnected = outcome {
-                if !pane.dead.load(Ordering::Relaxed) {
-                    pane.held.store(true, Ordering::Relaxed);
-                    Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id));
-                    return;
-                }
-            }
-            pane.declare_dead();
-        })
-        .detach();
-    }
-
-    pub fn start_io(self: &Arc<Self>, handle: TerminalHandle, input_rx: flume::Receiver<Vec<u8>>) {
-        self.spawn_output(handle);
-
-        let weak: Weak<PaseoTerminalPane> = Arc::downgrade(self);
-        promise::spawn::spawn(async move {
-            while let Ok(bytes) = input_rx.recv_async().await {
-                let Some(pane) = weak.upgrade() else {
-                    break;
-                };
-                let remote = pane.remote.lock().clone();
-                drop(pane);
-                let _ = remote.send_input(&bytes).await;
-            }
-        })
-        .detach();
-    }
 }
 
-impl Pane for PaseoTerminalPane {
+enum StreamOutcome {
+    Disconnected,
+    Ended,
+}
+
+impl Pane for OrcaTerminalPane {
     fn pane_id(&self) -> PaneId {
         self.pane_id
     }
@@ -271,12 +332,17 @@ impl Pane for PaseoTerminalPane {
     }
 
     fn get_title(&self) -> String {
-        let title = self.terminal.lock().get_title().to_string();
+        let title = self.terminal.lock().get_title().to_owned();
         if self.is_held() {
-            format!("⌁ {title}")
-        } else {
-            title
+            return format!("⌁ {title}");
         }
+        let glyph = match self.agent_state.lock().as_deref() {
+            Some("working") => "● ",
+            Some("blocked") | Some("waiting") => "⚠ ",
+            Some("done") => "✓ ",
+            _ => "",
+        };
+        format!("{glyph}{title}")
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
@@ -355,7 +421,7 @@ impl Pane for PaseoTerminalPane {
         Some(self.terminal.lock().get_config())
     }
 
-    fn copy_user_vars(&self) -> std::collections::HashMap<String, String> {
+    fn copy_user_vars(&self) -> HashMap<String, String> {
         self.terminal.lock().user_vars().clone()
     }
 
@@ -368,6 +434,9 @@ impl Pane for PaseoTerminalPane {
     }
 
     fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
-        self.terminal.lock().get_current_dir().cloned()
+        if let Some(url) = self.terminal.lock().get_current_dir().cloned() {
+            return Some(url);
+        }
+        Url::from_file_path(&self.binding.worktree_path).ok()
     }
 }

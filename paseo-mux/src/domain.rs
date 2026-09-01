@@ -11,7 +11,11 @@ use portable_pty::CommandBuilder;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use wezterm_term::TerminalSize;
+
+const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub enum ConnectTarget {
@@ -33,6 +37,7 @@ pub struct PaseoDomain {
     state: Arc<Mutex<DomainState>>,
     connection: Arc<AtomicU64>,
     attached_terminals: Mutex<HashSet<String>>,
+    attach_window: Mutex<Option<WindowId>>,
     projects: Arc<Mutex<HashMap<String, String>>>,
     workspace_ids: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -47,9 +52,61 @@ impl PaseoDomain {
             state: Arc::new(Mutex::new(DomainState::Detached)),
             connection: Arc::new(AtomicU64::new(0)),
             attached_terminals: Mutex::new(HashSet::new()),
+            attach_window: Mutex::new(None),
             projects: Arc::new(Mutex::new(HashMap::new())),
             workspace_ids: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub(crate) fn forget_terminal(&self, terminal_id: &str) {
+        self.attached_terminals.lock().remove(terminal_id);
+    }
+
+    fn wants_connection(&self) -> bool {
+        if self.attach_window.lock().is_some() {
+            return true;
+        }
+        Mux::get().iter_panes().into_iter().any(|pane| {
+            pane.domain_id() == self.domain_id
+                && pane
+                    .downcast_ref::<PaseoTerminalPane>()
+                    .is_some_and(|paseo_pane| paseo_pane.is_held())
+        })
+    }
+
+    async fn revive_panes(&self, client: &PaseoClient) -> anyhow::Result<()> {
+        let live = client
+            .list_terminals(None)
+            .await?
+            .into_iter()
+            .map(|info| info.id)
+            .collect::<HashSet<_>>();
+        let panes = Mux::get()
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| pane.domain_id() == self.domain_id)
+            .collect::<Vec<_>>();
+        for pane in panes {
+            let Some(paseo_pane) = pane.downcast_ref::<PaseoTerminalPane>() else {
+                continue;
+            };
+            if !paseo_pane.is_held() {
+                continue;
+            }
+            let terminal_id = paseo_pane.remote_terminal_id().to_owned();
+            if live.contains(&terminal_id) {
+                match client
+                    .subscribe_terminal(&terminal_id, "visible-snapshot")
+                    .await
+                {
+                    Ok(handle) => paseo_pane.resume(handle),
+                    Err(err) => log::warn!("paseo: could not revive {terminal_id}: {err:#}"),
+                }
+            } else {
+                paseo_pane.declare_dead();
+            }
+        }
+        Ok(())
     }
 
     async fn resolve_workspace_id(&self, client: &PaseoClient, cwd: &str) -> Option<String> {
@@ -96,11 +153,46 @@ impl PaseoDomain {
             let slot = self.client.clone();
             let state = self.state.clone();
             let generation = self.connection.clone();
+            let domain_id = self.domain_id;
             promise::spawn::spawn(async move {
                 let _ = client.run().await;
-                if generation.load(Ordering::SeqCst) == connection {
-                    *slot.lock() = None;
-                    *state.lock() = DomainState::Detached;
+                if generation.load(Ordering::SeqCst) != connection {
+                    return;
+                }
+                *slot.lock() = None;
+                *state.lock() = DomainState::Detached;
+                let mut delay = RECONNECT_MIN_DELAY;
+                loop {
+                    smol::Timer::after(delay).await;
+                    let Some(domain) = Mux::get().get_domain(domain_id) else {
+                        return;
+                    };
+                    let Some(paseo) = domain.downcast_ref::<PaseoDomain>() else {
+                        return;
+                    };
+                    if paseo.client().is_some() || !paseo.wants_connection() {
+                        return;
+                    }
+                    if paseo.ensure_client().await.is_ok() {
+                        return;
+                    }
+                    delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+                }
+            })
+            .detach();
+        }
+        {
+            let client = client.clone();
+            let domain_id = self.domain_id;
+            promise::spawn::spawn(async move {
+                let Some(domain) = Mux::get().get_domain(domain_id) else {
+                    return;
+                };
+                let Some(paseo) = domain.downcast_ref::<PaseoDomain>() else {
+                    return;
+                };
+                if let Err(err) = paseo.revive_panes(&client).await {
+                    log::warn!("paseo domain pane revival failed: {err:#}");
                 }
             })
             .detach();
@@ -244,6 +336,7 @@ impl Domain for PaseoDomain {
             Some(window_id) => window_id,
             None => *mux.new_empty_window(None, None),
         };
+        *self.attach_window.lock() = Some(window_id);
 
         let size = default_size();
         let terminals = client.list_terminals(None).await?;
@@ -285,9 +378,9 @@ impl Domain for PaseoDomain {
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        *self.client.lock() = None;
+        self.reset_client();
         self.attached_terminals.lock().clear();
-        *self.state.lock() = DomainState::Detached;
+        *self.attach_window.lock() = None;
         Ok(())
     }
 

@@ -1,0 +1,27 @@
+[package]
+name = "orca-mux"
+version = "0.1.0"
+edition = "2024"
+description = "WezTerm mux Domain and Pane backed by an Orca runtime"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+config = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+mux = { workspace = true }
+orca-client = { workspace = true }
+parking_lot = { workspace = true }
+portable-pty = { workspace = true }
+promise = { workspace = true }
+rangeset = { workspace = true }
+shell-words = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+smol = { workspace = true }
+termwiz = { workspace = true }
+url = { workspace = true }
+wezterm-term = { workspace = true }

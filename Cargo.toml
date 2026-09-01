@@ -6,6 +6,7 @@ members = [
   "sync-color-schemes",
   "deps/cairo",
   "git-review",
+  "orca-mux",
   "paseo-mux",
   "wezterm",
   "wezterm-blob-leases",
@@ -160,7 +161,9 @@ objc2-core-graphics = "0.3"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 openssl = "0.10.57"
-ordered-float = {version="4.1", default-features=false}
+orca-client = { git = "ssh://git@github.com/xorpse/orca-client.git", branch = "dev" }
+orca-mux = { path = "orca-mux" }
+ordered-float = { version="4.1", default-features=false }
 parking_lot = "0.12"
 paseo-client = { git = "ssh://git@github.com/xorpse/paseo-client.git", branch = "dev" }
 paseo-mux = { path = "paseo-mux" }

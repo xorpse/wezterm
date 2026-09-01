@@ -106,6 +106,30 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         mux.add_domain(&domain);
     }
 
+    for orca_runtime in &config.orca_runtimes {
+        if mux.get_domain_by_name(&orca_runtime.name).is_some() {
+            continue;
+        }
+
+        let domain = if !orca_runtime.ssh.is_empty() {
+            orca_mux::OrcaDomain::new_ssh(orca_runtime.name.clone(), orca_runtime.ssh.clone())
+        } else {
+            let offer = match orca_client::PairingOffer::parse(&orca_runtime.pairing_code) {
+                Ok(offer) => offer,
+                Err(err) => {
+                    log::warn!(
+                        "orca runtime {} has an invalid pairing_code: {err}; skipping",
+                        orca_runtime.name
+                    );
+                    continue;
+                }
+            };
+            orca_mux::OrcaDomain::new(orca_runtime.name.clone(), offer)
+        };
+        let domain: Arc<dyn Domain> = Arc::new(domain);
+        mux.add_domain(&domain);
+    }
+
     for serial in &config.serial_ports {
         if mux.get_domain_by_name(&serial.name).is_some() {
             continue;

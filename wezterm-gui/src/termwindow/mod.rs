@@ -209,9 +209,8 @@ pub struct PaneState {
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
 }
 
-fn paseo_tab_project(pane: &Arc<dyn Pane>) -> Option<String> {
+fn tab_project(pane: &Arc<dyn Pane>) -> Option<String> {
     let domain = Mux::get().get_domain(pane.domain_id())?;
-    let paseo = domain.downcast_ref::<paseo_mux::PaseoDomain>()?;
     let url = pane.get_current_working_dir(CachePolicy::FetchImmediate)?;
     if url.scheme() != "file" {
         return None;
@@ -219,7 +218,13 @@ fn paseo_tab_project(pane: &Arc<dyn Pane>) -> Option<String> {
     let path = percent_encoding::percent_decode_str(url.path())
         .decode_utf8_lossy()
         .into_owned();
-    paseo.project_for_cwd(&path)
+    if let Some(paseo) = domain.downcast_ref::<paseo_mux::PaseoDomain>() {
+        return paseo.project_for_cwd(&path);
+    }
+    if let Some(orca) = domain.downcast_ref::<orca_mux::OrcaDomain>() {
+        return orca.project_for_cwd(&path);
+    }
+    None
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -3207,6 +3212,23 @@ impl TermWindow {
                 }
             }
             ReviewMode(_) => {}
+            OpenOrcaHub(args) => match crate::orca::open_orca_hub(self, args) {
+                Ok(created_tab) => {
+                    if created_tab {
+                        let _ = self.activate_tab(-1);
+                        if let Some(window) = self.window.as_ref() {
+                            window.invalidate();
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::error!("failed to open orca hub: {err:#}");
+                    wezterm_toast_notification::persistent_toast_notification(
+                        "Orca",
+                        &format!("Couldn't open the orca hub: {err:#}"),
+                    );
+                }
+            },
             OpenPaseoAgentPane(args) => match crate::paseo::open_paseo_agent_pane(self, args) {
                 Ok(created_tab) => {
                     if created_tab {
@@ -3610,9 +3632,7 @@ impl TermWindow {
                 let panes = self.get_pos_panes_for_tab(tab);
                 let active_pane = tab.get_active_pane();
                 let domain_id = active_pane.as_ref().map(|p| p.domain_id());
-                let project = active_pane
-                    .as_ref()
-                    .and_then(|pane| paseo_tab_project(pane));
+                let project = active_pane.as_ref().and_then(|pane| tab_project(pane));
 
                 TabInformation {
                     tab_index: idx,

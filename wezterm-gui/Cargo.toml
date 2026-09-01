@@ -69,6 +69,8 @@ mlua = {workspace=true, features=["send", "serialize"]}
 mux-lua.workspace = true
 mux.workspace = true
 nucleo-matcher.workspace = true
+orca-client.workspace = true
+orca-mux.workspace = true
 paseo-client.workspace = true
 paseo-mux.workspace = true
 ordered-float.workspace = true
@@ -98,6 +100,7 @@ unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 url-funcs.workspace = true
 url.workspace = true
+uuid = { workspace=true, features=["v4"] }
 walkdir.workspace = true
 wezterm-bidi.workspace = true
 wezterm-blob-leases = { workspace=true, features=["simple_tempdir"] }

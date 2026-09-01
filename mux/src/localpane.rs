@@ -928,11 +928,17 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
     }
 }
 
-struct LocalPaneNotifHandler {
+pub struct PaneNotifHandler {
     pane_id: PaneId,
 }
 
-impl AlertHandler for LocalPaneNotifHandler {
+impl PaneNotifHandler {
+    pub fn new(pane_id: PaneId) -> PaneNotifHandler {
+        PaneNotifHandler { pane_id }
+    }
+}
+
+impl AlertHandler for PaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
         let pane_id = self.pane_id;
         promise::spawn::spawn_into_main_thread(async move {
@@ -1010,7 +1016,7 @@ impl LocalPane {
             pane_id,
             tmux_domain: None,
         }));
-        terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        terminal.set_notification_handler(Box::new(PaneNotifHandler::new(pane_id)));
 
         Self {
             pane_id,

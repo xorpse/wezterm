@@ -15,6 +15,7 @@ use crate::keyassignment::{
 };
 use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
+use crate::orca::OrcaRuntime;
 use crate::paseo::PaseoDaemon;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
@@ -361,6 +362,12 @@ pub struct Config {
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
+
+    #[dynamic(default)]
+    pub orca_runtimes: Vec<OrcaRuntime>,
+
+    #[dynamic(default)]
+    pub orca_orcad_dir: Option<String>,
 
     #[dynamic(default)]
     pub paseo_daemons: Vec<PaseoDaemon>,

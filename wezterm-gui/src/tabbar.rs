@@ -622,9 +622,8 @@ impl TabBarState {
                 })
                 .is_vertical();
         let mut last_domain: Option<mux::domain::DomainId> = None;
-        let mut domain_collapsed = false;
         let mut last_project: Option<u64> = None;
-        let mut project_collapsed = false;
+        let mut group_collapsed = false;
 
         let mut render_order: Vec<usize> = (0..tab_titles.len()).collect();
         if group_by_domain {
@@ -655,54 +654,38 @@ impl TabBarState {
             let tab_title = &tab_titles[tab_idx];
             if group_by_domain {
                 if let Some(domain_id) = tab_info[tab_idx].domain_id {
-                    if last_domain != Some(domain_id) {
+                    let project = tab_info[tab_idx].project.as_deref();
+                    let proj_hash = project.map(project_hash);
+                    if last_domain != Some(domain_id) || proj_hash != last_project {
                         last_domain = Some(domain_id);
-                        last_project = None;
-                        domain_collapsed = tab_group_is_collapsed(domain_id, None);
+                        last_project = proj_hash;
+                        group_collapsed = tab_group_is_collapsed(domain_id, proj_hash);
                         let name = mux::Mux::get()
                             .get_domain(domain_id)
                             .map(|d| d.domain_name().to_string())
                             .unwrap_or_else(|| format!("domain {domain_id}"));
-                        let glyph = if domain_collapsed { "▸" } else { "▾" };
-                        let header_title = parse_status_text(
-                            &format!("{glyph} {name}"),
-                            CellAttributes::default(),
-                        );
+                        let glyph = if group_collapsed { "▸" } else { "▾" };
+                        let breadcrumb = match project {
+                            Some(project) => format!("{glyph} {name} · {project}"),
+                            None => format!("{glyph} {name}"),
+                        };
+                        let header_title =
+                            parse_status_text(&breadcrumb, CellAttributes::default());
+                        let item = match proj_hash {
+                            Some(project_hash) => TabBarItem::ProjectHeader {
+                                domain_id,
+                                project_hash,
+                            },
+                            None => TabBarItem::GroupHeader { domain_id },
+                        };
                         items.push(TabEntry {
-                            item: TabBarItem::GroupHeader { domain_id },
+                            item,
                             title: header_title,
                             x,
                             width: 0,
                         });
                     }
-                    if domain_collapsed {
-                        continue;
-                    }
-
-                    let project = tab_info[tab_idx].project.as_deref();
-                    let proj_hash = project.map(project_hash);
-                    if proj_hash != last_project {
-                        last_project = proj_hash;
-                        project_collapsed = false;
-                        if let (Some(project), Some(hash)) = (project, proj_hash) {
-                            project_collapsed = tab_group_is_collapsed(domain_id, Some(hash));
-                            let glyph = if project_collapsed { "▸" } else { "▾" };
-                            let title = parse_status_text(
-                                &format!("  {glyph} {project}"),
-                                CellAttributes::default(),
-                            );
-                            items.push(TabEntry {
-                                item: TabBarItem::ProjectHeader {
-                                    domain_id,
-                                    project_hash: hash,
-                                },
-                                title,
-                                x,
-                                width: 0,
-                            });
-                        }
-                    }
-                    if proj_hash.is_some() && project_collapsed {
+                    if group_collapsed {
                         continue;
                     }
                 }

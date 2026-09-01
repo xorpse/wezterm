@@ -1985,6 +1985,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit", "Review Mode"],
             icon: None,
         },
+        OpenOrcaHub(_) => CommandDef {
+            brief: "Orca: open hub".into(),
+            doc: "Open the Orca hub to browse worktrees and open terminals or agents".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
         OpenPaseoAgentPane(_) => CommandDef {
             brief: "Paseo: open agents".into(),
             doc: "Open the Paseo picker to connect a daemon and open agent sessions".into(),
@@ -2078,6 +2086,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
             new_tab: true,
             ..Default::default()
         }),
+        OpenOrcaHub(OrcaHubArgs::default()),
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
         PasteFrom(ClipboardPasteSource::PrimarySelection),

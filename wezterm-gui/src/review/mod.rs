@@ -9,9 +9,11 @@ use git_review::{
     compute_diff, compute_file_diff, current_branch, find_repo_root, hunk_gap, parent_branch,
     DiffLimits, DiffLine, DiffLineType, DiffMode, GitDiffData, GitFileStatus, Host, Side,
 };
+use orca_client::{DiffComment, OrcaClient};
 use paseo_client::{DaemonEvent, PaseoClient};
 
 mod highlight;
+mod orca_source;
 mod paseo_source;
 
 use highlight::{DiffTints, FileHighlight, Span};
@@ -24,6 +26,7 @@ use mux::pane::{
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
+use orca_source::OrcaReviewMeta;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use percent_encoding::percent_decode_str;
 use rangeset::RangeSet;
@@ -83,6 +86,37 @@ struct LineAnchor {
 struct Comment {
     body: String,
     line_text: String,
+    remote: Option<RemoteNote>,
+}
+
+#[derive(Clone)]
+struct RemoteNote {
+    id: String,
+    created_at: u64,
+    sent_at: Option<u64>,
+    source: Option<String>,
+    selected_text: Option<String>,
+    start_line: Option<u32>,
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+impl RemoteNote {
+    fn fresh() -> RemoteNote {
+        RemoteNote {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: epoch_ms(),
+            sent_at: None,
+            source: None,
+            selected_text: None,
+            start_line: None,
+        }
+    }
 }
 
 struct RenderRow {
@@ -281,7 +315,14 @@ enum FileLoad {
 #[derive(Clone)]
 enum DiffSource {
     LocalGit(Host),
-    Paseo { client: PaseoClient, cwd: String },
+    Orca {
+        client: OrcaClient,
+        worktree: String,
+    },
+    Paseo {
+        client: PaseoClient,
+        cwd: String,
+    },
 }
 
 impl DiffSource {
@@ -317,6 +358,7 @@ struct ReviewState {
     compute_seq: u64,
     compute_started: Option<Instant>,
     annotations: HashMap<LineAnchor, Comment>,
+    orca: Option<OrcaReviewMeta>,
     collapsed: HashSet<String>,
     find: Option<FindState>,
     editing: Option<EditState>,
@@ -793,6 +835,13 @@ pub struct ReviewPane {
     writer: Mutex<Vec<u8>>,
     window: ::window::Window,
     weak: Mutex<Weak<ReviewPane>>,
+    orca_watch: Mutex<OrcaWatch>,
+}
+
+#[derive(Default)]
+struct OrcaWatch {
+    started: bool,
+    subscription: Option<String>,
 }
 
 impl ReviewPane {
@@ -811,11 +860,22 @@ impl ReviewPane {
             state.dead = true;
             (state.source.clone(), state.subscription.take())
         };
-        if let (DiffSource::Paseo { client, .. }, Some(subscription)) = (source, subscription) {
+        if let (DiffSource::Paseo { client, .. }, Some(subscription)) = (&source, subscription) {
+            let client = client.clone();
             promise::spawn::spawn(async move {
                 let _ = client.unsubscribe_checkout_diff(&subscription).await;
             })
             .detach();
+        }
+        if let DiffSource::Orca { client, .. } = &source {
+            let client = client.clone();
+            let watch = self.orca_watch.lock().subscription.take();
+            if let Some(subscription) = watch {
+                promise::spawn::spawn(async move {
+                    let _ = client.unwatch_files(&subscription).await;
+                })
+                .detach();
+            }
         }
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -961,8 +1021,97 @@ impl ReviewPane {
     }
 
     fn send_comments(&self) {
+        let source = self.state.lock().source.clone();
+        if let DiffSource::Orca { client, worktree } = source {
+            let Some(pane) = self.weak.lock().upgrade() else {
+                return;
+            };
+            let unsent = {
+                let s = self.state.lock();
+                build_orca_comments(&s)
+                    .into_iter()
+                    .filter(|comment| comment.sent_at.is_none())
+                    .collect::<Vec<_>>()
+            };
+            if unsent.is_empty() {
+                return;
+            }
+            let text = orca_client::format_diff_comments(&unsent);
+            promise::spawn::spawn(async move {
+                let agent_terminal =
+                    client
+                        .list_terminals(Some(&worktree))
+                        .await
+                        .ok()
+                        .and_then(|terminals| {
+                            terminals
+                                .into_iter()
+                                .find(|t| t.agent_identity.is_some() && t.connected)
+                        });
+                let delivered = match agent_terminal {
+                    Some(terminal) => {
+                        match client
+                            .send_terminal(&terminal.handle, &text, true, true)
+                            .await
+                        {
+                            Ok(send) if send.accepted => true,
+                            Ok(send) => {
+                                log::warn!("orca refused review notes: {:?}", send.refused_reason);
+                                false
+                            }
+                            Err(err) => {
+                                log::error!("orca: failed to send review notes: {err:#}");
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        pane.send_payload(text);
+                        true
+                    }
+                };
+                if delivered {
+                    let now = epoch_ms();
+                    pane.mutate(|s| {
+                        for comment in s.annotations.values_mut() {
+                            if let Some(remote) = &mut comment.remote {
+                                if remote.sent_at.is_none() {
+                                    remote.sent_at = Some(now);
+                                }
+                            }
+                        }
+                    });
+                    pane.persist_orca();
+                }
+            })
+            .detach();
+            return;
+        }
         let payload = build_comment_payload(&self.state.lock().annotations);
         self.send_payload(payload);
+    }
+
+    fn persist_orca(&self) {
+        let (client, selector, payload) = {
+            let s = self.state.lock();
+            let DiffSource::Orca { client, .. } = &s.source else {
+                return;
+            };
+            let Some(meta) = &s.orca else {
+                return;
+            };
+            (
+                client.clone(),
+                meta.worktree_selector.clone(),
+                build_orca_comments(&s),
+            )
+        };
+        promise::spawn::spawn(async move {
+            if let Err(err) = client.set_diff_comments(&selector, &payload).await {
+                log::error!("orca: failed to persist review notes: {err:#}");
+            }
+        })
+        .detach();
     }
 
     fn current_anchor(&self, s: &ReviewState) -> Option<LineAnchor> {
@@ -1080,6 +1229,7 @@ impl ReviewPane {
                 }
             }
         });
+        self.persist_orca();
     }
 
     fn clear_comments(&self) {
@@ -1090,6 +1240,7 @@ impl ReviewPane {
                 s.rebuild_rows();
             }
         });
+        self.persist_orca();
     }
 
     fn refresh_clear(&self) {
@@ -1112,11 +1263,23 @@ impl ReviewPane {
                 if text.is_empty() {
                     s.annotations.remove(&edit.anchor);
                 } else {
+                    let remote = s
+                        .annotations
+                        .get(&edit.anchor)
+                        .and_then(|c| c.remote.clone())
+                        .map(|mut remote| {
+                            remote.sent_at = None;
+                            remote
+                        })
+                        .or_else(|| {
+                            matches!(s.source, DiffSource::Orca { .. }).then(RemoteNote::fresh)
+                        });
                     s.annotations.insert(
                         edit.anchor,
                         Comment {
                             body: text,
                             line_text: edit.line_text,
+                            remote,
                         },
                     );
                 }
@@ -1124,6 +1287,7 @@ impl ReviewPane {
                 s.rebuild_rows();
             }
         });
+        self.persist_orca();
     }
 
     fn edit_apply<F: FnOnce(&mut EditState)>(&self, f: F) {
@@ -1344,6 +1508,42 @@ impl ReviewPane {
                     Self::apply_compute_result(&pane, seq, reset_view, mode, result, message);
                 });
             }
+            DiffSource::Orca { client, worktree } => {
+                Self::start_orca_watch(&pane, client.clone(), worktree.clone());
+                promise::spawn::spawn(async move {
+                    match orca_source::fetch(client, worktree, mode.clone()).await {
+                        Ok(fetched) => {
+                            let orca_source::OrcaComputed {
+                                computed,
+                                meta,
+                                comments,
+                            } = fetched;
+                            Self::apply_compute_result(
+                                &pane,
+                                seq,
+                                reset_view,
+                                mode,
+                                Ok(computed),
+                                None,
+                            );
+                            {
+                                let mut state = pane.state.lock();
+                                if state.compute_seq == seq {
+                                    state.orca = Some(meta);
+                                    seed_orca_annotations(&mut state, comments);
+                                    state.rebuild_rows();
+                                    state.seqno += 1;
+                                }
+                            }
+                            pane.window.invalidate();
+                        }
+                        Err(err) => {
+                            Self::apply_compute_result(&pane, seq, reset_view, mode, Err(err), None)
+                        }
+                    }
+                })
+                .detach();
+            }
             DiffSource::Paseo { client, cwd } => {
                 promise::spawn::spawn(async move {
                     let events = client.events();
@@ -1421,6 +1621,52 @@ impl ReviewPane {
         pane.window.invalidate();
     }
 
+    fn start_orca_watch(pane: &Arc<ReviewPane>, client: OrcaClient, worktree: String) {
+        {
+            let mut watch = pane.orca_watch.lock();
+            if watch.started {
+                return;
+            }
+            watch.started = true;
+        }
+        let weak = Arc::downgrade(pane);
+        promise::spawn::spawn(async move {
+            let Ok(events) = client.subscribe_files_watch(&worktree).await else {
+                if let Some(pane) = weak.upgrade() {
+                    pane.orca_watch.lock().started = false;
+                }
+                return;
+            };
+            while let Ok(event) = events.recv_async().await {
+                let Some(pane) = weak.upgrade() else {
+                    break;
+                };
+                if let Some(subscription) = event.subscription_id {
+                    pane.orca_watch.lock().subscription = Some(subscription);
+                }
+                if event.kind != "changed" {
+                    continue;
+                }
+                smol::Timer::after(Duration::from_millis(500)).await;
+                while events.try_recv().is_ok() {}
+                let skip = {
+                    let s = pane.state.lock();
+                    s.dead || s.editing.is_some() || s.find.is_some()
+                };
+                if skip {
+                    continue;
+                }
+                pane.recompute(false);
+            }
+            if let Some(pane) = weak.upgrade() {
+                let mut watch = pane.orca_watch.lock();
+                watch.started = false;
+                watch.subscription = None;
+            }
+        })
+        .detach();
+    }
+
     async fn watch_diff_updates(
         weak: Weak<ReviewPane>,
         client: PaseoClient,
@@ -1496,6 +1742,52 @@ impl ReviewPane {
 
         let host = match source {
             DiffSource::LocalGit(host) => host,
+            DiffSource::Orca { client, .. } => {
+                let meta = pane.state.lock().orca.clone();
+                let Some(meta) = meta else {
+                    return;
+                };
+                promise::spawn::spawn(async move {
+                    let result = orca_source::fetch_one(client, meta, path.clone(), status).await;
+                    {
+                        let mut s = pane.state.lock();
+                        if s.compute_seq != seq {
+                            return;
+                        }
+                        match result {
+                            Ok(file) => {
+                                let still_oversized = file.oversized;
+                                s.highlights.remove(&path);
+                                if let Some(data) = &mut s.data {
+                                    if let Some(slot) =
+                                        data.files.iter_mut().find(|f| f.file_path == path)
+                                    {
+                                        *slot = file;
+                                    }
+                                    data.recompute_totals();
+                                }
+                                if still_oversized {
+                                    s.file_loads.insert(
+                                        path.clone(),
+                                        FileLoad::Failed("file too large to display".to_string()),
+                                    );
+                                } else {
+                                    s.file_loads.remove(&path);
+                                }
+                            }
+                            Err(err) => {
+                                s.file_loads
+                                    .insert(path.clone(), FileLoad::Failed(format!("{err:#}")));
+                            }
+                        }
+                        s.seqno += 1;
+                        s.rebuild_rows();
+                    }
+                    pane.window.invalidate();
+                })
+                .detach();
+                return;
+            }
             DiffSource::Paseo { .. } => {
                 let mut s = pane.state.lock();
                 if s.compute_seq == seq {
@@ -1660,6 +1952,102 @@ fn line_anchor(file: &str, line: &git_review::DiffLine) -> Option<LineAnchor> {
             line: n,
         }),
     }
+}
+
+fn line_text_at(data: &GitDiffData, file: &str, line: usize) -> Option<String> {
+    let file = data.files.iter().find(|f| f.file_path == file)?;
+    for hunk in &file.hunks {
+        for diff_line in &hunk.lines {
+            if diff_line.new_line_number == Some(line)
+                && diff_line.line_type != DiffLineType::Delete
+            {
+                return Some(diff_line.text.clone());
+            }
+        }
+    }
+    None
+}
+
+fn seed_orca_annotations(state: &mut ReviewState, comments: Vec<DiffComment>) {
+    state.annotations.clear();
+    for comment in comments {
+        let anchor = LineAnchor {
+            file: comment.file_path.clone(),
+            side: Side::New,
+            line: comment.line_number as usize,
+        };
+        let line_text = state
+            .data
+            .as_ref()
+            .and_then(|data| line_text_at(data, &anchor.file, anchor.line))
+            .unwrap_or_default();
+        state.annotations.insert(
+            anchor,
+            Comment {
+                body: comment.body,
+                line_text,
+                remote: Some(RemoteNote {
+                    id: comment.id,
+                    created_at: comment.created_at,
+                    sent_at: comment.sent_at,
+                    source: comment.source,
+                    selected_text: comment.selected_text,
+                    start_line: comment.start_line,
+                }),
+            },
+        );
+    }
+}
+
+fn modified_side_line(data: Option<&GitDiffData>, anchor: &LineAnchor) -> u32 {
+    if anchor.side == Side::New {
+        return anchor.line as u32;
+    }
+    data.and_then(|data| data.files.iter().find(|f| f.file_path == anchor.file))
+        .and_then(|file| {
+            file.hunks.iter().find(|hunk| {
+                anchor.line >= hunk.old_start_line
+                    && anchor.line < hunk.old_start_line + hunk.old_line_count.max(1)
+            })
+        })
+        .map(|hunk| hunk.new_start_line as u32)
+        .unwrap_or(anchor.line as u32)
+}
+
+fn build_orca_comments(state: &ReviewState) -> Vec<DiffComment> {
+    let Some(meta) = &state.orca else {
+        return Vec::new();
+    };
+    let mut comments = Vec::new();
+    for (anchor, comment) in &state.annotations {
+        let Some(remote) = &comment.remote else {
+            continue;
+        };
+        let file_meta = meta.files.get(&anchor.file);
+        comments.push(DiffComment {
+            id: remote.id.clone(),
+            worktree_id: meta.worktree_id.clone(),
+            file_path: anchor.file.clone(),
+            source: remote.source.clone(),
+            selected_text: remote.selected_text.clone(),
+            start_line: remote.start_line,
+            line_number: modified_side_line(state.data.as_ref(), anchor),
+            body: comment.body.clone(),
+            created_at: remote.created_at,
+            updated_at: None,
+            sent_at: remote.sent_at,
+            scope: file_meta.map(|m| m.scope),
+            old_path: file_meta.and_then(|m| m.old_path.clone()),
+            diff_identity: file_meta.map(|m| m.identity.clone()),
+            side: "modified".to_owned(),
+        });
+    }
+    comments.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line_number.cmp(&b.line_number))
+    });
+    comments
 }
 
 fn build_send_payload(
@@ -2278,6 +2666,7 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
         writer: Mutex::new(Vec::new()),
         window: window.clone(),
         weak: Mutex::new(Weak::new()),
+        orca_watch: Mutex::new(OrcaWatch::default()),
         state: Mutex::new(ReviewState {
             status: LoadStatus::Loading,
             mode: config_mode_to_diff(&args.mode),
@@ -2297,6 +2686,7 @@ pub fn open_review_pane(term_window: &mut TermWindow, args: &ReviewPaneArgs) -> 
             compute_seq: 0,
             compute_started: None,
             annotations: HashMap::new(),
+            orca: None,
             collapsed: HashSet::new(),
             find: None,
             editing: None,
@@ -2367,6 +2757,15 @@ fn trim_trailing_slash(mut path: String) -> String {
 
 fn resolve_source_location(source: &Arc<dyn Pane>) -> (DiffSource, String) {
     if let Some(domain) = Mux::get().get_domain(source.domain_id()) {
+        if let Some(orca) = domain.downcast_ref::<orca_mux::OrcaDomain>() {
+            if let Some(client) = orca.client() {
+                if let Some(cwd) = source_cwd(source).filter(|c| !c.is_empty()) {
+                    if let Some(worktree) = orca.worktree_selector_for_cwd(&cwd) {
+                        return (DiffSource::Orca { client, worktree }, cwd);
+                    }
+                }
+            }
+        }
         if let Some(paseo) = domain.downcast_ref::<paseo_mux::PaseoDomain>() {
             if let Some(client) = paseo.client() {
                 if let Some(cwd) = source_cwd(source).filter(|c| !c.is_empty()) {
@@ -3329,6 +3728,7 @@ mod tests {
         Comment {
             body: body.to_string(),
             line_text: String::new(),
+            remote: None,
         }
     }
 
@@ -3471,6 +3871,7 @@ mod tests {
         let comment = Comment {
             body: "magic".to_string(),
             line_text: "let answer = 42;".to_string(),
+            remote: None,
         };
 
         let mut new_data = old_data.clone();

@@ -38,7 +38,12 @@ const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
-fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize) -> Line {
+pub(crate) fn make_line(
+    text: &str,
+    attrs: &CellAttributes,
+    seqno: SequenceNo,
+    cols: usize,
+) -> Line {
     let width = unicode_column_width(text, None);
     let padded = if width < cols {
         format!("{text}{}", " ".repeat(cols - width))
@@ -48,30 +53,30 @@ fn make_line(text: &str, attrs: &CellAttributes, seqno: SequenceNo, cols: usize)
     Line::from_text(&padded, attrs, seqno, None)
 }
 
-fn attr_default() -> CellAttributes {
+pub(crate) fn attr_default() -> CellAttributes {
     CellAttributes::default()
 }
 
-fn attr_dim() -> CellAttributes {
+pub(crate) fn attr_dim() -> CellAttributes {
     let mut a = CellAttributes::default();
     a.set_intensity(Intensity::Half);
     a
 }
 
-fn attr_fg(color: AnsiColor) -> CellAttributes {
+pub(crate) fn attr_fg(color: AnsiColor) -> CellAttributes {
     let mut a = CellAttributes::default();
     a.set_foreground(color);
     a
 }
 
-fn attr_bold_fg(color: AnsiColor) -> CellAttributes {
+pub(crate) fn attr_bold_fg(color: AnsiColor) -> CellAttributes {
     let mut a = CellAttributes::default();
     a.set_intensity(Intensity::Bold);
     a.set_foreground(color);
     a
 }
 
-fn attr_bold() -> CellAttributes {
+pub(crate) fn attr_bold() -> CellAttributes {
     let mut a = CellAttributes::default();
     a.set_intensity(Intensity::Bold);
     a
@@ -854,11 +859,23 @@ enum PickerAction {
 #[derive(Clone)]
 enum PendingCreate {
     Workspace(String),
-    WorktreeBranchOff { cwd: String, base_branch: String },
-    WorktreeCheckout { cwd: String, ref_name: String },
+    WorktreeBranchOff {
+        cwd: String,
+        base_branch: String,
+    },
+    WorktreeCheckout {
+        cwd: String,
+        ref_name: String,
+    },
     NewDirectory(String),
-    CloneRepo { repo: String, target_dir: String },
-    Migrate { cwd: String, attachment: TextAttachment },
+    CloneRepo {
+        repo: String,
+        target_dir: String,
+    },
+    Migrate {
+        cwd: String,
+        attachment: TextAttachment,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -896,36 +913,9 @@ fn crumb_basename(path: &str) -> String {
         .to_string()
 }
 
-struct PickerEntry {
-    dot: Option<(&'static str, AnsiColor)>,
-    indent: bool,
-    label: String,
-    detail: Option<String>,
-    action: PickerAction,
-}
-
-impl PickerEntry {
-    fn plain(label: impl Into<String>, action: PickerAction) -> Self {
-        Self {
-            dot: None,
-            indent: false,
-            label: label.into(),
-            detail: None,
-            action,
-        }
-    }
-}
-
-struct PickerGroup {
-    label: String,
-    collapsed: bool,
-    entries: Vec<PickerEntry>,
-}
-
-enum PickerRow {
-    Header(usize),
-    Entry(usize, usize),
-}
+type PickerEntry = crate::picker::PickerEntry<PickerAction>;
+type PickerGroup = crate::picker::PickerGroup<PickerAction>;
+use crate::picker::PickerRow;
 
 #[derive(Clone, Copy, PartialEq)]
 enum InputKind {
@@ -995,16 +985,7 @@ struct PickerState {
 
 impl PickerState {
     fn visible_rows(&self) -> Vec<PickerRow> {
-        let mut rows = Vec::new();
-        for (gi, group) in self.groups.iter().enumerate() {
-            rows.push(PickerRow::Header(gi));
-            if !group.collapsed {
-                for ei in 0..group.entries.len() {
-                    rows.push(PickerRow::Entry(gi, ei));
-                }
-            }
-        }
-        rows
+        crate::picker::visible_rows(&self.groups)
     }
 }
 
@@ -1727,77 +1708,31 @@ impl AgentState {
             }
 
             let selected = picker.selected;
-            let rows = picker.visible_rows();
-            let count = rows.len();
+            let view = crate::picker::browse_view(
+                &picker.title,
+                &picker.crumbs,
+                &picker.groups,
+                selected,
+                cols,
+            );
+            let count = view.count;
+            let sel_row = view.selected_line;
             let mut transcript = Vec::new();
-            transcript.push(AgentRow {
-                text: picker.title.clone(),
-                attrs: attr_bold_fg(AnsiColor::Teal),
-                line: None,
-            });
-            if !picker.crumbs.is_empty() {
-                transcript.push(AgentRow {
-                    text: truncate_to(&picker.crumbs.join("  ›  "), cols),
-                    attrs: attr_dim(),
-                    line: None,
-                });
-            }
-            transcript.push(hr_row(cols));
-            transcript.push(blank_row());
-            if picker.groups.is_empty() {
-                push_wrapped(&mut transcript, "  ", "nothing here", &attr_dim(), cols);
-            }
-            let mut sel_row = transcript.len();
-            for (i, row) in rows.iter().enumerate() {
-                let active = i == selected;
-                if active {
-                    sel_row = transcript.len();
-                }
-                match row {
-                    PickerRow::Header(gi) => {
-                        let group = &picker.groups[*gi];
-                        let glyph = if group.collapsed { "▸" } else { "▾" };
-                        let marker = if active { "❯ " } else { "  " };
-                        let text =
-                            format!("{marker}{glyph} {}  ({})", group.label, group.entries.len());
+            for line in view.lines {
+                match line {
+                    crate::picker::BrowseLine::Plain { text, attrs } => {
                         transcript.push(AgentRow {
-                            text: truncate_to(&text, cols),
-                            attrs: attr_bold_fg(AnsiColor::Teal),
+                            text,
+                            attrs,
                             line: None,
                         });
                     }
-                    PickerRow::Entry(gi, ei) => {
-                        let entry = &picker.groups[*gi].entries[*ei];
-                        let marker: &str = if active { "❯   " } else { "    " };
-                        let marker_attr = if active {
-                            attr_bold_fg(AnsiColor::Teal)
-                        } else {
-                            attr_dim()
-                        };
-                        let name_attr = if active { attr_bold() } else { attr_default() };
-                        let mut used = marker.chars().count() + if entry.indent { 2 } else { 0 };
-                        if entry.dot.is_some() {
-                            used += 2;
-                        }
-                        used += entry.label.chars().count();
-                        let detail = entry
-                            .detail
-                            .as_ref()
-                            .map(|d| truncate_to(d, cols.saturating_sub(used + 5)));
-                        let mut segments: Vec<(&str, CellAttributes)> = vec![(marker, marker_attr)];
-                        if entry.indent {
-                            segments.push(("  ", attr_default()));
-                        }
-                        if let Some((glyph, color)) = entry.dot {
-                            segments.push((glyph, attr_bold_fg(color)));
-                            segments.push((" ", attr_default()));
-                        }
-                        segments.push((entry.label.as_str(), name_attr));
-                        if let Some(detail) = &detail {
-                            segments.push(("  ·  ", attr_dim()));
-                            segments.push((detail.as_str(), attr_dim()));
-                        }
-                        transcript.push(AgentRow::rendered(styled_line(segments)));
+                    crate::picker::BrowseLine::Styled { segments, .. } => {
+                        transcript.push(AgentRow::rendered(styled_line(
+                            segments
+                                .iter()
+                                .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+                        )));
                     }
                 }
             }
@@ -3283,14 +3218,12 @@ impl PaseoAgentPane {
                 *pane.client.lock() = Some(client.clone());
             }
 
-            let alive = smol::future::or(
-                async { client.subscribe_agents().await.is_ok() },
-                async {
+            let alive =
+                smol::future::or(async { client.subscribe_agents().await.is_ok() }, async {
                     smol::Timer::after(CONNECT_PROBE_TIMEOUT).await;
                     false
-                },
-            )
-            .await;
+                })
+                .await;
             let client = if alive {
                 client
             } else {
@@ -4240,11 +4173,8 @@ impl PaseoAgentPane {
                             (*suggestion_selected as isize + delta).rem_euclid(len) as usize;
                     }
                 } else {
-                    let len = picker.visible_rows().len() as isize;
-                    if len > 0 {
-                        picker.selected =
-                            (picker.selected as isize + delta).rem_euclid(len) as usize;
-                    }
+                    picker.selected =
+                        crate::picker::move_selection(&picker.groups, picker.selected, delta);
                 }
             }
             state.rebuild_rows();
