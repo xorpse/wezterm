@@ -11,9 +11,9 @@ use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab, Tab
 use mux::window::WindowId;
 use mux::{Mux, MuxNotification};
 use orca_client::{
-    CreateTerminalOpts, LayoutNode, OrcaClient, PairingOffer, SessionTabsEvent,
-    SplitDirection as OrcaSplitDirection, TerminalSummary, VisualLayout, VisualPaneNode, VisualTab,
-    id_selector,
+    CreateTerminalOpts, LayoutNode, OrcaClient, PairingOffer, ServerDir, SessionTabsEvent,
+    SplitDirection as OrcaSplitDirection, SshConnectionState, SshTargetSummary, TerminalSummary,
+    VisualLayout, VisualPaneNode, VisualTab, WorktreePsSummary, id_selector,
 };
 use parking_lot::Mutex;
 use portable_pty::CommandBuilder;
@@ -362,6 +362,18 @@ pub enum RuntimeTarget {
     Ssh { target: String },
 }
 
+#[derive(Clone, Default)]
+pub struct HubTerminal {
+    pub handle: String,
+    pub worktree_id: String,
+    pub worktree_path: String,
+    pub parent_tab_id: String,
+    pub leaf_id: String,
+    pub title: String,
+    pub agent: Option<String>,
+    pub connected: bool,
+}
+
 pub struct OrcaDomain {
     domain_id: DomainId,
     name: String,
@@ -379,6 +391,11 @@ pub struct OrcaDomain {
     publish_order: Arc<AtomicBool>,
     publish_running: Arc<AtomicBool>,
     publish_subscribed: AtomicBool,
+    relay: Arc<crate::relay_backend::RelayBackend>,
+    relay_mode: AtomicBool,
+    runtime: Mutex<Option<Arc<crate::runtime_backend::RuntimeBackend>>>,
+    runtime_mode: AtomicBool,
+    ssh_attach_claimed: AtomicBool,
 }
 
 impl OrcaDomain {
@@ -396,9 +413,16 @@ impl OrcaDomain {
     }
 
     fn with_target(name: impl Into<String>, target: RuntimeTarget) -> OrcaDomain {
+        let domain_id = alloc_domain_id();
+        let name = name.into();
+        let relay_target = match &target {
+            RuntimeTarget::Ssh { target } => target.clone(),
+            RuntimeTarget::Direct(_) => String::new(),
+        };
+        let relay = crate::relay_backend::RelayBackend::new(domain_id, name.clone(), relay_target);
         OrcaDomain {
-            domain_id: alloc_domain_id(),
-            name: name.into(),
+            domain_id,
+            name,
             target,
             tunnel: Mutex::new(None),
             client: Arc::new(Mutex::new(None)),
@@ -413,11 +437,20 @@ impl OrcaDomain {
             publish_order: Arc::new(AtomicBool::new(false)),
             publish_running: Arc::new(AtomicBool::new(false)),
             publish_subscribed: AtomicBool::new(false),
+            relay,
+            relay_mode: AtomicBool::new(false),
+            runtime: Mutex::new(None),
+            runtime_mode: AtomicBool::new(false),
+            ssh_attach_claimed: AtomicBool::new(false),
         }
     }
 
-    async fn resolve_ssh_offer(&self, target: &str) -> anyhow::Result<PairingOffer> {
-        let runtime = crate::ssh::ensure_remote_runtime(target).await?;
+    async fn resolve_ssh_offer(
+        &self,
+        target: &str,
+        refresh_pairing: bool,
+    ) -> anyhow::Result<PairingOffer> {
+        let runtime = crate::ssh::ensure_remote_runtime(target, refresh_pairing).await?;
         let offer = PairingOffer::parse(&runtime.pairing_url)?;
         let local_port = free_local_port()?;
         self.spawn_tunnel(target, local_port, runtime.remote_port)?;
@@ -461,8 +494,355 @@ impl OrcaDomain {
     }
 
     pub fn project_for_cwd(&self, cwd: &str) -> Option<String> {
+        if self.runtime_mode.load(Ordering::SeqCst) {
+            let runtime = self.runtime.lock().clone();
+            if let Some(runtime) = runtime {
+                return runtime.project_for_cwd(cwd);
+            }
+        }
         self.worktree_for_cwd(cwd)
             .map(|entry| entry.display_name.clone())
+    }
+
+    pub fn is_runtime_mode(&self) -> bool {
+        self.runtime_mode.load(Ordering::SeqCst)
+    }
+
+    fn runtime_backend(&self) -> Option<Arc<crate::runtime_backend::RuntimeBackend>> {
+        if self.runtime_mode.load(Ordering::SeqCst) {
+            self.runtime.lock().clone()
+        } else {
+            None
+        }
+    }
+
+    pub async fn hub_worktree_ps(&self) -> anyhow::Result<Vec<WorktreePsSummary>> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().worktree_ps().await;
+        }
+        Ok(self.ensure_client().await?.worktree_ps().await?)
+    }
+
+    pub async fn hub_list_terminals(&self) -> anyhow::Result<Vec<HubTerminal>> {
+        if let Some(runtime) = self.runtime_backend() {
+            let session = runtime.local_runtime().list_all().await?;
+            return Ok(Self::hub_terminals_from_session(&session));
+        }
+        let terminals = self.ensure_client().await?.list_terminals(None).await?;
+        Ok(terminals
+            .into_iter()
+            .filter(|terminal| terminal.pty_id.is_some())
+            .map(|terminal| {
+                let title = match &terminal.title {
+                    Some(title) if !title.is_empty() => title.clone(),
+                    _ => terminal
+                        .preview
+                        .lines()
+                        .next()
+                        .unwrap_or(&terminal.handle)
+                        .trim()
+                        .to_owned(),
+                };
+                HubTerminal {
+                    handle: terminal.handle,
+                    worktree_id: terminal.worktree_id,
+                    worktree_path: terminal.worktree_path,
+                    parent_tab_id: terminal.tab_id,
+                    leaf_id: terminal.leaf_id,
+                    title,
+                    agent: terminal.agent_identity,
+                    connected: terminal.connected,
+                }
+            })
+            .collect())
+    }
+
+    fn hub_terminals_from_session(session: &serde_json::Value) -> Vec<HubTerminal> {
+        let mut terminals = Vec::new();
+        // The app session can carry stale tabs that point at a PTY already owned by
+        // another tab; a PTY backs exactly one terminal, so keep the first and drop
+        // the rest rather than materialising two panes that fight over it.
+        let mut seen_ptys = HashSet::new();
+        let Some(snapshots) = session.get("snapshots").and_then(|v| v.as_array()) else {
+            return terminals;
+        };
+        for snapshot in snapshots {
+            let key = snapshot
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (worktree_id, worktree_path) = key
+                .split_once("::")
+                .map(|(id, path)| (id.to_owned(), path.to_owned()))
+                .unwrap_or_else(|| (String::new(), key.to_owned()));
+            let Some(tabs) = snapshot.get("tabs").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tab in tabs {
+                let Some(pty_id) = tab.get("ptyId").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !seen_ptys.insert(pty_id.to_owned()) {
+                    continue;
+                }
+                let parent_tab_id = tab
+                    .get("parentTabId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let leaf_id = tab
+                    .get("leafId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let title = tab
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or("terminal")
+                    .to_owned();
+                terminals.push(HubTerminal {
+                    handle: leaf_id.clone(),
+                    worktree_id: worktree_id.clone(),
+                    worktree_path: worktree_path.clone(),
+                    parent_tab_id,
+                    leaf_id,
+                    title,
+                    agent: None,
+                    connected: true,
+                });
+            }
+        }
+        terminals
+    }
+
+    pub async fn hub_ssh_targets(&self) -> anyhow::Result<Vec<SshTargetSummary>> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().ssh_target_summaries().await;
+        }
+        Ok(self.ensure_client().await?.list_ssh_targets().await?)
+    }
+
+    pub async fn hub_ssh_target_state(
+        &self,
+        target_id: &str,
+    ) -> anyhow::Result<Option<SshConnectionState>> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().ssh_target_state(target_id).await;
+        }
+        Ok(self.ensure_client().await?.ssh_target_state(target_id).await?)
+    }
+
+    pub async fn hub_detect_agents(&self) -> anyhow::Result<Vec<String>> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().detect_agents().await;
+        }
+        Ok(self.ensure_client().await?.detect_agents().await.unwrap_or_default())
+    }
+
+    pub async fn hub_spawn_agent(
+        &self,
+        worktree_selector: &str,
+        worktree_path: &str,
+        agent: &str,
+        size: TerminalSize,
+        window_id: WindowId,
+    ) -> anyhow::Result<()> {
+        let pane: Arc<dyn Pane> = if let Some(runtime) = self.runtime_backend() {
+            runtime.spawn_agent(worktree_path, agent).await?
+        } else {
+            let client = self.ensure_client().await?;
+            let tab = client
+                .create_session_terminal(&CreateTerminalOpts {
+                    worktree: worktree_selector.to_owned(),
+                    launch_agent: Some(agent.to_owned()),
+                    ..CreateTerminalOpts::default()
+                })
+                .await?;
+            let terminal = tab.terminal.clone().ok_or_else(|| {
+                anyhow::anyhow!("orca terminal is still provisioning; refresh and open it")
+            })?;
+            self.attach_terminal(
+                &client,
+                TerminalBinding {
+                    terminal,
+                    worktree_selector: worktree_selector.to_owned(),
+                    worktree_path: worktree_path.to_owned(),
+                    parent_tab_id: tab.parent_tab_id.clone(),
+                    leaf_id: tab.leaf_id.clone(),
+                },
+                size,
+            )
+            .await? as Arc<dyn Pane>
+        };
+        let mux = Mux::get();
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)?;
+        mux.add_tab_to_window(&tab, window_id)?;
+        Ok(())
+    }
+
+    pub fn activate_runtime_terminal(&self, parent_tab_id: &str, hub_window: WindowId) -> bool {
+        let mux = Mux::get();
+        let target = mux.iter_panes().into_iter().find_map(|pane| {
+            if pane.domain_id() != self.domain_id {
+                return None;
+            }
+            let relay = pane.downcast_ref::<crate::relay_pane::RelayPane>()?;
+            (relay.parent_tab_id() == parent_tab_id).then(|| pane.pane_id())
+        });
+        let Some(pane_id) = target else {
+            log::info!("orca: no live pane for parent tab {parent_tab_id}");
+            return false;
+        };
+        let Some((_, _, tab_id)) = mux.resolve_pane_id(pane_id) else {
+            return false;
+        };
+        self.move_tab_to_window(tab_id, hub_window);
+        let Some(mut window) = mux.get_window_mut(hub_window) else {
+            return false;
+        };
+        match window.idx_by_id(tab_id) {
+            Some(idx) => {
+                window.set_active_without_saving(idx);
+                drop(window);
+                Mux::notify_from_any_thread(MuxNotification::WindowInvalidated(hub_window));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn move_tab_to_window(&self, tab_id: TabId, target: WindowId) {
+        let mux = Mux::get();
+        let current = mux
+            .iter_windows()
+            .into_iter()
+            .find(|window| mux.get_window(*window).is_some_and(|w| w.idx_by_id(tab_id).is_some()));
+        let Some(current) = current else {
+            return;
+        };
+        if current == target {
+            return;
+        }
+        let Some(mut window) = mux.get_window_mut(current) else {
+            return;
+        };
+        let Some(idx) = window.idx_by_id(tab_id) else {
+            return;
+        };
+        let tab = window.remove_by_idx(idx);
+        drop(window);
+        let _ = mux.add_tab_to_window(&tab, target);
+    }
+
+    pub async fn hub_connect_ssh(
+        &self,
+        target_id: &str,
+    ) -> anyhow::Result<Option<SshConnectionState>> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().connect_ssh_target(target_id).await;
+        }
+        Ok(self
+            .ensure_client()
+            .await?
+            .connect_ssh_target(target_id)
+            .await?)
+    }
+
+    pub async fn hub_open_terminal(&self, parent_tab_id: &str, window: WindowId) -> bool {
+        let Some(runtime) = self.runtime_backend() else {
+            return false;
+        };
+        if runtime.has_tab(parent_tab_id) {
+            return self.activate_runtime_terminal(parent_tab_id, window);
+        }
+        runtime.open_tab(parent_tab_id, window).await
+    }
+
+    pub fn hub_detach_group(&self, parent_tab_ids: &[String]) {
+        if let Some(runtime) = self.runtime_backend() {
+            for parent in parent_tab_ids {
+                runtime.close_tab(parent);
+            }
+            return;
+        }
+        let mux = Mux::get();
+        let panes = mux
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| {
+                pane.domain_id() == self.domain_id
+                    && pane.downcast_ref::<OrcaTerminalPane>().is_some_and(|orca| {
+                        parent_tab_ids.contains(&orca.binding().parent_tab_id)
+                    })
+            })
+            .map(|pane| pane.pane_id())
+            .collect::<Vec<_>>();
+        for pane_id in panes {
+            mux.remove_pane(pane_id);
+        }
+    }
+
+    pub async fn hub_create_worktree(&self, repo: &str, name: &str) -> anyhow::Result<()> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().create_worktree(repo, name).await;
+        }
+        self.ensure_client()
+            .await?
+            .create_worktree(repo, name)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hub_browse_dir(&self, path: &str) -> anyhow::Result<ServerDir> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().browse_server_dir(path).await;
+        }
+        Ok(self.ensure_client().await?.browse_server_dir(path).await?)
+    }
+
+    pub async fn hub_add_repo(&self, path: &str) -> anyhow::Result<()> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().add_repo(path).await;
+        }
+        self.ensure_client().await?.add_repo(path).await?;
+        Ok(())
+    }
+
+    pub async fn hub_clone_repo(&self, url: &str, destination: &str) -> anyhow::Result<()> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().clone_repo(url, destination).await;
+        }
+        self.ensure_client().await?.clone_repo(url, destination).await?;
+        Ok(())
+    }
+
+    pub async fn hub_create_repo(&self, parent: &str, name: &str) -> anyhow::Result<()> {
+        if let Some(runtime) = self.runtime_backend() {
+            return runtime.local_runtime().create_repo(parent, name).await;
+        }
+        self.ensure_client().await?.create_repo(parent, name).await?;
+        Ok(())
+    }
+
+    pub async fn open_runtime_in_new_window(&self, parent_tab_ids: &[String]) -> bool {
+        let Some(runtime) = self.runtime_backend() else {
+            return false;
+        };
+        let builder = Mux::get().new_empty_window(None, None);
+        let new_window = *builder;
+        let mut opened = false;
+        for parent in parent_tab_ids {
+            if runtime.has_tab(parent) {
+                opened |= self.activate_runtime_terminal(parent, new_window);
+            } else {
+                opened |= runtime.open_tab(parent, new_window).await;
+            }
+        }
+        drop(builder);
+        opened
     }
 
     pub fn worktree_selector_for_cwd(&self, cwd: &str) -> Option<String> {
@@ -720,11 +1100,24 @@ impl OrcaDomain {
             return Ok(client);
         }
         self.ensure_layout_publisher();
-        let offer = match &self.target {
-            RuntimeTarget::Direct(offer) => offer.clone(),
-            RuntimeTarget::Ssh { target } => self.resolve_ssh_offer(&target.clone()).await?,
+        let client = match &self.target {
+            RuntimeTarget::Direct(offer) => OrcaClient::connect(offer).await?,
+            RuntimeTarget::Ssh { target } => {
+                let target = target.clone();
+                let offer = self.resolve_ssh_offer(&target, false).await?;
+                match OrcaClient::connect(&offer).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        log::info!(
+                            "orca pairing for {target} was rejected ({err:#}); \
+                             requesting a fresh offer"
+                        );
+                        let offer = self.resolve_ssh_offer(&target, true).await?;
+                        OrcaClient::connect(&offer).await?
+                    }
+                }
+            }
         };
-        let client = OrcaClient::connect(&offer).await?;
         let connection = self.connection.fetch_add(1, Ordering::SeqCst) + 1;
         *self.client.lock() = Some(client.clone());
         *self.state.lock() = DomainState::Attached;
@@ -1369,7 +1762,7 @@ impl OrcaDomain {
         }
     }
 
-    pub(crate) async fn sync_layouts(&self, client: &OrcaClient) -> anyhow::Result<()> {
+    pub async fn sync_layouts(&self, client: &OrcaClient) -> anyhow::Result<()> {
         let _topology = self.topology.lock().await;
         let _applying = ApplyGuard::hold(&self.applying);
         let list = client.list_terminals_with_layouts(None).await?;
@@ -1533,6 +1926,15 @@ impl Domain for OrcaDomain {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
+        if self.runtime_mode.load(Ordering::SeqCst) {
+            let runtime = self.runtime.lock().clone();
+            if let Some(runtime) = runtime {
+                return runtime.spawn_pane(size, command_dir).await;
+            }
+        }
+        if self.relay_mode.load(Ordering::SeqCst) {
+            return self.relay.spawn_pane(size, command_dir).await;
+        }
         let client = self.ensure_client().await?;
         let cwd = command_dir.ok_or_else(|| {
             anyhow::anyhow!("orca domain {} needs a working directory", self.name)
@@ -1592,6 +1994,20 @@ impl Domain for OrcaDomain {
         pane_id: mux::pane::PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
+        if self.runtime_mode.load(Ordering::SeqCst) {
+            let runtime = self.runtime.lock().clone();
+            if let Some(runtime) = runtime {
+                return runtime
+                    .split_pane(source, tab, pane_id, split_request)
+                    .await;
+            }
+        }
+        if self.relay_mode.load(Ordering::SeqCst) {
+            return self
+                .relay
+                .split_pane(source, tab, pane_id, split_request)
+                .await;
+        }
         let mux = Mux::get();
         let tab = mux
             .get_tab(tab)
@@ -1690,6 +2106,51 @@ impl Domain for OrcaDomain {
     }
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
+        if let RuntimeTarget::Ssh { target } = &self.target {
+            if self.ssh_attach_claimed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(runtime) =
+                crate::runtime_backend::RuntimeBackend::discover(self.domain_id, &self.name, target)
+                    .await
+            {
+                match runtime.attach(window_id).await {
+                    Ok(()) => {
+                        *self.runtime.lock() = Some(runtime);
+                        self.runtime_mode.store(true, Ordering::SeqCst);
+                        *self.attach_window.lock() = window_id;
+                        *self.state.lock() = DomainState::Attached;
+                        log::info!("orca domain {} using local-runtime mode", self.name);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "orca domain {} local-runtime attach failed ({err:#}); \
+                             falling back",
+                            self.name
+                        );
+                    }
+                }
+            }
+            if crate::ssh::has_live_relay(target).await {
+                self.relay_mode.store(true, Ordering::SeqCst);
+                match self.relay.attach(window_id).await {
+                    Ok(()) => {
+                        *self.attach_window.lock() = window_id;
+                        *self.state.lock() = DomainState::Attached;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "orca domain {} relay attach failed ({err:#}); falling back to orcad",
+                            self.name
+                        );
+                        self.relay_mode.store(false, Ordering::SeqCst);
+                        self.relay.detach();
+                    }
+                }
+            }
+        }
         log::info!("orca domain {} connecting", self.name);
         let client = self.ensure_client().await?;
         self.refresh_worktrees(&client).await?;
@@ -1785,10 +2246,35 @@ impl Domain for OrcaDomain {
     }
 
     fn detach(&self) -> anyhow::Result<()> {
+        self.ssh_attach_claimed.store(false, Ordering::SeqCst);
+        if self.runtime_mode.swap(false, Ordering::SeqCst) {
+            if let Some(runtime) = self.runtime.lock().take() {
+                runtime.detach();
+            }
+            *self.attach_window.lock() = None;
+            *self.state.lock() = DomainState::Detached;
+            return Ok(());
+        }
+        if self.relay_mode.swap(false, Ordering::SeqCst) {
+            self.relay.detach();
+            *self.attach_window.lock() = None;
+            *self.state.lock() = DomainState::Detached;
+            return Ok(());
+        }
         self.reset_client();
         self.attached_terminals.lock().clear();
         *self.attach_window.lock() = None;
         self.stop_tunnel();
+        let mux = Mux::get();
+        let panes = mux
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| pane.domain_id() == self.domain_id)
+            .map(|pane| pane.pane_id())
+            .collect::<Vec<_>>();
+        for pane_id in panes {
+            mux.remove_pane(pane_id);
+        }
         Ok(())
     }
 

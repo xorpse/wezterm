@@ -370,6 +370,9 @@ pub struct Config {
     pub orca_orcad_dir: Option<String>,
 
     #[dynamic(default)]
+    pub orca_remote_data_dirs: Vec<String>,
+
+    #[dynamic(default)]
     pub paseo_daemons: Vec<PaseoDaemon>,
 
     #[dynamic(default)]

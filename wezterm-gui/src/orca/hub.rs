@@ -16,8 +16,8 @@ use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab as MuxTab};
 use mux::window::WindowId;
 use mux::Mux;
-use orca_client::{id_selector, CreateTerminalOpts, OrcaClient, PairingOffer, RuntimeEvent};
-use orca_mux::{OrcaDomain, TerminalBinding};
+use orca_client::{id_selector, OrcaClient, PairingOffer, RuntimeEvent};
+use orca_mux::{HubTerminal, OrcaDomain, TerminalBinding};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
 use termwiz::cell::CellAttributes;
@@ -300,8 +300,22 @@ impl HubState {
                     .as_deref()
                     .map(|a| format!(" · {a}"))
                     .unwrap_or_default();
+                let same_tab = |other: Option<&TerminalRow>| {
+                    other.is_some_and(|other| {
+                        !terminal.parent_tab_id.is_empty()
+                            && other.parent_tab_id == terminal.parent_tab_id
+                    })
+                };
+                let joins_previous = ti > 0 && same_tab(group.terminals.get(ti - 1));
+                let joins_next = same_tab(group.terminals.get(ti + 1));
+                let rail = match (joins_previous, joins_next) {
+                    (false, false) => "",
+                    (false, true) => "┌ ",
+                    (true, true) => "├ ",
+                    (true, false) => "└ ",
+                };
                 rows.push(HubRow {
-                    text: format!("  {glyph} {}{agent}", terminal.title),
+                    text: format!("  {rail}{glyph} {}{agent}", terminal.title),
                     attrs: attr_default(),
                     kind: RowKind::Terminal(gi, ti),
                 });
@@ -346,7 +360,7 @@ impl HubState {
         });
         rows.push(HubRow {
             text:
-                "enter open · T split · t terminal · n agent · a repo · c worktree · p actions · o fold · + runtime · r refresh · q close"
+                "enter open · S-enter window · d detach · T split · t terminal · n agent · a repo · c worktree · p actions · o fold · + runtime · r refresh · q close"
                     .to_owned(),
             attrs: attr_dim(),
             kind: RowKind::Static,
@@ -510,48 +524,64 @@ impl OrcaHubPane {
         let orca = domain
             .downcast_ref::<OrcaDomain>()
             .ok_or_else(|| anyhow!("hub pane is not bound to an orca domain"))?;
-        let client = orca.ensure_client().await?;
+        let summaries = orca.hub_worktree_ps().await?;
+        let terminals = orca.hub_list_terminals().await?;
+        let agents = orca.hub_detect_agents().await.unwrap_or_default();
 
-        let summaries = client.worktree_ps().await?;
-        let terminals = client.list_terminals(None).await?;
-        let agents = client.detect_agents().await.unwrap_or_default();
-
-        let mut by_worktree: HashMap<String, Vec<TerminalRow>> = HashMap::new();
+        let mut by_worktree: HashMap<String, Vec<HubTerminal>> = HashMap::new();
         for terminal in terminals {
-            if terminal.pty_id.is_none() {
-                continue;
-            }
-            let title = match &terminal.title {
-                Some(title) if !title.is_empty() => title.clone(),
-                _ => terminal
-                    .preview
-                    .lines()
-                    .next()
-                    .unwrap_or(&terminal.handle)
-                    .trim()
-                    .to_owned(),
-            };
             by_worktree
-                .entry(terminal.worktree_id.clone())
+                .entry(terminal.worktree_path.clone())
                 .or_default()
-                .push(TerminalRow {
-                    parent_tab_id: terminal.tab_id.clone(),
-                    leaf_id: terminal.leaf_id.clone(),
-                    handle: terminal.handle,
-                    worktree_selector: id_selector(&terminal.worktree_id),
-                    worktree_path: terminal.worktree_path,
-                    title,
-                    agent: terminal.agent_identity,
-                    connected: terminal.connected,
-                });
+                .push(terminal);
         }
 
+        let prior_fold = {
+            let state = self.state.lock();
+            state
+                .groups
+                .iter()
+                .map(|group| (group.selector.clone(), group.folded))
+                .collect::<Vec<_>>()
+        };
         let mut groups = Vec::new();
         for summary in summaries {
             if summary.is_archived {
                 continue;
             }
-            let terminals = by_worktree.remove(&summary.worktree_id).unwrap_or_default();
+            let selector = id_selector(&summary.worktree_id);
+            // Groups start folded; a group the user has already toggled keeps its
+            // state across refreshes.
+            let is_folded = prior_fold
+                .iter()
+                .find(|(other, _)| *other == selector)
+                .map(|(_, folded)| *folded)
+                .unwrap_or(true);
+            let mut terminals = by_worktree
+                .remove(&summary.path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|terminal| TerminalRow {
+                    parent_tab_id: terminal.parent_tab_id,
+                    leaf_id: terminal.leaf_id,
+                    handle: terminal.handle,
+                    worktree_selector: selector.clone(),
+                    worktree_path: summary.path.clone(),
+                    title: terminal.title,
+                    agent: terminal.agent,
+                    connected: terminal.connected,
+                })
+                .collect::<Vec<_>>();
+            let tab_order = terminals
+                .iter()
+                .map(|terminal| terminal.parent_tab_id.clone())
+                .collect::<Vec<_>>();
+            terminals.sort_by_key(|terminal| {
+                tab_order
+                    .iter()
+                    .position(|tab| *tab == terminal.parent_tab_id)
+                    .unwrap_or(usize::MAX)
+            });
             let branch = summary
                 .branch
                 .strip_prefix("refs/heads/")
@@ -566,20 +596,20 @@ impl OrcaHubPane {
                 summary.display_name
             };
             groups.push(WorktreeGroup {
-                selector: id_selector(&summary.worktree_id),
+                selector,
                 cwd: summary.path,
                 display,
                 branch,
                 status: summary.status,
-                folded: false,
+                folded: is_folded,
                 terminals,
             });
         }
 
         let mut ssh_hosts = Vec::new();
-        for target in client.list_ssh_targets().await.unwrap_or_default() {
-            let status = client
-                .ssh_target_state(&target.id)
+        for target in orca.hub_ssh_targets().await.unwrap_or_default() {
+            let status = orca
+                .hub_ssh_target_state(&target.id)
                 .await
                 .ok()
                 .flatten()
@@ -599,9 +629,45 @@ impl OrcaHubPane {
             state.agents = agents;
             state.ssh_hosts = ssh_hosts;
         });
-        self.spawn_watch(client.clone());
-        self.spawn_tabs_watch(client);
+        if orca.is_runtime_mode() {
+            self.spawn_runtime_watch();
+        } else {
+            let client = orca.ensure_client().await?;
+            self.spawn_watch(client.clone());
+            self.spawn_tabs_watch(client);
+        }
         Ok(())
+    }
+
+    fn spawn_runtime_watch(self: &Arc<Self>) {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        promise::spawn::spawn(async move {
+            loop {
+                smol::Timer::after(Duration::from_millis(1500)).await;
+                let Some(pane) = weak.upgrade() else {
+                    return;
+                };
+                let runtime_mode = pane
+                    .domain()
+                    .and_then(|domain| {
+                        domain
+                            .downcast_ref::<OrcaDomain>()
+                            .map(OrcaDomain::is_runtime_mode)
+                    })
+                    .unwrap_or(false);
+                if !runtime_mode {
+                    pane.watching.store(false, Ordering::SeqCst);
+                    return;
+                }
+                if let Err(err) = pane.refresh().await {
+                    pane.set_status(format!("orca: {err:#}"));
+                }
+            }
+        })
+        .detach();
     }
 
     fn spawn_tabs_watch(self: &Arc<Self>, client: OrcaClient) {
@@ -722,8 +788,89 @@ impl OrcaHubPane {
                 };
                 self.open_terminal(terminal, split);
             }
-            RowKind::Group(_) => self.new_terminal(group, split),
+            RowKind::Group(_) if split => self.new_terminal(group, true),
+            RowKind::Group(_) => self.open_group(group),
             RowKind::SshHost(_) | RowKind::Static => {}
+        }
+    }
+
+    fn open_group(self: &Arc<Self>, group: WorktreeGroup) {
+        if group.terminals.is_empty() {
+            self.new_terminal(group, false);
+            return;
+        }
+        for terminal in group.terminals {
+            self.open_terminal(terminal, false);
+        }
+    }
+
+    fn group_parents(&self, group: &WorktreeGroup) -> Vec<String> {
+        let mut parents = Vec::new();
+        for terminal in &group.terminals {
+            if !parents.contains(&terminal.parent_tab_id) {
+                parents.push(terminal.parent_tab_id.clone());
+            }
+        }
+        parents
+    }
+
+    fn open_selected_new_window(self: &Arc<Self>) {
+        let Some((kind, group)) = self.selected() else {
+            return;
+        };
+        let parents = match kind {
+            RowKind::Terminal(_, ti) => group
+                .terminals
+                .get(ti)
+                .map(|terminal| vec![terminal.parent_tab_id.clone()])
+                .unwrap_or_default(),
+            RowKind::Group(_) => self.group_parents(&group),
+            RowKind::SshHost(_) | RowKind::Static => return,
+        };
+        if parents.is_empty() {
+            self.set_status("nothing to open in a new window");
+            return;
+        }
+        let Some(domain) = self.domain() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        promise::spawn::spawn(async move {
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
+                return;
+            };
+            if !orca.open_runtime_in_new_window(&parents).await {
+                pane.set_status("terminal is still attaching; try again shortly");
+            }
+        })
+        .detach();
+    }
+
+    fn detach_selected(self: &Arc<Self>) {
+        let Some((kind, group)) = self.selected() else {
+            return;
+        };
+        let parents = match kind {
+            RowKind::Terminal(_, ti) => group
+                .terminals
+                .get(ti)
+                .map(|terminal| vec![terminal.parent_tab_id.clone()])
+                .unwrap_or_default(),
+            RowKind::Group(_) => self.group_parents(&group),
+            RowKind::SshHost(_) | RowKind::Static => return,
+        };
+        if parents.is_empty() {
+            self.set_status("nothing to detach");
+            return;
+        }
+        if let Some(domain) = self.domain() {
+            if let Some(orca) = domain.downcast_ref::<OrcaDomain>() {
+                orca.hub_detach_group(&parents);
+                self.set_status(format!("detached {}", group.display));
+            }
         }
     }
 
@@ -751,6 +898,15 @@ impl OrcaHubPane {
         let orca = domain
             .downcast_ref::<OrcaDomain>()
             .ok_or_else(|| anyhow!("hub pane is not bound to an orca domain"))?;
+        if orca.is_runtime_mode() {
+            if !orca
+                .hub_open_terminal(&terminal.parent_tab_id, self.mux_window_id)
+                .await
+            {
+                self.set_status("terminal is still attaching; try again shortly");
+            }
+            return Ok(());
+        }
         let client = orca.ensure_client().await?;
         let size = self.state.lock().size;
         let mux = Mux::get();
@@ -810,6 +966,9 @@ impl OrcaHubPane {
             mux.add_tab_and_active_pane(&tab)?;
             mux.add_tab_to_window(&tab, self.mux_window_id)?;
         }
+        if let Err(err) = orca.sync_layouts(&client).await {
+            log::warn!("orca: post-open layout sync failed: {err:#}");
+        }
         Ok(())
     }
 
@@ -867,14 +1026,7 @@ impl OrcaHubPane {
             let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
                 return;
             };
-            let client = match orca.ensure_client().await {
-                Ok(client) => client,
-                Err(err) => {
-                    pane.set_status(format!("orca: {err:#}"));
-                    return;
-                }
-            };
-            match client.connect_ssh_target(&host.id).await {
+            match orca.hub_connect_ssh(&host.id).await {
                 Ok(state) => {
                     let status = state
                         .map(|state| state.status)
@@ -891,9 +1043,9 @@ impl OrcaHubPane {
         .detach();
     }
 
-    fn with_client<F>(self: &Arc<Self>, action: F)
+    fn spawn_domain_action<F>(self: &Arc<Self>, action: F)
     where
-        F: FnOnce(Arc<OrcaHubPane>, OrcaClient) -> futures::future::BoxFuture<'static, ()>
+        F: FnOnce(Arc<OrcaHubPane>, Arc<dyn Domain>) -> futures::future::BoxFuture<'static, ()>
             + 'static,
     {
         let Some(domain) = self.domain() else {
@@ -905,17 +1057,7 @@ impl OrcaHubPane {
             let Some(pane) = weak.upgrade() else {
                 return;
             };
-            let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
-                return;
-            };
-            let client = match orca.ensure_client().await {
-                Ok(client) => client,
-                Err(err) => {
-                    pane.set_status(format!("orca: {err:#}"));
-                    return;
-                }
-            };
-            action(pane, client).await;
+            action(pane, domain).await;
         })
         .detach();
     }
@@ -926,9 +1068,12 @@ impl OrcaHubPane {
             return;
         }
         self.set_status(format!("adding repo {value}…"));
-        self.with_client(move |pane, client| {
+        self.spawn_domain_action(move |pane, domain| {
             Box::pin(async move {
-                match client.add_repo(&value).await {
+                let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
+                    return;
+                };
+                match orca.hub_add_repo(&value).await {
                     Ok(()) => {
                         pane.set_status(format!("added repo {value}; create a worktree with c"));
                     }
@@ -1149,9 +1294,6 @@ impl OrcaHubPane {
             let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
                 return;
             };
-            let Ok(client) = orca.ensure_client().await else {
-                return;
-            };
             let (dir, prefix) = match buffer.rsplit_once('/') {
                 Some((dir, prefix)) => (
                     if dir.is_empty() { "/" } else { dir }.to_owned(),
@@ -1159,7 +1301,7 @@ impl OrcaHubPane {
                 ),
                 None => (String::new(), buffer.clone()),
             };
-            let Ok(listing) = client.browse_server_dir(&dir).await else {
+            let Ok(listing) = orca.hub_browse_dir(&dir).await else {
                 return;
             };
             let prefix_lower = prefix.to_lowercase();
@@ -1327,15 +1469,25 @@ impl OrcaHubPane {
             format!("path:{repo}")
         };
         self.set_status(format!("creating worktree {name}…"));
-        self.with_client(move |pane, client| {
-            Box::pin(async move {
-                match client.create_worktree(&selector, &name).await {
-                    Ok(()) => pane.set_status(format!("created worktree {name}")),
-                    Err(err) => pane.set_status(format!("worktree create: {err}")),
-                }
-                let _ = pane.refresh().await;
-            })
-        });
+        let weak = Arc::downgrade(self);
+        let Some(domain) = self.domain() else {
+            self.set_status("no orca runtime; press + to pair one");
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
+                return;
+            };
+            match orca.hub_create_worktree(&selector, &name).await {
+                Ok(()) => pane.set_status(format!("created worktree {name}")),
+                Err(err) => pane.set_status(format!("worktree create: {err}")),
+            }
+            let _ = pane.refresh().await;
+        })
+        .detach();
     }
 
     fn run_clone_repo(self: &Arc<Self>, url: String, destination: String) {
@@ -1344,9 +1496,12 @@ impl OrcaHubPane {
             return;
         }
         self.set_status(format!("cloning {url}\u{2026}"));
-        self.with_client(move |pane, client| {
+        self.spawn_domain_action(move |pane, domain| {
             Box::pin(async move {
-                match client.clone_repo(&url, &destination).await {
+                let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
+                    return;
+                };
+                match orca.hub_clone_repo(&url, &destination).await {
                     Ok(()) => pane.set_status(format!("cloned into {destination}")),
                     Err(err) => pane.set_status(format!("clone: {err}")),
                 }
@@ -1361,9 +1516,12 @@ impl OrcaHubPane {
             return;
         }
         self.set_status(format!("creating {name}\u{2026}"));
-        self.with_client(move |pane, client| {
+        self.spawn_domain_action(move |pane, domain| {
             Box::pin(async move {
-                match client.create_repo(&parent, &name).await {
+                let Some(orca) = domain.downcast_ref::<OrcaDomain>() else {
+                    return;
+                };
+                match orca.hub_create_repo(&parent, &name).await {
                     Ok(()) => pane.set_status(format!("created {parent}/{name}")),
                     Err(err) => pane.set_status(format!("new repo: {err}")),
                 }
@@ -1449,7 +1607,6 @@ impl OrcaHubPane {
         let orca = domain
             .downcast_ref::<OrcaDomain>()
             .ok_or_else(|| anyhow!("hub pane is not bound to an orca domain"))?;
-        let client = orca.ensure_client().await?;
         let (selector, worktree_path) = self
             .state
             .lock()
@@ -1458,37 +1615,8 @@ impl OrcaHubPane {
             .map(|group| (group.selector.clone(), group.cwd.clone()))
             .ok_or_else(|| anyhow!("worktree is gone"))?;
         let size = self.state.lock().size;
-
-        let tab = client
-            .create_session_terminal(&CreateTerminalOpts {
-                worktree: selector.clone(),
-                launch_agent: Some(agent),
-                ..CreateTerminalOpts::default()
-            })
+        orca.hub_spawn_agent(&selector, &worktree_path, &agent, size, self.mux_window_id)
             .await?;
-        let terminal = tab
-            .terminal
-            .clone()
-            .ok_or_else(|| anyhow!("orca terminal is still provisioning; refresh and open it"))?;
-
-        let pane = orca
-            .attach_terminal(
-                &client,
-                TerminalBinding {
-                    terminal,
-                    worktree_selector: selector,
-                    worktree_path,
-                    parent_tab_id: tab.parent_tab_id.clone(),
-                    leaf_id: tab.leaf_id.clone(),
-                },
-                size,
-            )
-            .await?;
-        let mux = Mux::get();
-        let mux_tab = Arc::new(MuxTab::new(&size));
-        mux_tab.assign_pane(&(pane as Arc<dyn Pane>));
-        mux.add_tab_and_active_pane(&mux_tab)?;
-        mux.add_tab_to_window(&mux_tab, self.mux_window_id)?;
         self.spawn_refresh();
         Ok(())
     }
@@ -1927,8 +2055,10 @@ impl Pane for OrcaHubPane {
                     }
                 });
             }
+            (KeyCode::Enter, KeyModifiers::SHIFT) => this.open_selected_new_window(),
             (KeyCode::Enter, _) => this.open_selected(false),
             (KeyCode::Char('T'), _) => this.open_selected(true),
+            (KeyCode::Char('d'), KeyModifiers::NONE) => this.detach_selected(),
             (KeyCode::Char('t'), KeyModifiers::NONE) => {
                 if let Some((_, group)) = self.selected() {
                     this.new_terminal(group, false);

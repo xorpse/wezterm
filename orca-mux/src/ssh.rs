@@ -9,60 +9,154 @@ const ARTIFACTS: [&str; 3] = [
     "daemon-entry.js",
     "parcel-watcher-process-entry.js",
 ];
-const PROBE_NO_INSTALL: i32 = 3;
-const PROBE_DEAD: i32 = 4;
-
 pub(crate) struct RemoteRuntime {
     pub remote_port: u16,
     pub pairing_url: String,
 }
 
-pub(crate) async fn ensure_remote_runtime(target: &str) -> anyhow::Result<RemoteRuntime> {
-    match probe(target).await? {
-        ProbeResult::Live(readiness) => parse_readiness(target, &readiness),
-        ProbeResult::Dead { version } => {
-            ensure_native(target, &version).await?;
-            relaunch(target, &version).await?;
-            parse_readiness(target, &await_readiness(target, &version).await?)
-        }
-        ProbeResult::NoInstall => {
-            let version = deploy(target).await?;
-            parse_readiness(target, &await_readiness(target, &version).await?)
-        }
+pub(crate) async fn has_live_relay(target: &str) -> bool {
+    let script = r#"
+for s in "$HOME/.orca-remote/"relay-*/relay-*.sock; do
+  [ -e "$s" ] && [ -e "$s.credential" ] || continue
+  if pgrep -u "$(id -u)" -f 'relay.js --detached' >/dev/null 2>&1; then echo yes; exit 0; fi
+done
+echo no
+"#;
+    match ssh_output(target, script).await {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).contains("yes"),
+        Err(_) => false,
     }
 }
 
+pub(crate) async fn ensure_remote_runtime(
+    target: &str,
+    refresh_pairing: bool,
+) -> anyhow::Result<RemoteRuntime> {
+    match probe(target).await? {
+        ProbeResult::Orcad { readiness } => parse_readiness(target, &readiness),
+        ProbeResult::App {
+            metadata_path,
+            dead_version,
+        } => match adopt_app_runtime(target, &metadata_path, refresh_pairing).await {
+            Ok(runtime) => Ok(runtime),
+            Err(err) => {
+                log::warn!(
+                    "orca runtime on {target} cannot be adopted ({err:#}); \
+                     falling back to orcad"
+                );
+                match dead_version {
+                    Some(version) => revive(target, &version).await,
+                    None => bootstrap(target).await,
+                }
+            }
+        },
+        ProbeResult::Dead { version } => revive(target, &version).await,
+        ProbeResult::NoInstall => bootstrap(target).await,
+    }
+}
+
+async fn revive(target: &str, version: &str) -> anyhow::Result<RemoteRuntime> {
+    ensure_native(target, version).await?;
+    relaunch(target, version).await?;
+    parse_readiness(target, &await_readiness(target, version).await?)
+}
+
+async fn bootstrap(target: &str) -> anyhow::Result<RemoteRuntime> {
+    let version = deploy(target).await?;
+    parse_readiness(target, &await_readiness(target, &version).await?)
+}
+
 enum ProbeResult {
-    Live(String),
-    Dead { version: String },
+    Orcad {
+        readiness: String,
+    },
+    App {
+        metadata_path: String,
+        dead_version: Option<String>,
+    },
+    Dead {
+        version: String,
+    },
     NoInstall,
 }
 
 async fn probe(target: &str) -> anyhow::Result<ProbeResult> {
-    let script = r#"
-cd "$HOME/.orca-remote" 2>/dev/null || exit 3
-active=$(sed -n 's/.*"active": *"\([^"]*\)".*/\1/p' orcad-active.json 2>/dev/null || true)
-[ -n "$active" ] || exit 3
-[ -d "orcad-$active" ] || exit 3
-echo "$active"
-pid=$(cat "orcad-$active/orcad.pid" 2>/dev/null)
-if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then exit 4; fi
-head -1 "orcad-$active/.orcad-readiness"
-"#;
-    let output = ssh_output(target, script).await?;
+    let script = format!(
+        r#"
+alive() {{
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null && return 0
+  kill -0 "$1" 2>&1 | grep -qi "not permitted"
+}}
+dead=""
+if cd "$HOME/.orca-remote" 2>/dev/null; then
+  active=$(sed -n 's/.*"active": *"\([^"]*\)".*/\1/p' orcad-active.json 2>/dev/null || true)
+  if [ -n "$active" ] && [ -d "orcad-$active" ]; then
+    pid=$(cat "orcad-$active/.orcad-pid" 2>/dev/null)
+    [ -n "$pid" ] || pid=$(cat "orcad-$active/orcad.pid" 2>/dev/null)
+    if alive "$pid"; then
+      echo orcad
+      head -1 "orcad-$active/.orcad-readiness"
+      exit 0
+    fi
+    dead="$active"
+  fi
+fi
+for data in {candidates}; do
+  meta="$data/orca-runtime.json"
+  [ -f "$meta" ] || continue
+  pid=$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$meta" | head -1)
+  if alive "$pid"; then
+    echo app
+    echo "$meta"
+    echo "$dead"
+    exit 0
+  fi
+done
+if [ -n "$dead" ]; then
+  echo dead
+  echo "$dead"
+  exit 0
+fi
+echo none
+"#,
+        candidates = data_dir_candidates(),
+    );
+    let output = ssh_output(target, &script).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ssh {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    match output.status.code() {
-        Some(0) => {
-            let readiness = stdout
-                .lines()
-                .nth(1)
+    let mut lines = stdout.lines();
+    match lines.next() {
+        Some("orcad") => {
+            let readiness = lines
+                .next()
+                .filter(|line| !line.is_empty())
                 .ok_or_else(|| anyhow!("orcad on {target} reported no readiness"))?;
-            Ok(ProbeResult::Live(readiness.to_owned()))
+            Ok(ProbeResult::Orcad {
+                readiness: readiness.to_owned(),
+            })
         }
-        Some(PROBE_NO_INSTALL) => Ok(ProbeResult::NoInstall),
-        Some(PROBE_DEAD) => {
-            let version = stdout
-                .lines()
+        Some("app") => {
+            let metadata_path = lines
+                .next()
+                .filter(|line| !line.is_empty())
+                .ok_or_else(|| anyhow!("orca runtime metadata path missing on {target}"))?;
+            let dead_version = lines
+                .next()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.to_owned());
+            Ok(ProbeResult::App {
+                metadata_path: metadata_path.to_owned(),
+                dead_version,
+            })
+        }
+        Some("dead") => {
+            let version = lines
                 .next()
                 .filter(|line| !line.is_empty())
                 .ok_or_else(|| anyhow!("orcad activation on {target} is unreadable"))?;
@@ -70,11 +164,140 @@ head -1 "orcad-$active/.orcad-readiness"
                 version: version.to_owned(),
             })
         }
-        _ => anyhow::bail!(
-            "ssh {target} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
+        Some("none") => Ok(ProbeResult::NoInstall),
+        _ => anyhow::bail!("unreadable runtime probe output from {target}"),
     }
+}
+
+fn data_dir_candidates() -> String {
+    let mut words = config::configuration()
+        .orca_remote_data_dirs
+        .iter()
+        .map(|dir| remote_quote(dir))
+        .collect::<Vec<_>>();
+    words.push(r#""$HOME/Library/Application Support/orca""#.to_owned());
+    words.push(r#""${XDG_CONFIG_HOME:-$HOME/.config}/orca""#.to_owned());
+    words.join(" ")
+}
+
+fn remote_quote(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!(r#""$HOME"/{}"#, shell_quote(rest)),
+        None => shell_quote(path),
+    }
+}
+
+const MINT_BRIDGE: &str = r#"
+const fs = require("fs");
+const net = require("net");
+const metaPath = process.argv[1];
+const cachePath = process.argv[2];
+const refresh = process.argv[3] === "refresh";
+function fail(message, code) { console.error(message); process.exit(code); }
+const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+const unix = (meta.transports || []).find(function (t) { return t.kind === "unix"; });
+const ws = (meta.transports || []).find(function (t) { return t.kind === "websocket"; });
+if (!unix || !meta.authToken) {
+  fail("runtime metadata lacks a unix transport or auth token", 3);
+}
+if (!refresh && ws) {
+  try {
+    const cached = JSON.parse(fs.readFileSync(cachePath, "utf8"))[meta.runtimeId];
+    if (cached) {
+      console.log(JSON.stringify({ pairingUrl: cached, endpoint: ws.endpoint }));
+      process.exit(0);
+    }
+  } catch (err) {}
+}
+const socket = net.createConnection(unix.endpoint);
+socket.setEncoding("utf8");
+let buffer = "";
+socket.on("error", function (err) { fail(err.message, 4); });
+socket.on("connect", function () {
+  socket.write(JSON.stringify({
+    id: "wezterm-pairing",
+    method: "pairing.createOffer",
+    params: { name: "wezterm", rotate: refresh },
+    authToken: meta.authToken
+  }) + "\n");
+});
+socket.on("data", function (chunk) {
+  buffer += chunk;
+  let index;
+  while ((index = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const frame = JSON.parse(line);
+    if (frame._keepalive) continue;
+    if (!frame.ok) {
+      const code = frame.error && frame.error.code;
+      if (code === "method_not_found") {
+        fail("the orca runtime predates pairing.createOffer; update orca on the host", 6);
+      }
+      fail((frame.error && frame.error.message) || "pairing offer request failed", 4);
+    }
+    const result = frame.result || {};
+    if (!result.available) {
+      fail(result.guidance || "pairing unavailable", 4);
+    }
+    let cache = {};
+    try { cache = JSON.parse(fs.readFileSync(cachePath, "utf8")); } catch (err) {}
+    cache[meta.runtimeId] = result.pairingUrl;
+    fs.writeFileSync(cachePath, JSON.stringify(cache), { mode: 0o600 });
+    console.log(JSON.stringify({ pairingUrl: result.pairingUrl, endpoint: result.endpoint }));
+    process.exit(0);
+  }
+});
+setTimeout(function () {
+  fail("timed out waiting for the runtime socket", 4);
+}, 10000);
+"#;
+
+async fn adopt_app_runtime(
+    target: &str,
+    metadata_path: &str,
+    refresh_pairing: bool,
+) -> anyhow::Result<RemoteRuntime> {
+    let script = format!(
+        r#"
+umask 077
+mkdir -p "$HOME/.orca-remote"
+{NODE_DISCOVERY}
+[ -n "$node_bin" ] || {{ echo "no node runtime on host" >&2; exit 5; }}
+exec "$node_bin" -e {bridge} {meta} "$HOME/.orca-remote/app-pairing.json" {mode}
+"#,
+        bridge = shell_quote(MINT_BRIDGE),
+        meta = shell_quote(metadata_path),
+        mode = if refresh_pairing { "refresh" } else { "reuse" },
+    );
+    let output = ssh_output(target, &script).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "pairing with the orca runtime on {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_minted_offer(target, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_minted_offer(target: &str, offer: &str) -> anyhow::Result<RemoteRuntime> {
+    let offer = serde_json::from_str::<serde_json::Value>(offer.trim())
+        .map_err(|_| anyhow!("unreadable pairing response from the orca runtime on {target}"))?;
+    let endpoint = offer
+        .get("endpoint")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("pairing offer from {target} carries no endpoint"))?;
+    let remote_port = endpoint_port(endpoint)
+        .ok_or_else(|| anyhow!("unparseable orca endpoint {endpoint} on {target}"))?;
+    let pairing_url = offer
+        .get("pairingUrl")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("pairing offer from {target} carries no pairing URL"))?;
+    Ok(RemoteRuntime {
+        remote_port,
+        pairing_url: pairing_url.to_owned(),
+    })
 }
 
 async fn deploy(target: &str) -> anyhow::Result<String> {
@@ -88,11 +311,7 @@ async fn deploy(target: &str) -> anyhow::Result<String> {
     Ok(version)
 }
 
-async fn ensure_native(target: &str, version: &str) -> anyhow::Result<()> {
-    let script = format!(
-        r#"
-cd "$HOME/.orca-remote/orcad-{version}" || exit 7
-shell_path=$("${{SHELL:-/bin/sh}}" -l -c env 2>/dev/null </dev/null | sed -n 's/^PATH=//p' | tail -1)
+const NODE_DISCOVERY: &str = r#"shell_path=$("${SHELL:-/bin/sh}" -l -c env 2>/dev/null </dev/null | sed -n 's/^PATH=//p' | tail -1)
 [ -n "$shell_path" ] && PATH="$shell_path:$PATH"
 export PATH
 node_bin=""
@@ -102,7 +321,13 @@ for candidate in node /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "
   [ -x "$resolved" ] || continue
   major=$("$resolved" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null) || continue
   if [ "$major" -gt "$node_major" ]; then node_bin="$resolved"; node_major=$major; fi
-done
+done"#;
+
+async fn ensure_native(target: &str, version: &str) -> anyhow::Result<()> {
+    let script = format!(
+        r#"
+cd "$HOME/.orca-remote/orcad-{version}" || exit 7
+{NODE_DISCOVERY}
 [ -n "$node_bin" ] || {{ echo "no node runtime on host" >&2; exit 5; }}
 [ "$node_major" -ge 20 ] || {{ echo "orcad needs node >= 20; newest on host is $node_major" >&2; exit 5; }}
 export PATH="$(dirname "$node_bin"):$PATH"
@@ -245,24 +470,14 @@ async fn relaunch(target: &str, version: &str) -> anyhow::Result<()> {
         r#"
 set -e
 cd "$HOME/.orca-remote/orcad-{version}"
-shell_path=$("${{SHELL:-/bin/sh}}" -l -c env 2>/dev/null </dev/null | sed -n 's/^PATH=//p' | tail -1)
-[ -n "$shell_path" ] && PATH="$shell_path:$PATH"
-export PATH
-node_bin=""
-node_major=0
-for candidate in node /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
-  resolved=$(command -v "$candidate" 2>/dev/null) || resolved="$candidate"
-  [ -x "$resolved" ] || continue
-  major=$("$resolved" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null) || continue
-  if [ "$major" -gt "$node_major" ]; then node_bin="$resolved"; node_major=$major; fi
-done
+{NODE_DISCOVERY}
 [ -n "$node_bin" ] || {{ echo "no node runtime on host" >&2; exit 5; }}
 [ "$node_major" -ge 20 ] || {{ echo "orcad needs node >= 20; newest on host is $node_major" >&2; exit 5; }}
 : > .orcad-readiness
 umask 077
 ORCA_VERSION='{version}' ORCA_USER_DATA="$HOME/.orca-remote/orcad-data" \
   nohup "$node_bin" orcad.js --json --bind 127.0.0.1 > .orcad-readiness 2>> orcad.log < /dev/null &
-echo $! > orcad.pid
+echo $! > .orcad-pid
 "#
     );
     run_ssh(target, &script).await
@@ -293,10 +508,7 @@ fn parse_readiness(target: &str, line: &str) -> anyhow::Result<RemoteRuntime> {
         .get("boundEndpoint")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow!("orcad on {target} reported no bound endpoint"))?;
-    let remote_port = bound
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse::<u16>().ok())
+    let remote_port = endpoint_port(bound)
         .ok_or_else(|| anyhow!("unparseable orcad endpoint {bound} on {target}"))?;
     let pairing = readiness.get("pairing");
     let pairing_url = pairing
@@ -313,6 +525,10 @@ fn parse_readiness(target: &str, line: &str) -> anyhow::Result<RemoteRuntime> {
         remote_port,
         pairing_url: pairing_url.to_owned(),
     })
+}
+
+fn endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint.rsplit(':').next()?.parse::<u16>().ok()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -335,7 +551,7 @@ async fn ssh_output(target: &str, script: &str) -> anyhow::Result<std::process::
         .arg("-oBatchMode=yes")
         .arg("-oConnectTimeout=10")
         .arg(target)
-        .arg(script)
+        .arg(format!("sh -c {}", shell_quote(script)))
         .output()
         .await?)
 }
