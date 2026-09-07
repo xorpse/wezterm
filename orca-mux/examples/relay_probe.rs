@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use serde_json::json;
-
 use orca_mux::relay::RelayConnection;
+use serde_json::json;
 
 fn main() -> anyhow::Result<()> {
     let target = std::env::args()

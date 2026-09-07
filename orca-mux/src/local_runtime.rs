@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use orca_client::{ServerDir, SshConnectionState, SshTargetSummary, WorktreePsSummary};
+use orca_client::{
+    ServerDir, SshConnectionState, SshTargetSummary, TerminalSummary, WorktreePsSummary,
+};
 use serde_json::{Value, json};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -162,6 +164,19 @@ impl LocalRuntime {
         Ok(())
     }
 
+    pub async fn list_terminals(
+        &self,
+        worktree: Option<&str>,
+    ) -> anyhow::Result<Vec<TerminalSummary>> {
+        let mut params = json!({ "includeVisualLayouts": false });
+        if let Some(worktree) = worktree {
+            params["worktree"] = json!(worktree);
+        }
+        let value = self.call("terminal.list", params).await?;
+        let terminals = value.get("terminals").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::from_value(terminals).unwrap_or_default())
+    }
+
     pub async fn add_repo(&self, path: &str) -> anyhow::Result<()> {
         self.call("repo.add", json!({ "path": path })).await?;
         Ok(())
@@ -212,9 +227,12 @@ impl LocalRuntime {
         .await
     }
 
-    pub async fn close_tab(&self, tab_id: &str) -> anyhow::Result<Value> {
-        self.call("session.tabs.close", json!({ "tabId": tab_id }))
-            .await
+    pub async fn split_terminal(&self, terminal: &str, direction: &str) -> anyhow::Result<Value> {
+        self.call(
+            "terminal.split",
+            json!({ "terminal": terminal, "direction": direction }),
+        )
+        .await
     }
 }
 

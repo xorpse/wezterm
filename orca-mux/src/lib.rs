@@ -7,7 +7,6 @@ mod relay_pane;
 mod runtime_backend;
 mod ssh;
 
-pub use local_runtime::LocalRuntime;
-
 pub use domain::{HubTerminal, OrcaDomain};
+pub use local_runtime::LocalRuntime;
 pub use pane::{OrcaTerminalPane, TerminalBinding};

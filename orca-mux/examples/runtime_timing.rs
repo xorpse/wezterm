@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use anyhow::anyhow;
-
 use orca_mux::LocalRuntime;
 
 fn main() -> anyhow::Result<()> {
@@ -21,7 +20,11 @@ async fn run() -> anyhow::Result<()> {
 
         let t = Instant::now();
         let agents = runtime.detect_agents().await?;
-        eprintln!("detectAgents      {:?}  ({} agents)", t.elapsed(), agents.len());
+        eprintln!(
+            "detectAgents      {:?}  ({} agents)",
+            t.elapsed(),
+            agents.len()
+        );
 
         let t = Instant::now();
         let targets = runtime.ssh_target_summaries().await?;

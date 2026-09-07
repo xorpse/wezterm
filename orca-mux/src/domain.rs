@@ -630,14 +630,23 @@ impl OrcaDomain {
         if let Some(runtime) = self.runtime_backend() {
             return runtime.local_runtime().ssh_target_state(target_id).await;
         }
-        Ok(self.ensure_client().await?.ssh_target_state(target_id).await?)
+        Ok(self
+            .ensure_client()
+            .await?
+            .ssh_target_state(target_id)
+            .await?)
     }
 
     pub async fn hub_detect_agents(&self) -> anyhow::Result<Vec<String>> {
         if let Some(runtime) = self.runtime_backend() {
             return runtime.local_runtime().detect_agents().await;
         }
-        Ok(self.ensure_client().await?.detect_agents().await.unwrap_or_default())
+        Ok(self
+            .ensure_client()
+            .await?
+            .detect_agents()
+            .await
+            .unwrap_or_default())
     }
 
     pub async fn hub_spawn_agent(
@@ -716,10 +725,10 @@ impl OrcaDomain {
 
     fn move_tab_to_window(&self, tab_id: TabId, target: WindowId) {
         let mux = Mux::get();
-        let current = mux
-            .iter_windows()
-            .into_iter()
-            .find(|window| mux.get_window(*window).is_some_and(|w| w.idx_by_id(tab_id).is_some()));
+        let current = mux.iter_windows().into_iter().find(|window| {
+            mux.get_window(*window)
+                .is_some_and(|w| w.idx_by_id(tab_id).is_some())
+        });
         let Some(current) = current else {
             return;
         };
@@ -774,9 +783,9 @@ impl OrcaDomain {
             .into_iter()
             .filter(|pane| {
                 pane.domain_id() == self.domain_id
-                    && pane.downcast_ref::<OrcaTerminalPane>().is_some_and(|orca| {
-                        parent_tab_ids.contains(&orca.binding().parent_tab_id)
-                    })
+                    && pane
+                        .downcast_ref::<OrcaTerminalPane>()
+                        .is_some_and(|orca| parent_tab_ids.contains(&orca.binding().parent_tab_id))
             })
             .map(|pane| pane.pane_id())
             .collect::<Vec<_>>();
@@ -815,7 +824,10 @@ impl OrcaDomain {
         if let Some(runtime) = self.runtime_backend() {
             return runtime.local_runtime().clone_repo(url, destination).await;
         }
-        self.ensure_client().await?.clone_repo(url, destination).await?;
+        self.ensure_client()
+            .await?
+            .clone_repo(url, destination)
+            .await?;
         Ok(())
     }
 
@@ -823,7 +835,10 @@ impl OrcaDomain {
         if let Some(runtime) = self.runtime_backend() {
             return runtime.local_runtime().create_repo(parent, name).await;
         }
-        self.ensure_client().await?.create_repo(parent, name).await?;
+        self.ensure_client()
+            .await?
+            .create_repo(parent, name)
+            .await?;
         Ok(())
     }
 

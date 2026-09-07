@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-
 use orca_mux::relay::{DEFAULT_WINDOW_SU, RelayConnection};
 
 fn main() -> anyhow::Result<()> {

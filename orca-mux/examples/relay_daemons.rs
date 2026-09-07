@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-
 use orca_mux::relay::{DEFAULT_WINDOW_SU, RelayConnection, discover_all_daemons};
 
 fn main() -> anyhow::Result<()> {
@@ -28,15 +27,12 @@ async fn run(target: String) -> anyhow::Result<()> {
         match relay.list_processes().await {
             Ok(processes) => {
                 eprintln!("  {} processes:", processes.len());
-                for process in processes {
-                    let id = process.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                    let cwd = process.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-                    let title = process.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let worktree = process
-                        .get("worktreeId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    eprintln!("    {id}  cwd={cwd}  wt={worktree}  title={title}");
+                for process in processes.iter().take(2) {
+                    eprintln!(
+                        "    keys={:?}",
+                        process.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                    );
+                    eprintln!("    full={process}");
                 }
             }
             Err(err) => eprintln!("  listProcesses failed: {err:#}"),

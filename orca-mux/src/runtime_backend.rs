@@ -107,9 +107,7 @@ impl LayoutNode {
     /// alone when only a split ratio is dragged.
     fn signature(&self, pty_by_leaf: &HashMap<String, String>) -> String {
         match self {
-            LayoutNode::Leaf { leaf_id } => {
-                pty_by_leaf.get(leaf_id).cloned().unwrap_or_default()
-            }
+            LayoutNode::Leaf { leaf_id } => pty_by_leaf.get(leaf_id).cloned().unwrap_or_default(),
             LayoutNode::Split {
                 direction,
                 first,
@@ -134,6 +132,14 @@ impl LayoutNode {
 /// becomes the second child's percentage; clamp so neither pane collapses.
 fn second_percent(ratio: f64) -> u8 {
     (((1.0 - ratio) * 100.0).round() as i64).clamp(1, 99) as u8
+}
+
+// Flipped as in LayoutNode::parse: a wezterm Horizontal (side-by-side) split is orca 'vertical'.
+fn orca_direction(direction: SplitDirection) -> &'static str {
+    match direction {
+        SplitDirection::Horizontal => "vertical",
+        SplitDirection::Vertical => "horizontal",
+    }
 }
 
 pub struct RuntimeBackend {
@@ -335,7 +341,11 @@ impl RuntimeBackend {
     }
 
     fn tab_window(&self, parent_tab_id: &str) -> Option<WindowId> {
-        let panes = self.tabs.lock().get(parent_tab_id).map(|state| state.panes.clone())?;
+        let panes = self
+            .tabs
+            .lock()
+            .get(parent_tab_id)
+            .map(|state| state.panes.clone())?;
         let mux = Mux::get();
         for weak in &panes {
             if let Some(pane) = weak.upgrade() {
@@ -641,7 +651,10 @@ impl RuntimeBackend {
         let output = relay.route_pty(raw_pty);
         if let Err(err) = relay.attach_pty(raw_pty).await {
             relay.unroute_pty(raw_pty);
-            log::warn!("orca host {} could not attach {raw_pty}: {err:#}", self.name);
+            log::warn!(
+                "orca host {} could not attach {raw_pty}: {err:#}",
+                self.name
+            );
             return Err(err);
         }
         let pane_size = match relay.pty_size(raw_pty).await? {
@@ -690,9 +703,7 @@ impl RuntimeBackend {
         agent: &str,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let worktree = self.worktree_for(Some(cwd.to_owned()));
-        let (pane, _parent) = self
-            .create_pane(worktree, Some(agent.to_owned()))
-            .await?;
+        let (pane, _parent) = self.create_pane(worktree, Some(agent.to_owned())).await?;
         Ok(pane)
     }
 
@@ -763,15 +774,146 @@ impl RuntimeBackend {
             SplitSource::Spawn { command_dir, .. } => command_dir,
             SplitSource::MovePane(_) => anyhow::bail!("moving panes is not supported"),
         };
-        let pane_index = mux_tab
-            .iter_panes_ignoring_zoom()
+        let panes = mux_tab.iter_panes_ignoring_zoom();
+        let entry = panes
             .iter()
             .find(|p| p.pane.pane_id() == pane_id)
-            .map(|p| p.index)
             .ok_or_else(|| anyhow::anyhow!("invalid pane id {pane_id}"))?;
+        let source_pane = entry.pane.clone();
+        let pane_index = entry.index;
+        drop(panes);
+
+        if let Some(pane) = self
+            .split_via_runtime(&mux_tab, &source_pane, pane_index, split_request)
+            .await?
+        {
+            return Ok(pane);
+        }
         let (pane_dyn, _parent) = self.create_and_track(command_dir).await?;
         mux_tab.split_and_insert(pane_index, split_request, pane_dyn.clone())?;
         Ok(pane_dyn)
+    }
+
+    async fn split_via_runtime(
+        self: &Arc<Self>,
+        mux_tab: &Arc<Tab>,
+        source_pane: &Arc<dyn Pane>,
+        pane_index: usize,
+        split_request: SplitRequest,
+    ) -> anyhow::Result<Option<Arc<dyn Pane>>> {
+        let (raw, parent) = {
+            let Some(relay_pane) = source_pane.downcast_ref::<RelayPane>() else {
+                return Ok(None);
+            };
+            (
+                relay_pane.pty_id().to_owned(),
+                relay_pane.parent_tab_id().to_owned(),
+            )
+        };
+
+        let session = self.runtime.list_all().await?;
+        let Some(handle) = Self::handle_for_raw(&session, &raw) else {
+            return Ok(None);
+        };
+        let direction = orca_direction(split_request.direction);
+        let worktree_path = self
+            .parse_tabs(&session)
+            .into_iter()
+            .find(|tab| tab.parent_tab_id == parent)
+            .map(|tab| tab.worktree_path)
+            .unwrap_or_default();
+        let before = self.tab_raw_ptys(&session, &parent);
+
+        self.runtime.split_terminal(&handle, direction).await?;
+
+        // The sibling leaf lands in the next inventory scan; retry in case it lags.
+        let mut discovered = None;
+        for _ in 0..5 {
+            let session = self.runtime.list_all().await?;
+            let after = self.tab_raw_ptys(&session, &parent);
+            if let Some(new_raw) = after.difference(&before).next().cloned() {
+                let signature = self.tab_signature(&session, &parent);
+                discovered = Some((new_raw, signature));
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(150)).await;
+        }
+        let Some((new_raw, signature)) = discovered else {
+            anyhow::bail!("orca accepted the split but the new pane never appeared");
+        };
+
+        let relay = self.ensure_relay(&HashSet::new()).await?;
+        let new_pane = self
+            .make_pane(
+                &relay,
+                &new_raw,
+                &worktree_path,
+                &parent,
+                TerminalSize::default(),
+            )
+            .await?;
+        mux_tab.split_and_insert(pane_index, split_request, new_pane.clone() as Arc<dyn Pane>)?;
+
+        // Record the fresh two-leaf signature so the poller sees it as materialised.
+        let generation = self.relay_generation.load(Ordering::SeqCst);
+        let mut tabs = self.tabs.lock();
+        let state = tabs.entry(parent).or_insert_with(|| TabState {
+            signature: signature.clone().unwrap_or_default(),
+            generation,
+            panes: Vec::new(),
+        });
+        state.panes.push(Arc::downgrade(&new_pane));
+        if let Some(signature) = signature {
+            state.signature = signature;
+        }
+        state.generation = generation;
+
+        Ok(Some(new_pane as Arc<dyn Pane>))
+    }
+
+    fn handle_for_raw(session: &Value, raw: &str) -> Option<String> {
+        let snapshots = session.get("snapshots")?.as_array()?;
+        for snapshot in snapshots {
+            for tab in snapshot
+                .get("tabs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if tab.get("type").and_then(|v| v.as_str()) != Some("terminal") {
+                    continue;
+                }
+                let pty = tab.get("ptyId").and_then(|v| v.as_str()).unwrap_or("");
+                if pty.rsplit("@@").next() != Some(raw) {
+                    continue;
+                }
+                if let Some(handle) = tab.get("terminal").and_then(|v| v.as_str()) {
+                    return Some(handle.to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn tab_raw_ptys(&self, session: &Value, parent: &str) -> HashSet<String> {
+        self.parse_tabs(session)
+            .into_iter()
+            .find(|tab| tab.parent_tab_id == parent)
+            .map(|tab| tab.pty_by_leaf.into_values().collect())
+            .unwrap_or_default()
+    }
+
+    fn tab_signature(&self, session: &Value, parent: &str) -> Option<String> {
+        self.parse_tabs(session)
+            .into_iter()
+            .find(|tab| tab.parent_tab_id == parent)
+            .map(|tab| {
+                format!(
+                    "{}|{}",
+                    tab.worktree_path,
+                    tab.layout.signature(&tab.pty_by_leaf)
+                )
+            })
     }
 
     fn worktree_for(&self, command_dir: Option<String>) -> String {
@@ -850,9 +992,7 @@ impl RuntimeBackend {
 mod tests {
     use serde_json::json;
 
-    use super::LayoutNode;
-    use super::SplitDirection;
-    use super::second_percent;
+    use super::{LayoutNode, SplitDirection, orca_direction, second_percent};
 
     fn split_of(direction: &str, ratio: f64) -> LayoutNode {
         LayoutNode::parse(&json!({
@@ -894,6 +1034,12 @@ mod tests {
     }
 
     #[test]
+    fn orca_direction_inverts_the_layout_axis() {
+        assert_eq!(orca_direction(SplitDirection::Horizontal), "vertical");
+        assert_eq!(orca_direction(SplitDirection::Vertical), "horizontal");
+    }
+
+    #[test]
     fn second_percent_sizes_the_new_pane_from_first_ratio() {
         assert_eq!(second_percent(0.5), 50);
         assert_eq!(second_percent(0.7), 30);
@@ -923,9 +1069,12 @@ mod tests {
 
     #[test]
     fn signature_tracks_structure_not_ratio() {
-        let ptys = [("a".to_owned(), "pty-1".to_owned()), ("b".to_owned(), "pty-2".to_owned())]
-            .into_iter()
-            .collect();
+        let ptys = [
+            ("a".to_owned(), "pty-1".to_owned()),
+            ("b".to_owned(), "pty-2".to_owned()),
+        ]
+        .into_iter()
+        .collect();
         let wide = split_of("vertical", 0.7).signature(&ptys);
         let narrow = split_of("vertical", 0.3).signature(&ptys);
         assert_eq!(wide, narrow);

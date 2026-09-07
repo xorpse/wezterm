@@ -110,6 +110,10 @@ impl RelayPane {
         &self.parent_tab_id
     }
 
+    pub fn pty_id(&self) -> &str {
+        &self.pty_id
+    }
+
     pub fn start_io(
         &self,
         output_rx: flume::Receiver<Notification>,
